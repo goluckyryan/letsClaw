@@ -1,0 +1,54 @@
+# letsClaw Configuration — Example Template
+# Copy to config.yaml and customize.
+
+# LLM backend (defaults — a model can override base_url/api_key below)
+llm:
+  provider: "vllm"              # vllm | openai_compatible
+  base_url: "http://localhost:8000/v1"
+  api_key: ""                   # leave empty if not needed
+
+# Model registry
+#   default_model: which entry to start with
+#   -m <name>     : override at startup (./run.sh -m <name>)
+#   provider_name: the exact model ID the server reports (check /v1/models)
+#   base_url/api_key: optional per model — fall back to the llm section above
+models:
+  default_model: "qwen36"
+  qwen36:
+    provider_name: "Qwen/Qwen3.6-35B-A3B"
+    behavior_file: "models/default.md"
+    temperature: 0.7
+    max_tokens: 4096
+    top_p: 0.95
+  # Example: a second model on another server (e.g. llama.cpp + GGUF)
+  qwen38:
+    provider_name: "path/or/id/exactlly-as-reported-by-the-server"
+    base_url: "http://192.168.203.75:8080/v1"
+    api_key: ""
+    behavior_file: "models/default.md"   # each model can have its own MD
+    temperature: 0.7
+    max_tokens: 4096
+    top_p: 0.95
+
+# Agent tools
+tools:
+  enabled: true
+  allow: [exec, read_file, write_file, list_dir]   # anything not listed is denied
+  max_iterations: 8           # max tool rounds per user turn before forced final answer
+  exec_timeout: 120           # seconds
+  max_output_chars: 8000      # tool output truncation
+
+# Conversation settings
+conversation:
+  max_history_messages: 50      # messages kept per session
+  context_window_tokens: 12000
+
+# Memory settings
+memory:
+  long_term_file: "state/memory_store/long_term.md"
+  auto_summarize_after: 100
+
+# Logging
+logging:
+  level: "INFO"
+  file: "logs/letclaw.log"

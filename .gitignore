@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Secrets — config.yaml holds the bot token
+config.yaml
+
+# Runtime state
+state/
+logs/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
