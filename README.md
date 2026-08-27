@@ -55,7 +55,7 @@ graph TD
 ```
 
 **Data flow:**
-- **Terminal REPL:** `chat.py` is the single entry point — interactive chat with `/` commands for session control, calls `llm_engine.py` for LLM chat.
+- **Terminal REPL:** `chat.py` is the single entry point — interactive chat with `/` commands for session control (Tab completes commands and model names), calls `llm_engine.py` for LLM chat.
 - **Dotted lines = config/behavior files loaded at startup.**
 
 ## Behavior Files
@@ -84,10 +84,12 @@ entry in `tools.py` and list its name in `tools.allow`.
 All tool I/O is truncated (`max_output_chars`) so a single call can't blow
 up the context; `exec` has a timeout.
 
-## Roadmap
+## Future Features
 
-- **Context-length awareness** — manage history against `conversation.context_window_tokens`
-- **Auto-compaction** — compact/summarize old turns when near the context budget, instead of hard-trimming
+- **Auto start new session** — detect when the conversation is stale or context-degraded and roll over into a fresh session automatically, instead of trimming in place
+- **Better context-length compaction** — manage history against `conversation.context_window_tokens`: when near the budget, summarize/compact old turns instead of the current message-count-based hard-trim
+- **Semantic search** — embed past messages/sessions and search them by meaning, not just keyword match
+- **Memory system** — long-term memory store (the `memory:` config section already hints at it: `state/memory_store/`, auto-summarize after N messages)
 - **Discord connection** — chat via Discord, each channel with its own behavior MD file
 
 ## Config

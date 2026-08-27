@@ -9,7 +9,7 @@ from pathlib import Path
 try:
     import readline  # enables arrow-key / history editing in input() on Linux & macOS
 except ImportError:
-    pass  # Windows has no readline; input() still works, just without arrow keys
+    readline = None  # Windows has no readline; input() still works, just without arrow keys
 
 import yaml
 
@@ -33,6 +33,79 @@ def load_config():
 def known_models(config):
     models_cfg = config.get("models", {})
     return [k for k in models_cfg if k != "default_model"]
+
+
+PROMPT = "👤 "  # shared with the completer, which redraws it after listing matches
+
+COMMANDS = {
+    "/quit": "leave letsClaw",
+    "/exit": "leave letsClaw",
+    "/clear": "reset the conversation, keep the model",
+    "/model": "list models, or /model <name> to switch",
+    "/info": "recent history and context usage",
+    "/behavior": "print the loaded behavior file",
+    "/reasoning": "toggle live display of the model's thinking",
+}
+
+
+def _bind_tab_to_complete():
+    """Bind TAB to readline's completion function.
+
+    CPython leaves plain TAB inserting a literal tab, so completion is dead
+    until we rebind it. The two readline flavors want different syntax, and
+    they do not politely ignore each other's: hand GNU readline the libedit
+    form and it binds the letter 'b' instead, so pick one.
+    """
+    if "libedit" in (readline.__doc__ or ""):  # macOS system Python
+        readline.parse_and_bind("bind ^I rl_complete")
+    else:  # GNU readline
+        readline.parse_and_bind("tab: complete")
+
+
+def install_completer(model_names):
+    """Tab completion: /commands, and model names after '/model '. No-op without readline."""
+    if readline is None:
+        return
+    # Whitespace-only delimiters so '/reaso' reaches the completer as one word
+    # ('/' and '-' are ordinary characters in command and model names).
+    readline.set_completer_delims(" \t\n")
+    _bind_tab_to_complete()
+
+    def candidates(text):
+        """What may follow the cursor, decided by which word we're completing."""
+        prior = readline.get_line_buffer()[:readline.get_begidx()].split()
+        if not prior:  # first word of the line — a command
+            return [c for c in COMMANDS if c.startswith(text)]
+        if prior == ["/model"]:  # its single argument — a configured model
+            return [m for m in model_names if m.startswith(text)]
+        return []  # plain prose, or an argument we have nothing to offer for
+
+    matches = []
+
+    def completer(text, state):
+        # readline asks for match 0, 1, 2 … until None; compute once on state 0.
+        if state == 0:
+            try:
+                # Trailing space so an argument can be typed straight after the
+                # command; CPython zeroes readline's own append character.
+                matches[:] = [c + " " for c in candidates(text)]
+            except Exception:
+                matches[:] = []  # readline swallows exceptions — degrade to "no match"
+        return matches[state] if state < len(matches) else None
+
+    def show_matches(substitution, shown, longest):
+        """Annotate the ambiguous-match listing with what each command does."""
+        sys.stdout.write("\n")
+        for m in (c.rstrip() for c in shown):
+            desc = COMMANDS.get(m)
+            sys.stdout.write(f"  {m.ljust(longest + 2)}{desc}\n" if desc else f"  {m}\n")
+        # readline.redisplay() won't repaint after our direct writes, so put the
+        # prompt and the half-typed line back by hand.
+        sys.stdout.write(PROMPT + readline.get_line_buffer())
+        sys.stdout.flush()
+
+    readline.set_completer(completer)
+    readline.set_completion_display_matches_hook(show_matches)
 
 
 async def make_engine(config, model_name=None):
@@ -105,6 +178,7 @@ async def chat(engine, model_name, config, tools):
     history = new_history(engine, TOOLS_NOTE if tools else "")
     conv_cfg = config.get("conversation", {})
     budget = conv_cfg.get("context_window_tokens", 12000)
+    show_reasoning = False  # /reasoning toggles live display of thinking content
     tools_cfg = config.get("tools", {})
     schemas = [t.spec for t in tools]
     max_tool_rounds = int(tools_cfg.get("max_iterations", 8)) if tools else 1
@@ -117,12 +191,13 @@ async def chat(engine, model_name, config, tools):
 
     print("\nletsClaw Terminal Chat")
     print("Type your message and press Enter.")
-    print("Commands: /quit, /clear, /model [name], /info, /behavior")
+    print("Commands: /quit, /clear, /model [name], /info, /behavior, /reasoning")
+    print("(Tab completes commands and model names)")
     print("💬 ")
 
     while True:
         try:
-            user_input = input("👤 ").strip()
+            user_input = input(PROMPT).strip()
         except (EOFError, KeyboardInterrupt):
             print("\n\nBye! 👋")
             break
@@ -187,6 +262,11 @@ async def chat(engine, model_name, config, tools):
             else:
                 print("\nNo behavior file loaded.")
             continue
+        elif user_input == "/reasoning":
+            show_reasoning = not show_reasoning
+            print(f"\n🧠 Reasoning display: {'ON' if show_reasoning else 'OFF'}"
+                  f" (reasoning tokens are always counted separately in the stats line)")
+            continue
 
         # Add user message
         history.append({"role": "user", "content": user_input})
@@ -197,17 +277,31 @@ async def chat(engine, model_name, config, tools):
         last_ttft = None
         full_response = ""
         had_error = False
+        reasoning_parts = []
         try:
             for _ in range(max_tool_rounds):
                 ind = thinking_indicator()
                 ind.start()
                 first = {"v": True}
-                result = await engine.chat_with_tools(history, tools=schemas,
-                                                      on_text=make_on_text(ind, first))
+                rfirst = {"v": True}
+                def on_reasoning(chunk, ind=ind, rf=rfirst):
+                    if rf["v"]:  # first thinking chunk: clear spinner, open the 🧠 line
+                        ind.stop()
+                        sys.stdout.write("\n🧠 ")
+                        sys.stdout.flush()
+                        rf["v"] = False
+                    sys.stdout.write("\x1b[2m" + chunk + "\x1b[0m")  # dim
+                    sys.stdout.flush()
+                result = await engine.chat_with_tools(
+                    history, tools=schemas,
+                    on_text=make_on_text(ind, first),
+                    on_reasoning=on_reasoning if show_reasoning else None)
                 ind.stop()
                 if ind.ttft is not None:
                     last_ttft = ind.ttft
-                if not first["v"]:  # text was streamed this round — terminate the line
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+                if not first["v"] or not rfirst["v"]:  # something was streamed — terminate the line
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                 if not result.wants_tool:
@@ -246,6 +340,8 @@ async def chat(engine, model_name, config, tools):
                 if not first["v"]:
                     sys.stdout.write("\n")
                     sys.stdout.flush()
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
                 full_response = result.text
         except Exception as e:
             had_error = True
@@ -269,12 +365,14 @@ async def chat(engine, model_name, config, tools):
             if full_response:
                 history.append({"role": "assistant", "content": full_response})
                 asst_tok = count_text(full_response)
+                reason_tok = count_text("".join(reasoning_parts))
+                rtok = f" + reasoning {reason_tok} tok" if reason_tok else ""
                 total = count_messages(history)
                 pct = (total * 100) // budget if budget else 0
                 warn = "  ⚠️ over budget" if budget and total > budget else ""
                 ttft = f" ttft {last_ttft:.1f}s ·" if last_ttft is not None else ""
                 tparts = f" · {tools_used} tool call{'s' if tools_used != 1 else ''}" if tools_used else ""
-                print(f"⚡{ttft} user {user_tok} + assistant {asst_tok} tok{tparts} · context {total}/{budget} ({pct}%){warn}")
+                print(f"⚡{ttft} user {user_tok} + assistant {asst_tok} tok{rtok}{tparts} · context {total}/{budget} ({pct}%){warn}")
             else:
                 print("🐱 (no answer — the model likely burned its token budget on reasoning; try again)")
 
@@ -299,6 +397,7 @@ def main():
     args = parser.parse_args()
 
     config = load_config()
+    install_completer(known_models(config))
     tools = build_tools(config.get("tools", {}))
     try:
         engine, model = asyncio.run(make_engine(config, args.model))

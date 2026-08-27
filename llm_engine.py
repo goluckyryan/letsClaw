@@ -19,6 +19,7 @@ class ChatResult:
     text: str
     tool_calls: list = field(default_factory=list)  # [{"id", "name", "arguments"(json str)}]
     finish_reason: str | None = None
+    reasoning: str = ""  # model's reasoning/thinking content (thinking models)
 
     @property
     def wants_tool(self) -> bool:
@@ -72,12 +73,13 @@ class LLMEngine:
 
     async def chat_with_tools(self, messages: list, model: str | None = None,
                               tools: list | None = None,
-                              on_text=None) -> ChatResult:
+                              on_text=None, on_reasoning=None) -> ChatResult:
         """Chat completion with optional tool calling.
 
         on_text: if given (and streaming is used), called with each text
         chunk as it arrives; tool-call deltas are accumulated silently.
-        Returns a ChatResult with .text and .tool_calls.
+        on_reasoning: same, but for reasoning/thinking chunks (thinking models).
+        Returns a ChatResult with .text, .tool_calls and .reasoning.
         """
         params = self.get_model_params(model)
         if tools:
@@ -96,11 +98,13 @@ class LLMEngine:
                         "name": tc.function.name,
                         "arguments": tc.function.arguments or "",
                     })
-                return ChatResult(msg.content or "", tool_calls, choice.finish_reason)
+                return ChatResult(msg.content or "", tool_calls, choice.finish_reason,
+                                  reasoning=getattr(msg, "reasoning_content", None) or "")
 
             response = await self.client.chat.completions.create(
                 messages=messages, stream=True, **params)
             text_parts = []
+            reason_parts = []
             pending = {}  # index -> accumulated tool call
             finish = None
             try:
@@ -109,6 +113,11 @@ class LLMEngine:
                     delta = choice.delta
                     if choice.finish_reason:
                         finish = choice.finish_reason
+                    rchunk = getattr(delta, "reasoning_content", None)
+                    if rchunk:
+                        reason_parts.append(rchunk)
+                        if on_reasoning:
+                            on_reasoning(rchunk)
                     if delta.content:
                         text_parts.append(delta.content)
                         on_text(delta.content)
@@ -129,14 +138,23 @@ class LLMEngine:
                 except Exception:
                     pass
             tool_calls = [pending[i] for i in sorted(pending)]
-            return ChatResult("".join(text_parts), tool_calls, finish)
+            return ChatResult("".join(text_parts), tool_calls, finish,
+                              reasoning="".join(reason_parts))
         except Exception as e:
             logger.error(f"LLM tools call failed: {e}")
             raise
 
     async def close(self):
-        """Release HTTP client resources (call once when the session ends)."""
-        await self.client.close()
+        """Release HTTP client resources (call once when the session ends).
+
+        Swallows teardown noise: httpx/httpcore pools can raise while closing
+        idle keep-alive connections after the session is over (e.g. httpcore2
+        'generator didn't stop after athrow()' during pool shutdown).
+        """
+        try:
+            await self.client.close()
+        except Exception as e:
+            logger.debug(f"Ignoring error while closing LLM client: {e}")
 
     async def load_behavior(self, path: str | Path) -> str:
         """Load a behavior file (.md) and return its contents."""
