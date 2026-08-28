@@ -1,22 +1,23 @@
 # letsClaw Configuration — Example Template
 # Copy to config.yaml and customize.
 
-# LLM backend (defaults — a model can override base_url/api_key below)
-llm:
-  provider: "vllm"              # vllm | openai_compatible
-  base_url: "http://localhost:8000/v1"
-  api_key: ""                   # leave empty if not needed
-
-# Model registry
+# Model registry — every entry is self-contained: it names its own server, so
+# reading one entry tells you everything about that model.
 #   default_model: which entry to start with
 #   -m <name>     : override at startup (./run.sh -m <name>)
 #   provider_name: the exact model ID the server reports (check /v1/models)
-#   base_url/api_key: optional per model — fall back to the llm section above
+#   base_url     : required — the OpenAI-compatible endpoint serving this model
+#   api_key      : omit or "" when the server needs no key
+#   context_length: total window the server was launched with — the budget the
+#                   ⚡ stats line reports against (max_tokens caps output only)
 models:
   default_model: "qwen36"
   qwen36:
     provider_name: "Qwen/Qwen3.6-35B-A3B"
+    base_url: "http://localhost:8000/v1"
+    api_key: ""                          # omit or "" if the server needs no key
     behavior_file: "models/default.md"
+    context_length: 12000
     temperature: 0.7
     max_tokens: 4096
     top_p: 0.95
@@ -26,6 +27,7 @@ models:
     base_url: "http://192.168.203.75:8080/v1"
     api_key: ""
     behavior_file: "models/default.md"   # each model can have its own MD
+    context_length: 32768
     temperature: 0.7
     max_tokens: 4096
     top_p: 0.95
@@ -38,15 +40,17 @@ tools:
   exec_timeout: 120           # seconds
   max_output_chars: 8000      # tool output truncation
 
-# Conversation settings
+# Conversation settings  (context_length lives per model, under models:)
 conversation:
   max_history_messages: 50      # messages kept per session
-  context_window_tokens: 12000
+  rollover_at_percent: 90       # % of the model's context_length that trips a rollover (0 = never)
+  rollover_mode: "auto"         # auto = roll over and say so | ask = prompt [y/N] | off = warn only
+                                # /new forces a rollover in any mode
+  sessions_dir: "state/sessions"  # archived transcripts land here
 
 # Memory settings
 memory:
-  long_term_file: "state/memory_store/long_term.md"
-  auto_summarize_after: 100
+  long_term_file: "state/memory_store/long_term.md"   # rollover handoffs are appended here
 
 # Logging
 logging:

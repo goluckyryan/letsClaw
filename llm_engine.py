@@ -1,7 +1,8 @@
 """LLM engine — OpenAI-compatible wrapper for chat completions.
 
 Supports vllm (localhost) and any OpenAI-compatible API.
-Config-driven: provider, base_url, api_key come from config.yaml.
+Config-driven: base_url, api_key and sampling parameters come from the
+model's own entry under models: in config.yaml.
 """
 
 import logging
@@ -20,10 +21,20 @@ class ChatResult:
     tool_calls: list = field(default_factory=list)  # [{"id", "name", "arguments"(json str)}]
     finish_reason: str | None = None
     reasoning: str = ""  # model's reasoning/thinking content (thinking models)
+    # Server-reported token usage; None when the server doesn't supply it.
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
 
     @property
     def wants_tool(self) -> bool:
         return bool(self.tool_calls)
+
+    @property
+    def context_used(self) -> int | None:
+        """Exact size of the context after this turn, or None if unreported."""
+        if self.prompt_tokens is None:
+            return None
+        return self.prompt_tokens + (self.completion_tokens or 0)
 
 
 class LLMEngine:
@@ -34,6 +45,8 @@ class LLMEngine:
         self.client = AsyncOpenAI(base_url=base_url, api_key=api_key or "sk-not-needed")
         self.default_model = default_model
         self.extra_params = kwargs
+        # Ask for streamed usage until a server tells us it doesn't understand.
+        self._usage_opt = True
 
     def get_model_params(self, model_override: str | None = None) -> dict:
         """Return kwargs dict for api.chat.completions.create()."""
@@ -42,15 +55,21 @@ class LLMEngine:
         params.update({k: v for k, v in self.extra_params.items() if v is not None})
         return params
 
-    async def chat(self, messages: list, model: str | None = None) -> str:
-        """Send a chat completion request. Returns the assistant message text."""
+    async def chat(self, messages: list, model: str | None = None, **overrides) -> str:
+        """Send a chat completion request. Returns the assistant message text.
+
+        **overrides adjust request parameters for this one call (e.g. a small
+        max_tokens for a summary). get_model_params() hands back a fresh dict,
+        so the engine's configured defaults are never touched.
+        """
         params = self.get_model_params(model)
+        params.update(overrides)
         try:
             response = await self.client.chat.completions.create(
                 messages=messages,
                 **params,
             )
-            return response.choices[0].message.content
+            return response.choices[0].message.content or ""
         except Exception as e:
             logger.error(f"LLM chat failed: {e}")
             raise
@@ -98,17 +117,36 @@ class LLMEngine:
                         "name": tc.function.name,
                         "arguments": tc.function.arguments or "",
                     })
+                usage = getattr(response, "usage", None)
                 return ChatResult(msg.content or "", tool_calls, choice.finish_reason,
-                                  reasoning=getattr(msg, "reasoning_content", None) or "")
+                                  reasoning=getattr(msg, "reasoning_content", None) or "",
+                                  prompt_tokens=getattr(usage, "prompt_tokens", None),
+                                  completion_tokens=getattr(usage, "completion_tokens", None))
 
-            response = await self.client.chat.completions.create(
-                messages=messages, stream=True, **params)
+            create_kw = dict(messages=messages, stream=True, **params)
+            if self._usage_opt:
+                # Asks for a final usage-only chunk; vLLM and llama.cpp both honour it.
+                create_kw["stream_options"] = {"include_usage": True}
+            try:
+                response = await self.client.chat.completions.create(**create_kw)
+            except Exception as e:
+                if not self._usage_opt or "stream_options" not in str(e):
+                    raise
+                logger.warning("server rejected stream_options; token counts will be estimated")
+                self._usage_opt = False
+                create_kw.pop("stream_options")
+                response = await self.client.chat.completions.create(**create_kw)
             text_parts = []
             reason_parts = []
             pending = {}  # index -> accumulated tool call
             finish = None
+            usage = None
             try:
                 async for chunk in response:
+                    if getattr(chunk, "usage", None):
+                        usage = chunk.usage
+                    if not chunk.choices:
+                        continue  # the usage-only chunk carries an empty choices list
                     choice = chunk.choices[0]
                     delta = choice.delta
                     if choice.finish_reason:
@@ -139,7 +177,9 @@ class LLMEngine:
                     pass
             tool_calls = [pending[i] for i in sorted(pending)]
             return ChatResult("".join(text_parts), tool_calls, finish,
-                              reasoning="".join(reason_parts))
+                              reasoning="".join(reason_parts),
+                              prompt_tokens=getattr(usage, "prompt_tokens", None),
+                              completion_tokens=getattr(usage, "completion_tokens", None))
         except Exception as e:
             logger.error(f"LLM tools call failed: {e}")
             raise

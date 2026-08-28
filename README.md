@@ -33,10 +33,11 @@ graph TD
     end
 
     subgraph Modules
-        Cmds[Commands\n/status /help /clear /info /model /behavior]
+        Cmds[Commands\n/clear /new /info /model /behavior /reasoning]
         TokenCounter[Token Counter\ntoken_counter.py\nper-message stats]
         ThinkingUI[Thinking indicator\nui.py\nlive spinner + TTFT]
         Tools[Tool executor\ntools.py\nexec / read / write / list]
+        Roll[Session rollover\nsession.py\narchive + handoff]
     end
 
     subgraph State
@@ -46,6 +47,9 @@ graph TD
 
     REPL --> Cmds
     REPL --> Tools
+    REPL --> Roll
+    Roll --> Sessions
+    Roll --> Memory
     Cmds --> Engine
     Engine --> Config
     Engine --> ModelFile
@@ -84,12 +88,32 @@ entry in `tools.py` and list its name in `tools.allow`.
 All tool I/O is truncated (`max_output_chars`) so a single call can't blow
 up the context; `exec` has a timeout.
 
+## Context Rollover
+
+A conversation that outgrows the model's window gets rejected by the server. Rather
+than silently dropping the oldest turns, letsClaw rolls the session over once it
+passes `rollover_at_percent` of the active model's `context_length`:
+
+1. the full transcript is archived to `state/sessions/<timestamp>.json`
+2. the model writes a handoff — objective, what's established, what's still open —
+   appended to `memory.long_term_file`
+3. a fresh window starts from that handoff plus the last exchange verbatim, and is
+   told where the transcript is so `read_file` can recover any detail
+
+`rollover_mode` picks the behaviour: `auto` rolls over and says so, `ask` prompts
+first, `off` only warns. **`/new` forces a rollover at any time**, in any mode — and
+unlike `/clear`, which discards the conversation, `/new` files it and carries the
+thread forward.
+
+The trigger reads the server's own `usage.prompt_tokens`, so the percentage is exact.
+Servers that withhold usage fall back to a local estimate, scaled up deliberately —
+rolling over early costs a summary, rolling over late costs a rejected request. The
+`~` in the stats line marks an estimated figure.
+
 ## Future Features
 
-- **Auto start new session** — detect when the conversation is stale or context-degraded and roll over into a fresh session automatically, instead of trimming in place
-- **Better context-length compaction** — manage history against `conversation.context_window_tokens`: when near the budget, summarize/compact old turns instead of the current message-count-based hard-trim
 - **Semantic search** — embed past messages/sessions and search them by meaning, not just keyword match
-- **Memory system** — long-term memory store (the `memory:` config section already hints at it: `state/memory_store/`, auto-summarize after N messages)
+- **Memory system** — read accumulated handoffs back in: rollover writes `state/memory_store/long_term.md`, but a new session is only seeded from its own predecessor, never from the whole history of the file
 - **Discord connection** — chat via Discord, each channel with its own behavior MD file
 
 ## Config
@@ -97,8 +121,7 @@ up the context; `exec` has a timeout.
 See `config.example.yaml` for full reference with comments.
 
 **Key sections:**
-- `llm` — Default provider settings (base URL, API key)
-- `models` — Registry of named models (exact server model ID, optional per-model endpoint, parameters). `default_model` picks the startup model; switch with `/model <name>` (runtime) or `./run.sh -m <name>`.
+- `models` — Registry of named models. Each entry is self-contained: its own `base_url` (required), `api_key`, exact server model ID (`provider_name`), behavior file, `context_length` and sampling parameters — so two models can live on two different servers with different window sizes, and reading one entry tells you everything about that model. `default_model` picks the startup model; switch with `/model <name>` (runtime) or `./run.sh -m <name>`.
 - `tools` — Agent tools: enable flag, allowlist, max tool rounds per turn, exec timeout, output truncation.
-- `conversation` — History limits, context window
-- `memory` — Long-term storage paths, auto-summarize settings
+- `conversation` — History limits (`max_history_messages`), and rollover policy: `rollover_at_percent` (0 disables), `rollover_mode` (`auto`/`ask`/`off`), `sessions_dir`. The context window itself is per model, under `models`.
+- `memory` — `long_term_file`, where rollover handoffs accumulate

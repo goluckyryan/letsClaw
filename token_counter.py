@@ -8,6 +8,7 @@ approximation (typically within ~10-20%). Good enough for budget display
 and compaction triggers, not for billing.
 """
 
+import json
 import logging
 
 logger = logging.getLogger("letclaw.tokens")
@@ -52,8 +53,17 @@ def count_text(text: str) -> int:
 
 
 def count_message(msg: dict) -> int:
-    """Estimate tokens for one chat message (content + framing overhead)."""
-    return count_text(msg.get("content", "")) + _MESSAGE_OVERHEAD
+    """Estimate tokens for one chat message (content + tool calls + framing).
+
+    Assistant turns that call tools carry their payload in tool_calls, not in
+    content, so counting content alone scores them as bare overhead and makes a
+    tool-heavy conversation look far smaller than it is.
+    """
+    total = count_text(msg.get("content") or "")
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        total += count_text(fn.get("name") or "") + count_text(fn.get("arguments") or "")
+    return total + _MESSAGE_OVERHEAD
 
 
 def count_messages(messages: list) -> int:
@@ -64,3 +74,15 @@ def count_messages(messages: list) -> int:
 def message_breakdown(messages: list) -> list:
     """Per-message content token counts: [(role, tokens), ...]."""
     return [(m.get("role", "?"), count_text(m.get("content", ""))) for m in messages]
+
+
+def count_tools(specs: list) -> int:
+    """Estimate tokens for tool schemas.
+
+    Schemas are re-sent with every request, so on a tool-enabled session they are
+    a large fixed part of each prompt — invisible to count_messages(), which only
+    ever sees the conversation.
+    """
+    if not specs:
+        return 0
+    return count_text(json.dumps(specs))
