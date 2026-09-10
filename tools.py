@@ -7,6 +7,8 @@ messages. Output is truncated so one tool can't blow up the context.
 
 import asyncio
 import json
+import os
+import signal
 from pathlib import Path
 
 DEFAULT_MAX_OUTPUT = 8000
@@ -45,16 +47,34 @@ class Tool:
             return f"error: {type(e).__name__}: {e}"
 
 
-def build_tools(cfg: dict | None = None) -> list:
-    """Create the enabled tools from the config's tools: section."""
+def _kill_group(proc):
+    """Kill the whole process group; fall back to the process if that fails."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
+def build_tools(cfg: dict | None = None, workdir: str | None = None) -> list:
+    """Create the enabled tools from the config's tools: section.
+
+    workdir is the default working directory for exec and the base the model is
+    told about. It matters in the core: the daemon's own cwd is not the shell cwd
+    the user was in, so relative paths would otherwise resolve somewhere else.
+    """
     cfg = cfg or {}
+    base = str(Path(workdir).expanduser()) if workdir else "."
     if not cfg.get("enabled", False):
         return []
     allow = set(cfg.get("allow", ["exec", "read_file", "write_file", "list_dir"]))
     max_out = int(cfg.get("max_output_chars", DEFAULT_MAX_OUTPUT))
     exec_timeout = int(cfg.get("exec_timeout", 120))
 
-    async def exec_(command: str, workdir: str = ".", timeout: int | None = None) -> str:
+    async def exec_(command: str, workdir: str | None = None, timeout: int | None = None) -> str:
+        workdir = workdir or base
         try:
             timeout = int(timeout) if timeout else exec_timeout
         except (TypeError, ValueError):
@@ -64,15 +84,20 @@ def build_tools(cfg: dict | None = None) -> list:
                 command, cwd=workdir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,  # own process group, so we can kill children too
             )
         except (OSError, ValueError) as e:
             return f"could not start command: {e}"
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            proc.kill()
+            _kill_group(proc)
             await proc.wait()
             return f"timed out after {timeout}s (command killed)"
+        except asyncio.CancelledError:
+            # Shutdown or interrupt: without this the shell keeps running, detached.
+            _kill_group(proc)
+            raise
         out_s = out.decode(errors="replace").strip()
         err_s = err.decode(errors="replace").strip()
         parts = [f"exit code: {proc.returncode}"]
@@ -82,19 +107,27 @@ def build_tools(cfg: dict | None = None) -> list:
             parts.append(f"stderr:\n{err_s}")
         return _truncate("\n\n".join(parts), max_out)
 
-    async def read_file(path: str) -> str:
+    # These three touch the disk. In the shared core one slow read would stall every
+    # session's token stream, so the blocking part runs off the event loop.
+    def _read_file(path: str) -> str:
         p = Path(path).expanduser()
         if not p.is_file():
             return f"error: not a file: {path}"
         return _truncate(p.read_text(errors="replace"), max_out)
 
-    async def write_file(path: str, content: str) -> str:
+    async def read_file(path: str) -> str:
+        return await asyncio.to_thread(_read_file, path)
+
+    def _write_file(path: str, content: str) -> str:
         p = Path(path).expanduser()
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
         return f"wrote {len(content)} chars to {p}"
 
-    async def list_dir(path: str = ".") -> str:
+    async def write_file(path: str, content: str) -> str:
+        return await asyncio.to_thread(_write_file, path, content)
+
+    def _list_dir(path: str = ".") -> str:
         p = Path(path).expanduser()
         if not p.is_dir():
             return f"error: not a directory: {path}"
@@ -105,6 +138,9 @@ def build_tools(cfg: dict | None = None) -> list:
             else:
                 lines.append(f"{e.name}  ({e.stat().st_size} bytes)")
         return _truncate("\n".join(lines) or "(empty)", max_out)
+
+    async def list_dir(path: str = ".") -> str:
+        return await asyncio.to_thread(_list_dir, path)
 
     tools = {
         "exec": Tool(

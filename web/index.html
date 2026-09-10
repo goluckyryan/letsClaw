@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>letsClaw</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%90%B1%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<aside id="side">
+  <div class="side-head">
+    <span>sessions</span>
+    <button id="side-new" title="start a new session">+</button>
+  </div>
+  <!-- Above the list, not below it: #side-list is flex:1, so anything after it is
+       pushed to the far bottom of the sidebar, nowhere near the + that opened it. -->
+  <form id="side-add" hidden>
+    <input id="side-name" placeholder="name…" spellcheck="false" autocomplete="off">
+  </form>
+  <div id="side-list"></div>
+</aside>
+
+<div id="pane">
+
+<header>
+  <button id="side-toggle" title="show or hide the session list">☰</button>
+  <div class="brand">🐱&nbsp;<b>letsClaw</b></div>
+
+  <label class="field" title="model for this session">
+    <select id="model"></select>
+  </label>
+
+  <div class="gauge" id="gauge" title="context used">
+    <div class="gauge-fill" id="gauge-fill"></div>
+    <div class="gauge-trip" id="gauge-trip" hidden></div>
+    <span class="gauge-label" id="gauge-label">—</span>
+  </div>
+
+  <div class="spacer"></div>
+
+  <!-- Labelled, not icon-only: the emoji fall back to tofu on a machine without an
+       emoji font, and a lab box is exactly such a machine. -->
+  <button id="btn-reasoning" class="tog" title="show the model's thinking (/reasoning)">🧠 think</button>
+  <button id="btn-info"      title="context and recent history (/info)">ℹ️ info</button>
+  <button id="btn-behavior"  title="print the loaded behavior file (/behavior)">📄 behavior</button>
+  <button id="btn-clear"     title="discard the conversation (/clear)">🧹 clear</button>
+  <button id="btn-new"       title="archive it and carry the thread forward (/new)">🔄 new</button>
+  <button id="btn-reload"    title="re-read config.yaml into the running core (/reload)">♻️ reload</button>
+  <span id="status" class="status off">offline</span>
+</header>
+
+<main id="log" tabindex="0"></main>
+
+<footer>
+  <div id="ac" class="ac" hidden></div>
+  <div class="composer">
+    <textarea id="input" rows="1" spellcheck="false"
+              placeholder="Message letsClaw…   ( / for commands · Enter to send · Shift+Enter for a newline )"></textarea>
+    <button id="send" title="send">Send</button>
+    <button id="stop" hidden title="interrupt the turn in progress">Stop</button>
+  </div>
+  <div class="hint" id="hint">connecting…</div>
+</footer>
+
+</div><!-- /#pane -->
+
+<!-- Shown only when core.token is set and we don't have it yet. -->
+<div id="gate" hidden>
+  <form class="gate-box" id="gate-form">
+    <h2>🔒 This core wants a token</h2>
+    <p>Anyone who can talk to the core can run shell commands on that machine,
+       so it was started with <code>core.token</code> set.</p>
+    <input id="gate-token" type="password" placeholder="core.token" autocomplete="off">
+    <button type="submit">Connect</button>
+  </form>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

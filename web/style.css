@@ -1,0 +1,566 @@
+/* letsClaw web client — no framework, no build step, no CDN.
+   The core may well be sitting on an isolated lab network, so everything the
+   page needs has to come from the core itself. */
+
+:root {
+  --bg:     #12141a;
+  --bg2:    #171a21;
+  --bg3:    #1e222b;
+  --fg:     #dfe3ea;
+  --dim:    #8b93a3;
+  --line:   #272c37;
+  --accent: #7aa2f7;
+  --ok:     #9ece6a;
+  --warn:   #e0af68;
+  --err:    #f7768e;
+  --think:  #bb9af7;
+  --mono:   ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --sans:   system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg:#ffffff; --bg2:#f4f6fa; --bg3:#eaeef5; --fg:#1c2027; --dim:#5f6875;
+    --line:#dde3ec; --accent:#2f6fd0; --ok:#3f8b2f; --warn:#a06800; --err:#c33c50;
+    --think:#7a4fc0;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;                 /* sidebar | pane */
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.55 var(--sans);
+}
+
+#pane {
+  flex: 1;
+  min-width: 0;                  /* or a wide <pre> stretches the whole page */
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* ---------- session sidebar ---------- */
+
+#side {
+  flex: 0 0 210px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg2);
+  border-right: 1px solid var(--line);
+  overflow: hidden;
+}
+/* Same trap as #gate: an explicit display: beats the hidden attribute. */
+#side[hidden] { display: none; }
+
+.side-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 8px 8px 14px;
+  font: 11px var(--mono);
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--dim);
+}
+.side-head button {
+  font-size: 15px;
+  line-height: 1;
+  width: 24px;
+  height: 24px;
+  background: var(--bg3);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.side-head button:hover { border-color: var(--accent); }
+
+#side-list { flex: 1; overflow-y: auto; padding: 0 6px 8px; }
+
+.srow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  cursor: pointer;
+  color: var(--fg);
+}
+.srow:hover { background: var(--bg3); }
+.srow.on { background: var(--accent); color: #fff; }
+
+.srow .nm {
+  flex: 1;
+  min-width: 0;
+  font: 13px var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.srow .ct { font: 11px var(--mono); color: var(--dim); }
+.srow.on .ct { color: #fff; opacity: .8; }
+
+/* A live turn, so you can see which session is working while you read another. */
+.srow .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+  flex: 0 0 auto;
+}
+.srow .dot[hidden] { display: none; }
+
+.srow .ren,
+.srow .del {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  font: 12px var(--sans);
+  line-height: 1;
+  background: none;
+  color: var(--dim);
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0;                    /* revealed on hover — one of them destroys a conversation */
+}
+.srow .ren { display: flex; align-items: center; justify-content: center; }
+.srow:hover .ren,
+.srow:hover .del { opacity: 1; }
+.srow .ren:hover { background: var(--bg); color: var(--fg); }
+.srow .del:hover { background: var(--err); color: #fff; }
+.srow.on .ren,
+.srow.on .del { color: #fff; }
+
+#side-add { flex: 0 0 auto; padding: 0 12px 8px; }
+#side-add[hidden] { display: none; }
+#side-add input {
+  width: 100%;
+  padding: 5px 8px;
+  font: 13px var(--mono);
+  color: var(--fg);
+  background: var(--bg3);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  outline: none;
+}
+
+#side-toggle {
+  font-size: 15px;
+  padding: 4px 8px;
+}
+
+@media (max-width: 720px) {
+  #side { position: fixed; z-index: 5; top: 0; bottom: 0; left: 0; }
+}
+
+/* ---------- header ---------- */
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand { font-size: 16px; white-space: nowrap; }
+.spacer { flex: 1; }
+
+.field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.field input, .field select {
+  font: 13px var(--mono);
+  color: var(--fg);
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 7px;
+  max-width: 220px;
+}
+
+header button {
+  font: 12px var(--sans);
+  line-height: 1.4;
+  white-space: nowrap;
+  padding: 5px 7px;
+  background: var(--bg3);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+header button:hover { border-color: var(--accent); }
+header button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* Context gauge: fill = used, tick = the rollover threshold. */
+.gauge {
+  position: relative;
+  width: 155px;
+  height: 20px;
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.gauge-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  background: var(--accent);
+  opacity: .35;
+  transition: width .3s ease;
+}
+.gauge.warn .gauge-fill { background: var(--warn); opacity: .5; }
+.gauge.over .gauge-fill { background: var(--err);  opacity: .5; }
+.gauge-trip {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 2px;
+  background: var(--warn);
+  opacity: .8;
+}
+.gauge-label {
+  position: relative;
+  display: block;
+  text-align: center;
+  font: 11px var(--mono);
+  line-height: 18px;
+  color: var(--fg);
+}
+
+.status {
+  font: 11px var(--mono);
+  padding: 3px 8px;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+.status.on  { background: rgba(158,206,106,.15); color: var(--ok); }
+.status.off { background: rgba(247,118,142,.15); color: var(--err); }
+.status.wait{ background: rgba(224,175,104,.15); color: var(--warn); }
+
+/* ---------- log ---------- */
+
+main {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px 0 26px;
+  /* No scroll-behavior:smooth — during streaming it animates against itself and
+     the log judders. Sticking to the bottom has to be instant. */
+}
+
+.msg {
+  max-width: 900px;
+  margin: 0 auto 14px;
+  padding: 0 18px;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+.who { flex: 0 0 22px; font-size: 15px; user-select: none; padding-top: 2px; }
+.body { flex: 1; min-width: 0; }        /* min-width:0 lets <pre> scroll instead of stretching the page */
+
+.msg.user .body {
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.msg.reasoning .body {
+  color: var(--think);
+  font-size: 13.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-left: 2px solid var(--think);
+  padding-left: 10px;
+  opacity: .85;
+}
+
+/* ---------- markdown ---------- */
+
+.body > :first-child { margin-top: 0; }
+.body > :last-child  { margin-bottom: 0; }
+.body p { margin: .5em 0; overflow-wrap: anywhere; }
+.body h1, .body h2, .body h3, .body h4 { margin: .9em 0 .4em; line-height: 1.3; }
+.body h1 { font-size: 1.35em; }
+.body h2 { font-size: 1.2em; }
+.body h3 { font-size: 1.07em; }
+.body ul, .body ol { margin: .5em 0; padding-left: 1.5em; }
+.body li { margin: .18em 0; }
+.body blockquote {
+  margin: .5em 0;
+  padding-left: 12px;
+  border-left: 3px solid var(--line);
+  color: var(--dim);
+}
+.body hr { border: 0; border-top: 1px solid var(--line); margin: 1em 0; }
+.body a { color: var(--accent); }
+
+.body code {
+  font: 13px var(--mono);
+  background: var(--bg3);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.body pre {
+  position: relative;
+  margin: .7em 0;
+  padding: 10px 12px;
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.body pre code { background: none; padding: 0; font-size: 13px; }
+.body pre[data-lang]:not([data-lang=""])::before {
+  content: attr(data-lang);
+  position: absolute;
+  top: 4px; right: 34px;
+  font: 10px var(--mono);
+  color: var(--dim);
+}
+.body pre .copy {
+  position: absolute;
+  top: 4px; right: 5px;
+  padding: 1px 5px;
+  font-size: 11px;
+  background: var(--bg3);
+  color: var(--dim);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .15s;
+}
+.body pre:hover .copy { opacity: 1; }
+
+.body table {
+  border-collapse: collapse;
+  margin: .6em 0;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+.body th, .body td {
+  border: 1px solid var(--line);
+  padding: 4px 9px;
+  text-align: left;
+}
+.body th { background: var(--bg3); }
+
+/* ---------- tool calls, stats, notices ---------- */
+
+.slab {
+  max-width: 900px;
+  margin: 0 auto 10px;
+  padding: 0 18px 0 50px;      /* line up with .body, past the .who gutter */
+  font: 12.5px var(--mono);
+}
+
+.tool .slab-box {
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+.tool summary {
+  cursor: pointer;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+  list-style: none;
+}
+.tool summary::-webkit-details-marker { display: none; }
+.tool summary b { color: var(--fg); font-weight: 600; }
+.tool pre {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  background: var(--bg3);
+  border-radius: 5px;
+  overflow-x: auto;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.tool .done { color: var(--ok); }
+.tool .fail { color: var(--err); }
+
+.stats  { color: var(--dim); }
+.notice { color: var(--dim); }
+.notice.warn { color: var(--warn); }
+.notice.err, .err-line { color: var(--err); }
+
+.roll .slab-box {
+  background: var(--bg2);
+  border: 1px solid var(--warn);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--warn);
+}
+.roll .paths { color: var(--dim); }
+.roll button {
+  font: 12px var(--sans);
+  margin: 6px 6px 0 0;
+  padding: 4px 12px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: var(--bg3);
+  color: var(--fg);
+  cursor: pointer;
+}
+.roll button.yes { background: var(--warn); border-color: var(--warn); color: #12141a; }
+.roll .slab-box[data-answered] button { display: none; }
+
+.sep {
+  max-width: 900px;
+  margin: 18px auto;
+  padding: 0 18px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font: 11px var(--mono);
+  color: var(--dim);
+}
+.sep::before, .sep::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--line);
+}
+
+.waiting { color: var(--dim); font: 12.5px var(--mono); }
+.waiting .spin { display: inline-block; width: 1em; color: var(--accent); }
+
+/* ---------- composer ---------- */
+
+footer {
+  border-top: 1px solid var(--line);
+  background: var(--bg2);
+  padding: 10px 18px 8px;
+}
+
+.composer {
+  max-width: 900px;
+  margin: 0 auto;
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+
+#input {
+  flex: 1;
+  resize: none;
+  max-height: 40vh;
+  padding: 9px 11px;
+  font: 14px/1.5 var(--sans);
+  color: var(--fg);
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline: none;
+}
+#input:focus { border-color: var(--accent); }
+
+.composer button {
+  padding: 9px 16px;
+  font: 14px var(--sans);
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+.composer button:disabled { opacity: .45; cursor: default; }
+#stop { background: var(--err); border-color: var(--err); }
+
+.hint {
+  max-width: 900px;
+  margin: 5px auto 0;
+  font: 11px var(--mono);
+  color: var(--dim);
+}
+
+/* slash-command popup */
+.ac {
+  max-width: 900px;
+  margin: 0 auto 6px;
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.ac div {
+  padding: 5px 11px;
+  font: 13px var(--mono);
+  cursor: pointer;
+  display: flex;
+  gap: 12px;
+}
+.ac div.sel { background: var(--accent); color: #fff; }
+.ac div span { color: var(--dim); font: 12px var(--sans); }
+.ac div.sel span { color: #fff; opacity: .8; }
+
+/* ---------- token gate ---------- */
+
+#gate {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+/* An explicit display: value beats the hidden attribute, so the overlay would
+   otherwise sit over the chat permanently. */
+#gate[hidden] { display: none; }
+.gate-box {
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 22px 26px;
+  max-width: 420px;
+}
+.gate-box h2 { margin: 0 0 8px; font-size: 16px; }
+.gate-box p  { margin: 0 0 14px; font-size: 13px; color: var(--dim); }
+.gate-box input {
+  width: 100%;
+  padding: 8px 10px;
+  font: 13px var(--mono);
+  color: var(--fg);
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.gate-box button {
+  margin-top: 10px;
+  padding: 8px 16px;
+  font: 14px var(--sans);
+  background: var(--accent);
+  color: #fff;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}

@@ -32,6 +32,18 @@ models:
     max_tokens: 4096
     top_p: 0.95
 
+# Core service — start this first (./serve.sh); clients connect to it
+core:
+  bind: "127.0.0.1"     # tools are unconfined: anyone who can reach this port gets a shell here
+  port: 8770            # also serves the WebUI at http://<bind>:<port>/
+  token: ""             # optional shared secret; required in practice if bind is not loopback
+                        # the WebUI prompts for it (the page itself is served unauthenticated)
+                        #
+                        # bind and port are the only settings here that need a restart:
+                        # the socket is already bound, and rebinding it would drop every
+                        # client. Everything else in this file is picked up by /reload
+                        # (or the ♻️ button) without stopping the core.
+
 # Agent tools
 tools:
   enabled: true
@@ -39,6 +51,9 @@ tools:
   max_iterations: 8           # max tool rounds per user turn before forced final answer
   exec_timeout: 120           # seconds
   max_output_chars: 8000      # tool output truncation
+  # workdir: "/home/you/project"  # base dir for exec and relative paths.
+                                # Defaults to the letsClaw directory — the core is a
+                                # daemon, so its own cwd is not the shell you started in.
 
 # Conversation settings  (context_length lives per model, under models:)
 conversation:
@@ -47,6 +62,8 @@ conversation:
   rollover_mode: "auto"         # auto = roll over and say so | ask = prompt [y/N] | off = warn only
                                 # /new forces a rollover in any mode
   sessions_dir: "state/sessions"  # archived transcripts land here
+  live_dir: "state/live"        # live conversations; reloaded when the core restarts
+  prompt_timeout: 60            # seconds to wait for a rollover answer before keeping the session
 
 # Memory settings
 memory:
