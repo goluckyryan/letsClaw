@@ -49,19 +49,12 @@ ESTIMATE_SCALE = 1.6
 
 CARRYOVER_MARKER = "\n\n=== CONTINUED SESSION ===\n"
 
-SYSTEM_PROMPT = """You are letsClaw, a lightweight technical agent engine.
-You are helpful, concise, and direct. Use markdown for code blocks.
-"""
-
-TOOLS_NOTE = """
-=== TOOLS ===
-You can call tools to inspect and modify the real environment:
-- exec: run shell commands
-- read_file / write_file / list_dir: file access
-Prefer tools over guessing when asked about commands, files, or system state.
-Work iteratively: call a tool, inspect the result, continue until the task is
-done, then give one concise final answer. Do not stop to ask for permission
-on read-only operations."""
+# The base behavior — identity, working style and the tool notes — lives in
+# plain Markdown (behavior.base_file) so it can be tuned without a code change.
+# It is read once per core and shared by every session, and it is always in the
+# system prompt: a missing file is a startup warning and an empty base, the
+# same behavior as a missing per-model behavior file.
+DEFAULT_BASE_FILE = "models/base.md"
 
 
 def ev(t, **kw):
@@ -227,6 +220,7 @@ class Session:
 
         self.engine = None
         self.model_name = None
+        self.base_behavior = ""
         self.behavior = ""
         self.history = []
         self.tools = []
@@ -250,6 +244,10 @@ class Session:
         # odometer, not a gauge: /clear empties the conversation but does not
         # rewind what it cost, and it carries across a restart with the session.
         self.total_output = 0
+        # How many times this session has rolled over (auto, /new, or an
+        # accepted ask). Like total_output it survives /clear and a restart —
+        # it counts the session's life, not the current window.
+        self.rollover_count = 0
 
         self.lock = asyncio.Lock()
         self.subscribers = set()
@@ -306,7 +304,8 @@ class Session:
                   budget=self.budget,
                   busy=self.lock.locked(),
                   messages=[m for m in self.history if m.get("role") != "system"],
-                  rollover={"mode": self.rollover_mode, "percent": self.rollover_pct},
+                  rollover={"mode": self.rollover_mode, "percent": self.rollover_pct,
+                            "count": self.rollover_count},
                   missed=missed,
                   gap=bool(last_seq and missed and missed[0]["seq"] > last_seq + 1))
 
@@ -322,11 +321,14 @@ class Session:
         return int((count_messages(msgs) + self.tools_tok) * ESTIMATE_SCALE)
 
     def fresh_history(self, carryover=""):
-        content = SYSTEM_PROMPT
+        """System message: base behavior, per-model behavior, then carryover.
+
+        The base (identity + tool notes) comes from the shared base file and is
+        in the prompt even when the session has no per-model file.
+        """
+        content = self.base_behavior
         if self.behavior:
             content += "\n=== BEHAVIOR ===\n" + self.behavior
-        if self.tools:
-            content += "\n" + TOOLS_NOTE
         if carryover:
             content += CARRYOVER_MARKER + carryover
         return [{"role": "system", "content": content}]
@@ -345,14 +347,18 @@ class Session:
         return tail if sep else ""
 
     def repair_history(self):
-        """Drop a trailing assistant tool-call turn with no results.
+        """Roll the in-memory history back to its last settled shape.
 
-        Belt to the placeholder braces: an interrupted or crashed turn must never
-        leave the server an unanswerable tool call, which 400s forever after.
+        Delegates to settled() so memory and disk agree on what an unfinished
+        turn is: an interrupted or crashed turn must never leave the server an
+        unanswerable tool call (which 400s forever after), a dangling tool
+        result, or a question the model never got to answer.
         """
-        while self.history and self.history[-1].get("tool_calls"):
-            self.history.pop()
-            logger.warning("session %s: dropped an unanswered tool-call turn", self.name)
+        before = len(self.history)
+        self.history = settled(self.history)
+        if len(self.history) < before:
+            logger.warning("session %s: rolled back %d unfinished turn message(s)",
+                           self.name, before - len(self.history))
 
     # ---- config reload ---------------------------------------------------
 
@@ -381,10 +387,11 @@ class Session:
 
         if blob["engine"] is not None:
             self.engine = blob["engine"]
-        if blob["behavior"] is not None and blob["behavior"] != self.behavior:
-            self.behavior = blob["behavior"]
-        # The system message is rebuilt either way: TOOLS_NOTE depends on whether
-        # any tools survived the reload, so an emptied allowlist has to reach it.
+        if blob["behavior"] is not None and blob["behavior"] != (self.base_behavior, self.behavior):
+            self.base_behavior, self.behavior = blob["behavior"]
+        # The system message is rebuilt either way: the base file may have
+        # changed under a live session, and it is the only place the tool
+        # notes live now.
         carried = self.carryover()
         body = [m for m in self.history if m["role"] != "system"]
         self.history = self.fresh_history(carried) + body
@@ -433,6 +440,7 @@ class Session:
             "warned_over": self.warned_over,
             "last_used": self._last_used,
             "total_output": self.total_output,
+            "rollover_count": self.rollover_count,
             # The system message goes too. A rolled-over session carries a
             # === CONTINUED SESSION === block holding a model-written handoff and
             # a transcript path — regenerating the prompt would destroy it.
@@ -456,6 +464,7 @@ class Session:
         self.warned_over = bool(payload.get("warned_over"))
         self._last_used = payload.get("last_used")
         self.total_output = int(payload.get("total_output") or 0)
+        self.rollover_count = int(payload.get("rollover_count") or 0)
         self._persisted = True
 
     # ---- the turn --------------------------------------------------------
@@ -685,7 +694,7 @@ class Session:
                 rolled = await self._maybe_roll(used, trip)
         if rolled:
             self.declined_at, self.warned_over = None, False
-            if trip and count_messages(self.history) >= trip:
+            if trip and self.estimate() >= trip:
                 self.emit(ev("notice", level="warn",
                              text=f"the fresh session already exceeds {self.rollover_pct}% "
                                   f"of {self.budget} tok — automatic rollover disabled; "
@@ -753,8 +762,10 @@ class Session:
         Archive first: a failed summariser or a full disk costs the summary,
         never the conversation.
         """
+        self.rollover_count += 1
         used = used if used is not None else self.estimate()
-        self.emit(ev("rollover_start", reason=reason, used=used, budget=self.budget))
+        self.emit(ev("rollover_start", reason=reason, used=used,
+                     budget=self.budget, count=self.rollover_count))
         try:
             transcript = await store.save_transcript(
                 self.history, self.model_name, self.config, self.name)
@@ -785,7 +796,7 @@ class Session:
 
         fresh = self.fresh_history(store.format_carryover(handoff, transcript))
         tail = store.last_exchange(self.history)
-        if tail and (not trip or count_messages(fresh + tail) < trip):
+        if tail and (not trip or self.estimate(fresh + tail) < trip):
             fresh += tail
         elif tail:
             self.emit(ev("notice", level="warn",
@@ -794,7 +805,8 @@ class Session:
         self.emit(ev("rollover_done",
                      transcript=str(transcript) if transcript else None,
                      handoff=str(handoff_path) if handoff_path else None,
-                     used=count_messages(fresh), budget=self.budget))
+                     used=self.estimate(), budget=self.budget,
+                     count=self.rollover_count))
 
     # ---- commands --------------------------------------------------------
 
@@ -811,7 +823,8 @@ class Session:
             used = self.estimate()
             return {"ok": True, "info": {
                 "session": self.name, "model": self.model_name,
-                "base_url": str(self.engine.client.base_url),
+                "base_url": (str(self.engine.client.base_url)
+                             if self.engine else None),
                 "messages": len(self.history),
                 "recent": [{"role": m["role"],
                             "content": (m.get("content") or "")[:120],
@@ -823,10 +836,13 @@ class Session:
                 "output_total": self.total_output,
                 "rollover": {"mode": self.rollover_mode, "percent": self.rollover_pct,
                              "trip": int(self.budget * self.rollover_pct / 100)
-                                     if self.rollover_pct else 0},
+                                     if self.rollover_pct else 0,
+                             "count": self.rollover_count},
             }}
         if name == "behavior":
-            return {"ok": True, "behavior": self.behavior or ""}
+            return {"ok": True, "model": self.model_name,
+                    "base": self.base_behavior or "",
+                    "behavior": self.behavior or ""}
         if name == "models":
             return {"ok": True, "current": self.model_name,
                     "configured": known_models(self.config)}
@@ -879,7 +895,8 @@ class Session:
         engine, name, entry = await self.manager.engine_for(model_name)
         self.engine = engine
         self.model_name = name
-        self.behavior = await self.manager.behavior_for(entry)
+        # The base is shared by every session; the model file is per model.
+        self.base_behavior, self.behavior = await self.manager.behavior_for(entry)
         # carryover() must be read before history[0] is replaced, and passed back
         # in: switching models after a rollover used to drop the handoff on the floor.
         carried = self.carryover()
@@ -901,6 +918,11 @@ class SessionManager:
         self.sessions = {}
         self._engines = {}
         self._behaviors = {}
+        # Read synchronously at startup — one small local file, the same way
+        # the config file itself is read. A missing file warns and degrades to
+        # an empty base; the core keeps starting.
+        self.base_behavior = self._behavior_sync(
+            config.get("behavior", {}).get("base_file") or DEFAULT_BASE_FILE)
         self._engine_lock = asyncio.Lock()
         tools_cfg = config.get("tools", {})
         workdir = tools_cfg.get("workdir") or str(Path(__file__).parent)
@@ -920,17 +942,28 @@ class SessionManager:
                 self._engines[name] = build_engine(self.config, name)
             return self._engines[name]
 
-    async def behavior_for(self, entry):
-        path = entry.get("behavior_file", "models/default.md")
+    def _behavior_sync(self, path):
+        """Cached read, synchronous: a missing file is a warning and ""."""
         if path not in self._behaviors:
             p = Path(path)
             if not p.is_absolute():
                 p = Path(__file__).parent / p
-            self._behaviors[path] = (await asyncio.to_thread(p.read_text)
-                                     if p.exists() else "")
+            self._behaviors[path] = p.read_text() if p.exists() else ""
             if not p.exists():
                 logger.warning("behavior file not found: %s", p)
         return self._behaviors[path]
+
+    async def _behavior_text(self, path):
+        """Cached read off the event loop; a missing file is a warning and ""."""
+        return await asyncio.to_thread(self._behavior_sync, path)
+
+    async def behavior_for(self, entry):
+        """(base, model) behavior for a session: the shared base file, then
+        the model's own file. Both cached; a missing file is "" (warned)."""
+        base = await self._behavior_text(
+            self.config.get("behavior", {}).get("base_file") or DEFAULT_BASE_FILE)
+        model = await self._behavior_text(entry.get("behavior_file", "models/default.md"))
+        return base, model
 
     async def get(self, name, model=None):
         if name not in self.sessions:
@@ -977,6 +1010,10 @@ class SessionManager:
 
         old_engines, self._engines = self._engines, engines
         self._behaviors.clear()
+        # The base file is re-read like any other behavior file: /reload is
+        # how an edited base.md reaches the live sessions.
+        self.base_behavior = await self._behavior_text(
+            fresh.get("behavior", {}).get("base_file") or DEFAULT_BASE_FILE)
         tools_cfg = fresh.get("tools", {})
         workdir = tools_cfg.get("workdir") or str(Path(__file__).parent)
         from tools import build_tools

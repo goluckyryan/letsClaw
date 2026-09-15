@@ -1,6 +1,13 @@
 # letsClaw Configuration — Example Template
 # Copy to config.yaml and customize.
 
+# Behavior — Markdown sent with every prompt. The base file is shared by all
+# models (identity, working style, tool notes); each model's behavior_file
+# layers per-model tuning on top of it. A missing file is a warning at core
+# startup and an empty file — the core keeps running.
+behavior:
+  base_file: "models/base.md"
+
 # Model registry — every entry is self-contained: it names its own server, so
 # reading one entry tells you everything about that model.
 #   default_model: which entry to start with

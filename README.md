@@ -51,7 +51,7 @@ graph TD
         Sessions2[Sessions\ncore.py\nhistory + rollover]
         Engine[LLM Engine\nllm_engine.py]
         Config[Config\nconfig.yaml]
-        ModelFile["Behavior MD files\nper-model / per-channel (planned)"]
+        ModelFile["Behavior MD files\nbase (shared) + per-model\nper-channel (planned)"]
     end
 
     subgraph Modules
@@ -97,22 +97,25 @@ graph TD
 
 ## Behavior Files
 
-The system prompt is assembled from four parts, in this order:
+The system prompt is assembled from three parts, in this order:
 
-1. **Base** — a short hardcoded identity in `core.py` (`SYSTEM_PROMPT`), shared by all models
-2. **Behavior file** — plain Markdown, one per model entry via `behavior_file`
-   (e.g. `models/default.md`); each model can point at its own file
-3. **Tools note** — a fixed block describing the enabled tools, included only when any are on
-4. **Continued session** — after a rollover, the model-written handoff and the transcript
-   path, carried in the system message
+1. **Base behavior** — `models/base.md` (config: `behavior.base_file`), shared by every
+   session and every model: the identity, the working style, and the tool notes. It is
+   plain Markdown, so all of it can be tuned without a code change. A missing base file
+   is a warning at core startup and an empty base — the core keeps running, the same
+   behavior as a missing per-model file.
+2. **Per-model behavior** — one MD file per model entry via `behavior_file`
+   (e.g. `models/default.md`), layered on top of the base for tuning a specific LLM.
+3. **Continued session** — after a rollover, the model-written handoff and the transcript
+   path, carried in the system message.
 
 The prompt is not frozen at startup: it is rebuilt when a session switches models, rolls
-over, or takes a config reload — which is also how a changed behavior file reaches a
+over, or takes a config reload — which is also how a changed base or model file reaches a
 running session. Per-channel behavior (a Discord channel with its own MD file) is planned
 with Discord.
 
-No framework-injected boilerplate: if it's not in the system prompt parts above or the
-conversation, it's not sent.
+No framework-injected boilerplate: if it's not in the files above or the conversation,
+it's not sent.
 
 ## Agent Tools
 

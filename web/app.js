@@ -22,7 +22,7 @@ const COMMANDS = {
   '/new':       'archive the session, keep the objective, start fresh',
   '/model':     'list models, or /model <name> to switch',
   '/info':      'recent history and context usage',
-  '/behavior':  'print the loaded behavior file',
+  '/behavior':  'print the loaded behavior files (base + model)',
   '/reasoning': "toggle live display of the model's thinking",
   '/stop':      'interrupt the turn in progress',
   '/reload':    're-read config.yaml into the running core',
@@ -43,6 +43,7 @@ const S = {
   model: null,
   budget: 0,
   tripPct: 0,
+  rollovers: 0,
   showReasoning: localStorage.getItem('letsclaw.reasoning') === '1',
   busy: false,
   closing: false,
@@ -291,7 +292,8 @@ function setBusy(on) {
 }
 
 function setHint(extra) {
-  const ro = S.tripPct ? `rollover at ${S.tripPct}%` : 'rollover off';
+  const ro = (S.tripPct ? `rollover at ${S.tripPct}%` : 'rollover off')
+           + rolloverCount({ count: S.rollovers });
   $('#hint').textContent =
     `session '${S.session}' · ${S.model || '?'} · ${ro} · thinking ${S.showReasoning ? 'shown' : 'hidden'}` +
     (extra ? ` · ${extra}` : '');
@@ -503,7 +505,9 @@ function handle(e) {
     slab('roll', `✨ New session — ${e.used}/${e.budget} tok` +
                  (paths.length ? `<div class="paths">${paths.join('<br>')}</div>` : ''));
     separator('fresh context from here');
+    if (e.count != null) S.rollovers = e.count;
     setGauge(e.used, e.budget, false);
+    setHint();
     return;
   }
 
@@ -585,6 +589,7 @@ function hello(e) {
   S.model = e.model;
   S.budget = e.budget;
   S.tripPct = (e.rollover && e.rollover.percent) || 0;
+  S.rollovers = (e.rollover && e.rollover.count) || 0;
   S.session = e.session;
   document.title = `${e.session} · letsClaw`;
   // Empty means boot()'s /models fetch never landed. The core is plainly up now, or
@@ -687,7 +692,10 @@ function response(e) {
   if (e.changed) return showReload(e);
   if (e.info) return showInfo(e.info);
   if ('behavior' in e) {
-    return msg('assistant', '📄', renderMd(e.behavior ? '```markdown\n' + e.behavior + '\n```' : '_No behavior file loaded._'));
+    let md = '';
+    if (e.base) md += '**base**\n```markdown\n' + e.base + '\n```\n';
+    if (e.behavior) md += '**model**\n```markdown\n' + e.behavior + '\n```\n';
+    return msg('assistant', '📄', renderMd(md || '_No behavior file loaded._'));
   }
   if (e.configured) {
     return notice(`🤖 current: ${e.current}   ·   configured: ${e.configured.join(', ') || '(none)'}`);
@@ -704,6 +712,11 @@ function showReload(e) {
     (e.deferred ? `, ${e.deferred} waiting for a turn to finish` : ''));
 }
 
+function rolloverCount(ro) {
+  if (!ro) return '';
+  const n = ro.count || 0;
+  return ` · ${n} rollover${n !== 1 ? 's' : ''}`;
+}
 function showInfo(i) {
   const pct = i.budget ? Math.round((i.used * 100) / i.budget) : 0;
   const rows = i.recent.map((m) => {
@@ -718,8 +731,8 @@ function showInfo(i) {
       ? `📤 ${i.output_total} output tok generated in this session (an odometer — /clear does not rewind it)<br>`
       : '') +
     (i.rollover.percent
-      ? `🔄 rollover ${esc(i.rollover.mode)} at ${i.rollover.percent}% (${i.rollover.trip} tok)<br>`
-      : `🔄 rollover disabled (/new still works)<br>`) +
+      ? `🔄 rollover ${esc(i.rollover.mode)} at ${i.rollover.percent}% (${i.rollover.trip} tok)${rolloverCount(i.rollover)}<br>`
+      : `🔄 rollover disabled (/new still works)${rolloverCount(i.rollover)}<br>`) +
     `<br>📜 recent:<br>${rows}`);
   setGauge(i.used, i.budget, false);
 }

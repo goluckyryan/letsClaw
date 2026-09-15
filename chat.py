@@ -44,7 +44,7 @@ COMMANDS = {
     "/new": "archive the session, keep the objective, start fresh",
     "/model": "list models, or /model <name> to switch",
     "/info": "recent history and context usage",
-    "/behavior": "print the loaded behavior file",
+    "/behavior": "print the loaded behavior files (base + model)",
     "/reasoning": "toggle live display of the model's thinking",
     "/stop": "interrupt the turn in progress",
     "/reload": "re-read config.yaml into the running core",
@@ -260,8 +260,10 @@ class Renderer:
             self.line(f"  📤 Output: {i['output_total']} tok generated in this session"
                       f"  (an odometer — /clear does not rewind it)")
         ro = i["rollover"]
-        self.line(f"  🔄 Rollover: {ro['mode']} at {ro['percent']}% ({ro['trip']} tok)"
-                  if ro["percent"] else "  🔄 Rollover: disabled  (/new still works)")
+        n = ro.get("count") or 0
+        count = f" · {n} rollover{'s' if n != 1 else ''}"
+        self.line(f"  🔄 Rollover: {ro['mode']} at {ro['percent']}% ({ro['trip']} tok){count}"
+                  if ro["percent"] else f"  🔄 Rollover: disabled (/new still works){count}")
 
     def show_reload(self, r):
         changed = r.get("changed") or []
@@ -327,8 +329,13 @@ async def run_client(url, session_name, render):
                     if "info" in e:
                         render.show_info(e)
                     elif "behavior" in e:
-                        render.line(f"\n📄 Behavior file:\n{e['behavior']}"
-                                    if e["behavior"] else "\nNo behavior file loaded.")
+                        if e.get("base"):
+                            render.line(f"\n📄 Base behavior:\n{e['base']}")
+                        if e.get("behavior"):
+                            model = f" ({e['model']})" if e.get("model") else ""
+                            render.line(f"\n📄 Model behavior{model}:\n{e['behavior']}")
+                        if not e.get("base") and not e.get("behavior"):
+                            render.line("\nNo behavior file loaded.")
                     elif "configured" in e:
                         render.line(f"\n🤖 Current: {e.get('current')}")
                         render.line(f"📋 Configured models: {', '.join(e['configured']) or '(none)'}")
