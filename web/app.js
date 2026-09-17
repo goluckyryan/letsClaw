@@ -164,6 +164,12 @@ function renderMd(src) {
 
 let waitEl = null;
 let waitTimer = null;
+// Reasoning characters seen this turn, for the live counter in the waiting slab.
+// Characters, not tokens: the browser has no tokeniser, so the figure shown is
+// an estimate and wears a ~ to say so. The exact count arrives in the ⚡ stats
+// line at the end of the turn, from the server.
+let reasonChars = 0;
+const CHARS_PER_TOKEN = 4;   // the same fallback ratio token_counter.py uses
 
 function atBottom() {
   return log.scrollHeight - log.scrollTop - log.clientHeight < 80;
@@ -237,7 +243,14 @@ function setWaiting(label) {
   let i = 0;
   const tick = () => {
     const s = (Date.now() - t0) / 1000;
-    waitEl.innerHTML = `<span class="spin">${FRAMES[i++ % FRAMES.length]}</span> ${esc(label)}… ${s.toFixed(1)}s`;
+    // The token figure keeps counting across a whole turn — several rounds, and
+    // every resumed lap of a thinking pad — while the clock restarts with each
+    // wait. On a long think it is the only sign the model is still getting
+    // somewhere, which is why it shows even when the thinking text is hidden.
+    const tok = Math.round(reasonChars / CHARS_PER_TOKEN);
+    const thought = tok ? ` · ~${tok.toLocaleString()} tok thought` : '';
+    waitEl.innerHTML = `<span class="spin">${FRAMES[i++ % FRAMES.length]}</span> `
+      + `${esc(label)}… ${s.toFixed(1)}s${thought}`;
   };
   tick();
   waitTimer = setInterval(tick, 100);
@@ -416,12 +429,16 @@ function handle(e) {
 
   case 'turn_start':
     S.turn = { textEl: null, reasonEl: null, tools: new Map() };
+    reasonChars = 0;
     setBusy(true);
     msg('user', '👤').querySelector('.body').textContent = e.text;
     setWaiting('thinking');
     return;
 
   case 'reasoning':
+    // Counted before the display check on purpose: with the thinking hidden
+    // this counter is the only feedback that the model is still working.
+    reasonChars += e.delta.length;
     if (!S.showReasoning) return;
     if (!S.turn) S.turn = { textEl: null, reasonEl: null, tools: new Map() };
     if (!S.turn.reasonEl) S.turn.reasonEl = msg('reasoning', '🧠').querySelector('.body');
@@ -588,6 +605,10 @@ function hello(e) {
   }
   S.model = e.model;
   S.budget = e.budget;
+  // Zeroed before the replay below: attaching to a turn already in flight, we
+  // never saw its earlier thinking, so counting on from a previous turn's total
+  // would invent tokens. A replayed turn_start resets it again, harmlessly.
+  reasonChars = 0;
   S.tripPct = (e.rollover && e.rollover.percent) || 0;
   S.rollovers = (e.rollover && e.rollover.count) || 0;
   S.session = e.session;
