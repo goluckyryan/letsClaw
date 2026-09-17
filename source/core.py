@@ -701,11 +701,19 @@ class Session:
         rounds = out_reported = 0
         out_measured = out_estimated = 0
 
-        def tally(result):
-            """Fold one round's usage in. Shared by the loop and its fallback."""
+        def tally(result, history_shaped=True):
+            """Fold one round's usage in. Shared by the loop and its fallback.
+
+            history_shaped=False for a resumed round. Its prompt carries the
+            thinking pad, which is thrown away at the end of the turn and never
+            reaches history, so letting it set last_prompt would measure the
+            window as tens of thousands of tokens fuller than it really is — and
+            trip a rollover on the next check. Output still counts: those tokens
+            were genuinely generated.
+            """
             nonlocal last_prompt, rounds, out_reported, out_measured, out_estimated
             rounds += 1
-            if result.prompt_tokens is not None:
+            if history_shaped and result.prompt_tokens is not None:
                 last_prompt = result.prompt_tokens
             if result.completion_tokens is not None:
                 out_reported += 1
@@ -754,7 +762,8 @@ class Session:
                     on_text=on_text, on_reasoning=on_reasoning)
             if ttft_box["v"] is not None:
                 last_ttft = ttft_box["v"]
-            tally(result)
+            # A resumed round's prompt is history + pad, not history: see tally.
+            tally(result, history_shaped=pad is None)
             last_finish = result.finish_reason
             last_reasoning = result.reasoning or ""
             return result
@@ -934,6 +943,13 @@ class Session:
         if not (self.engine and self.engine.max_reasoning_rounds and self.budget):
             return
         if self.rollover_mode != "auto" or not self.rollover_before_think:
+            return
+        # rollover_at_percent: 0 means never, and _after_turn already honours it.
+        # This path has to as well, or a session that switched rollover off — by
+        # config, or by the auto-disable when even a fresh window trips the
+        # threshold — would still be rolled over from here, which is both a
+        # surprise and, in the auto-disable case, the loop that guard prevents.
+        if not self.rollover_pct:
             return
         if self._pad_headroom() >= MIN_THINK_HEADROOM:
             return
