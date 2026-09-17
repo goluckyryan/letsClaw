@@ -13,6 +13,9 @@ state/
 logs/
 *.log
 
+# Local test suite — kept out of the tree deliberately
+tests/
+
 # Editor / OS
 .vscode/
 .idea/

@@ -18,7 +18,9 @@ Two rules shape everything below:
 import asyncio
 import copy
 import itertools
+import json
 import logging
+import re
 import time
 from collections import deque
 from datetime import datetime
@@ -26,15 +28,16 @@ from pathlib import Path
 
 import yaml
 
+import paths
 import session as store
-from llm_engine import LLMEngine
+from llm_engine import ChatResult, LLMEngine
 from token_counter import count_messages, count_text, count_tools
 
 logger = logging.getLogger("letclaw.core")
 
 PROTOCOL_VERSION = 1
 
-CONFIG_PATH = Path(__file__).parent / "config.yaml"
+CONFIG_PATH = paths.REPO_ROOT / "config.yaml"
 
 DEFAULT_CONTEXT_LENGTH = 12000
 DEFAULT_ROLLOVER_PCT = 90
@@ -48,6 +51,43 @@ HANDOFF_MARGIN = 200
 ESTIMATE_SCALE = 1.6
 
 CARRYOVER_MARKER = "\n\n=== CONTINUED SESSION ===\n"
+
+# Seconds held back from turn_timeout so the closing round still fits inside the
+# wall after a long think. Thinking stops at turn_timeout - this.
+DEFAULT_ANSWER_TIME_RESERVE = 120
+# Slack left between the pad and the context ceiling. The pad rides in the
+# prompt and grows every lap, and our token count runs low (see ESTIMATE_SCALE),
+# so the headroom wall trips this far short of the real edge.
+PAD_CONTEXT_MARGIN = 2000
+# Below this much free context there is no room to think in, so the pad is not
+# worth starting — the pre-turn check rolls over instead where it may.
+MIN_THINK_HEADROOM = 4000
+# How much of a compacted pad stays word-for-word. A checkpoint replaces the
+# distant past, but the model must still resume *mid-sentence*, so the tail it
+# left off in is never summarised.
+PAD_TAIL_TOKENS = 2000
+
+# Marks the forced-conclusion directive in base.md. The core extracts the
+# paragraph after this line and re-sends it as a user message when a cut-off
+# round cannot be resumed (resume_mode: off, or a server that won't prefill) —
+# the model's own words, tunable without a code change. Missing marker = a short
+# built-in sentence.
+CONCLUDE_MARKER = "## Forced conclusion"
+CONCLUDE_FALLBACK = ("Your reasoning was cut off at the token limit. Stop "
+                     "reasoning now and give your best final answer. If you "
+                     "truly cannot conclude, say in one sentence what single "
+                     "fact is missing.")
+
+# Sent when a thinking pad has filled the context and is about to be compacted:
+# the model writes down what it has established, and that note replaces the
+# reasoning it summarises. Lives in base.md for the same reason as the above.
+CHECKPOINT_MARKER = "## Checkpoint"
+CHECKPOINT_FALLBACK = ("Your reasoning has filled the available room. Write "
+                       "down everything you have established so far — every "
+                       "intermediate value exactly as you computed it, every "
+                       "assumption made, and what still has to be done. This "
+                       "note replaces the reasoning it summarises, so whatever "
+                       "you leave out is lost. This is not the final answer.")
 
 # The base behavior — identity, working style and the tool notes — lives in
 # plain Markdown (behavior.base_file) so it can be tuned without a code change.
@@ -95,11 +135,40 @@ def build_engine(config, model_name=None):
     engine = LLMEngine(
         base_url=base_url, api_key=entry.get("api_key", ""),
         default_model=entry.get("provider_name", name),
+        timeout=(int(entry.get("turn_timeout", 36000) or 0) or None),
         temperature=entry.get("temperature"),
         max_tokens=entry.get("max_tokens"),
         top_p=entry.get("top_p"),
     )
     engine.context_length = entry.get("context_length", DEFAULT_CONTEXT_LENGTH)
+    # The answer sheet: the cap the closing round runs under, once thinking has
+    # been shut with </think>. Every token of it buys answer, not reasoning.
+    # 0 = the closing round keeps the per-lap max_tokens.
+    engine.max_output = int(entry.get("max_output_tokens", 32768) or 0)
+    # Hard wall for one turn, in seconds — a limit on a round, thinking model or
+    # not. 0 = no wall. It must reach the HTTP client too, whose 600 s read
+    # timeout would otherwise kill a long round.
+    engine.turn_timeout = int(entry.get("turn_timeout", 36000) or 0)
+    # How many resume laps the thinking pad may run before the answer phase
+    # takes over. Bounded so a runaway model costs extra laps, never a loop.
+    engine.max_reasoning_rounds = int(entry.get("max_reasoning_rounds", 3) or 0)
+    # Seconds held back from turn_timeout so the answer still fits inside the
+    # wall after a long think. Thinking stops at turn_timeout - this.
+    engine.answer_time_reserve = int(entry.get("answer_time_reserve",
+                                               DEFAULT_ANSWER_TIME_RESERVE) or 0)
+    # How many times a pad that has filled the context may be distilled to a
+    # checkpoint and carry on. Off by default: compaction is lossy, and for a
+    # derivation that carries exact values through many steps, concluding from a
+    # complete pad usually beats continuing from a summarised one.
+    engine.max_pad_compactions = int(entry.get("max_pad_compactions", 0) or 0)
+    mode = str(entry.get("resume_mode", "auto")).lower()
+    if mode not in ("auto", "chat", "raw", "off"):
+        logger.warning("model %s: bad resume_mode %r, using auto", name, mode)
+        mode = "auto"
+    engine.resume_mode = mode
+    # Qwen3 templates turn this into a system directive; llama.cpp defaults to
+    # xhigh, which is itself a large part of why rounds run out mid-reasoning.
+    engine.reasoning_effort = entry.get("reasoning_effort") or None
     return engine, name, entry
 
 
@@ -209,6 +278,79 @@ def settled(history):
     return out
 
 
+def truncated_tool_calls(result):
+    """Tool calls whose arguments did not finish generating.
+
+    A round cut off at the token cap can stop in the middle of a tool call's
+    JSON. Such a call must never run: `rm -rf /tmp/scratch` truncated to
+    `rm -rf /` is the same shape of accident, and the half-written JSON also
+    fails the server's own validation on the next request, killing the turn.
+    """
+    bad = []
+    for tc in result.tool_calls or []:
+        args = (tc.get("arguments") or "").strip()
+        if not args:
+            continue  # a no-argument call is legitimately empty
+        try:
+            json.loads(args)
+        except (ValueError, TypeError):
+            bad.append(tc)
+    return bad
+
+
+def strip_tool_markup(text):
+    """Drop tool-call markup a resumed round may have written as prose.
+
+    The raw transport talks to /completion, which has no tool-call parser, so a
+    model that decides mid-answer to run `exec` emits the template's own
+    <tool_call> XML as plain text. It cannot be honoured — a resumed round is
+    past the point where tools can run — and showing the user raw markup is
+    worse than showing them nothing, so it comes out.
+    """
+    if not text or "<tool_call>" not in text:
+        return text
+    cleaned = re.sub(r"<tool_call>.*?(?:</tool_call>|\Z)", "", text, flags=re.S)
+    return cleaned.strip()
+
+
+def extract_conclude_directive(base_behavior):
+    """The paragraph that forces a cut-off round to conclude. See extract_directive."""
+    return extract_directive(base_behavior, CONCLUDE_MARKER, CONCLUDE_FALLBACK)
+
+
+def extract_checkpoint_directive(base_behavior):
+    """The paragraph that asks a full pad to distil itself. See extract_directive."""
+    return extract_directive(base_behavior, CHECKPOINT_MARKER, CHECKPOINT_FALLBACK)
+
+
+def extract_directive(base_behavior, marker, fallback):
+    """The paragraph after `marker` in the base behavior file.
+
+    These are messages the core sends the model on its own initiative, so they
+    live in base.md — tunable with /reload, no code change. Without the heading,
+    a short built-in sentence.
+    """
+    if marker not in base_behavior:
+        return fallback
+    _, _, rest = base_behavior.partition(marker)
+    # The paragraph ends at the next heading or end of file. HTML comments are
+    # notes to whoever edits the file, not words for the model.
+    para = []
+    in_comment = False
+    for line in rest.splitlines():
+        if line.startswith("#"):
+            break
+        if in_comment:
+            in_comment = "-->" not in line
+            continue
+        if line.lstrip().startswith("<!--"):
+            in_comment = "-->" not in line
+            continue
+        para.append(line)
+    text = "\n".join(para).strip()
+    return text or CONCLUDE_FALLBACK
+
+
 class Session:
     """One conversation: history, model, rollover policy, attached clients."""
 
@@ -237,6 +379,9 @@ class Session:
             logger.warning("session %s: bad rollover_mode %r, using auto",
                            name, self.rollover_mode)
             self.rollover_mode = "auto"
+        # Roll over before a turn that has no room left to think in, rather than
+        # after one whose thinking was squeezed out. Auto mode only.
+        self.rollover_before_think = bool(conv.get("rollover_before_think", True))
         self.prompt_timeout = int(conv.get("prompt_timeout", 60))
         self.declined_at = None
         self.warned_over = False
@@ -483,7 +628,21 @@ class Session:
             self.turn_events.clear()
             self.emit(ev("turn_start", turn_id=self.turn_id, text=text, origin=origin))
             try:
-                await self._turn(text)
+                if self.engine and self.engine.turn_timeout:
+                    # The turn's hard wall (models.<name>.turn_timeout). A wall
+                    # hit mid-round cancels the turn; the cleanup below is the
+                    # same as a /stop, and the finally persists and announces.
+                    await asyncio.wait_for(self._turn(text),
+                                           timeout=self.engine.turn_timeout)
+                else:
+                    await self._turn(text)
+            except asyncio.TimeoutError:
+                wall = self.engine.turn_timeout
+                self.repair_history()
+                self.emit(ev("notice", level="warn",
+                             text=(f"turn hit the {wall // 3600} h wall — cancelled"
+                                   if wall >= 3600 else
+                                   f"turn hit the {wall} s wall — cancelled")))
             except asyncio.CancelledError:
                 self.repair_history()
                 self.emit(ev("notice", level="warn", text="turn cancelled"))
@@ -518,14 +677,20 @@ class Session:
                                          self.name)
 
     async def _turn(self, text):
+        # Before the user message lands, so a roll starts the fresh session with
+        # this turn's question in it rather than one turn late.
+        await self._headroom_check()
         self.history.append({"role": "user", "content": text})
         user_tok = count_text(text)
 
+        turn_t0 = time.monotonic()
         tools_used = 0
         last_ttft = None
         last_prompt = None   # size of the last prompt actually sent
         full_response = ""
         had_error = False
+        last_finish = None   # finish_reason of the last round that returned
+        last_reasoning = ""  # that round's reasoning — the seed of a thinking pad
         reasoning_parts = []
         # Output accounting. A turn can span several rounds, and every one of
         # them generates: text, reasoning, and the tool-call arguments. The
@@ -552,76 +717,131 @@ class Session:
                 out_estimated += (count_text(tc.get("name") or "")
                                   + count_text(tc.get("arguments") or ""))
 
+        async def call_round(tools=None, overrides=None, pad=None, closing=False,
+                             extra_messages=None):
+            """One model round: stream, tally, and return the result.
+
+            Shared by the tool loop, the thinking-pad laps and the fallback
+            conclusion rounds, so every one of them lands in the same accounting
+            and emits the same events. With `pad` set the round is a resume —
+            the pad is handed back to the model instead of the question being
+            re-asked, and tools are never offered.
+            """
+            nonlocal last_ttft, last_finish, last_reasoning
+            t0 = time.monotonic()
+            ttft_box = {"v": None}
+
+            def on_text(chunk, box=ttft_box):
+                if box["v"] is None:
+                    box["v"] = time.monotonic() - t0  # measured at the model, not the client
+                self.emit(ev("text", delta=chunk))
+
+            def on_reasoning(chunk):
+                self.emit(ev("reasoning", delta=chunk))
+
+            # extra_messages ride along for this one round without entering the
+            # conversation: the closing round needs the "do not call tools"
+            # directive, but a turn's history must not collect scaffolding.
+            msgs = self.history + list(extra_messages or [])
+            if pad is None:
+                result = await self.engine.chat_with_tools(
+                    msgs, tools=tools, on_text=on_text,
+                    on_reasoning=on_reasoning, overrides=overrides)
+            else:
+                result = await self.engine.resume_round(
+                    msgs, pad, closing=closing, tools=tools,
+                    max_tokens=(overrides or {}).get("max_tokens"),
+                    on_text=on_text, on_reasoning=on_reasoning)
+            if ttft_box["v"] is not None:
+                last_ttft = ttft_box["v"]
+            tally(result)
+            last_finish = result.finish_reason
+            last_reasoning = result.reasoning or ""
+            return result
+
+        async def run_tools(result):
+            """Record one round's tool calls and execute them.
+
+            Shared by the tool loop and by a thinking pad's conclusion, which may
+            decide the right ending is an action rather than a sentence.
+            """
+            nonlocal tools_used
+            # A call cut off mid-JSON is never executed and never stored as it
+            # came: the arguments go in as {} so the history stays valid for the
+            # server, and the model is told why nothing ran.
+            cut = {id(tc) for tc in truncated_tool_calls(result)}
+            self.history.append({
+                "role": "assistant",
+                "content": result.text or "",
+                "tool_calls": [
+                    {"id": tc["id"], "type": "function",
+                     "function": {"name": tc["name"],
+                                  "arguments": "{}" if id(tc) in cut else tc["arguments"]}}
+                    for tc in result.tool_calls
+                ],
+            })
+            # Reserve every result slot before running anything, so a turn
+            # torn off mid-loop still leaves a well-formed history.
+            slots = {}
+            for tc in result.tool_calls:
+                msg = {"role": "tool", "tool_call_id": tc["id"],
+                       "content": "error: cancelled"}
+                slots[tc["id"]] = msg
+                self.history.append(msg)
+
+            for tc in result.tool_calls:
+                # Emitted BEFORE the call: a 120-second exec used to be silent.
+                self.emit(ev("tool_call", id=tc["id"], name=tc["name"],
+                             arguments=tc["arguments"]))
+                tool = next((t for t in self.tools if t.name == tc["name"]), None)
+                if id(tc) in cut:
+                    out = ("error: the call was cut off at the output limit and "
+                           "its arguments are incomplete, so it was not run. "
+                           "Issue it again, more briefly.")
+                    self.emit(ev("notice", level="warn",
+                                 text=f"{tc['name']} call was truncated mid-arguments "
+                                      "— not run"))
+                elif tool is None:
+                    out = f"error: tool '{tc['name']}' is not enabled"
+                else:
+                    out = await tool.run(tc["arguments"])
+                tools_used += 1
+                slots[tc["id"]]["content"] = out
+                self.emit(ev("tool_result", id=tc["id"], name=tc["name"], size=len(out)))
+
+        def was_cut_off(result):
+            """Reasoning ate the whole budget: thought hard, said nothing."""
+            return (not result.text and not result.wants_tool
+                    and result.finish_reason == "length"
+                    and self.engine.max_reasoning_rounds)
+
         try:
             for _ in range(self.max_tool_rounds):
-                t0 = time.monotonic()
-                ttft_box = {"v": None}
-
-                def on_text(chunk, box=ttft_box):
-                    if box["v"] is None:
-                        box["v"] = time.monotonic() - t0  # measured at the model, not the client
-                    self.emit(ev("text", delta=chunk))
-
-                def on_reasoning(chunk):
-                    self.emit(ev("reasoning", delta=chunk))
-
-                result = await self.engine.chat_with_tools(
-                    self.history, tools=self.schemas,
-                    on_text=on_text, on_reasoning=on_reasoning)
-
-                if ttft_box["v"] is not None:
-                    last_ttft = ttft_box["v"]
-                tally(result)
+                result = await call_round(tools=self.schemas)
                 if not result.wants_tool:
+                    # A cut-off round is resumed rather than lost — see
+                    # _think_pad. Its conclusion may be an answer or, if the
+                    # thinking decided the ending is an action, a tool call;
+                    # the latter rejoins this loop with the result in hand.
+                    if was_cut_off(result):
+                        result = await self._think_pad(call_round, turn_t0,
+                                                       result.reasoning)
+                        if result.wants_tool:
+                            await run_tools(result)
+                            continue
                     full_response = result.text
                     break
 
-                self.history.append({
-                    "role": "assistant",
-                    "content": result.text or "",
-                    "tool_calls": [
-                        {"id": tc["id"], "type": "function",
-                         "function": {"name": tc["name"], "arguments": tc["arguments"]}}
-                        for tc in result.tool_calls
-                    ],
-                })
-                # Reserve every result slot before running anything, so a turn
-                # torn off mid-loop still leaves a well-formed history.
-                slots = {}
-                for tc in result.tool_calls:
-                    msg = {"role": "tool", "tool_call_id": tc["id"],
-                           "content": "error: cancelled"}
-                    slots[tc["id"]] = msg
-                    self.history.append(msg)
-
-                for tc in result.tool_calls:
-                    # Emitted BEFORE the call: a 120-second exec used to be silent.
-                    self.emit(ev("tool_call", id=tc["id"], name=tc["name"],
-                                 arguments=tc["arguments"]))
-                    tool = next((t for t in self.tools if t.name == tc["name"]), None)
-                    if tool is None:
-                        out = f"error: tool '{tc['name']}' is not enabled"
-                    else:
-                        out = await tool.run(tc["arguments"])
-                    tools_used += 1
-                    slots[tc["id"]]["content"] = out
-                    self.emit(ev("tool_result", id=tc["id"], name=tc["name"], size=len(out)))
+                await run_tools(result)
             else:
                 self.emit(ev("notice", level="warn",
                              text=f"{self.max_tool_rounds} tool rounds used — "
                                   "asking for a final answer"))
-                t0 = time.monotonic()
-                ttft_box = {"v": None}
-
-                def on_text2(chunk, box=ttft_box):
-                    if box["v"] is None:
-                        box["v"] = time.monotonic() - t0
-                    self.emit(ev("text", delta=chunk))
-
-                result = await self.engine.chat_with_tools(self.history, on_text=on_text2)
-                if ttft_box["v"] is not None:
-                    last_ttft = ttft_box["v"]
-                tally(result)
+                result = await call_round()
+                if was_cut_off(result):
+                    # Out of tool rounds, so this conclusion must be words.
+                    result = await self._think_pad(call_round, turn_t0,
+                                                   result.reasoning, allow_tools=False)
                 full_response = result.text
         except asyncio.CancelledError:
             raise
@@ -676,14 +896,275 @@ class Session:
         elif not had_error:
             # No answer, but the generation still happened and still cost — say
             # how much, or a turn spent entirely on reasoning looks free.
-            self.emit(ev("notice", level="info",
-                         text=f"no answer — the model likely spent its budget on "
-                              f"reasoning ({'' if out_exact else '~'}{out_tok} output tok)"))
+            # finish_reason says whether the cap was actually hit, so the advice
+            # matches the cause instead of guessing.
+            if last_finish == "length" and not self.engine.max_reasoning_rounds:
+                # The forced-conclusion loop is off, so the cap advice is still
+                # the useful one; with it on, the loop said what it did already.
+                self.emit(ev("notice", level="warn",
+                             text="the answer hit the output cap mid-reasoning — "
+                                  "raise max_output_tokens (or the model's "
+                                  "max_tokens) and try again"))
+            else:
+                self.emit(ev("notice", level="info",
+                             text=f"no answer — the model likely spent its budget on "
+                                  f"reasoning ({'' if out_exact else '~'}{out_tok} output tok)"))
 
         # Rollover is evaluated only here: the tool loop has fully drained, so no
-        # tool_call/tool_result pair can be split.
+        # tool_call/tool_result pair can be split. A thinking pad never reaches
+        # history — only the answer does — so a long think cannot drag the
+        # rollover trip point forward. Keep it that way.
         if not had_error:
             await self._after_turn(getattr(self, "_last_used", None))
+
+    def _pad_headroom(self):
+        """Context tokens a thinking pad may still grow into."""
+        answer = self.engine.max_output or (self.engine.extra_params.get("max_tokens") or 0)
+        return self.budget - self.estimate() - answer - PAD_CONTEXT_MARGIN
+
+    async def _headroom_check(self):
+        """Roll over *before* a turn when there is no room left to think in.
+
+        A session sitting just under the rollover threshold has a full window
+        and no headroom, so the pad's context wall would trip on the first lap —
+        thinking would be off exactly where a hard question needs it. Rolling
+        first gives the turn a fresh window. Only in auto mode: `ask` must not
+        put a question before the turn has even started, and `off` means off.
+        """
+        if not (self.engine and self.engine.max_reasoning_rounds and self.budget):
+            return
+        if self.rollover_mode != "auto" or not self.rollover_before_think:
+            return
+        if self._pad_headroom() >= MIN_THINK_HEADROOM:
+            return
+        used = self.estimate()
+        self.emit(ev("notice", level="info",
+                     text=f"only {max(0, self._pad_headroom())} tok of thinking room "
+                          f"left — rolling over before the turn"))
+        await self.roll_over("no thinking headroom", used,
+                             int(self.budget * self.rollover_pct / 100))
+
+    async def _think_pad(self, call_round, turn_t0, seed, allow_tools=True):
+        """Resume a cut-off round instead of re-asking the question.
+
+        The model's reasoning and its answer come out of one budget, so a round
+        can end having thought hard and said nothing. Rather than bin that work,
+        the reasoning becomes a *pad*: handed back unclosed, so the model carries
+        on mid-sentence. The pad grows lap by lap until a wall trips, and then
+        the answer phase closes the thinking block itself — which both forces an
+        answer (models often never close it) and makes the answer's budget
+        genuinely separate, since past `</think>` no more reasoning can happen.
+
+        The pad lives here and nowhere else: it never enters history, so it costs
+        nothing after the turn and cannot move the rollover point.
+        """
+        pad = seed or ""
+        lap_cap = self.engine.extra_params.get("max_tokens") or None
+        answer_cap = self.engine.max_output or lap_cap
+        # Thinking must stop early enough that the closing round still fits
+        # inside the turn wall that run_turn already holds us to.
+        wall = self.engine.turn_timeout
+        reserve = getattr(self.engine, "answer_time_reserve", DEFAULT_ANSWER_TIME_RESERVE)
+        think_deadline = (turn_t0 + max(0, wall - reserve)) if wall else None
+
+        transport = await self.engine.resume_transport()
+        if transport == "off":
+            return await self._forced_conclusion(call_round, answer_cap)
+        # Only the chat transport parses tool calls; see the answer phase below.
+        tools_ok = allow_tools and transport == "chat"
+
+        laps = compactions = 0
+        # A while loop, not a range: a compaction is not a lap and must not
+        # spend one — it buys room for the laps that follow.
+        while laps < self.engine.max_reasoning_rounds:
+            if think_deadline and time.monotonic() >= think_deadline:
+                self.emit(ev("notice", level="info",
+                             text=f"thinking stopped at the {reserve} s answer reserve "
+                                  f"after {laps} lap(s) — concluding"))
+                break
+            if self._pad_headroom() - count_text(pad) <= 0:
+                if compactions >= self.engine.max_pad_compactions:
+                    self.emit(ev("notice", level="info",
+                                 text=f"thinking filled the context after {laps} lap(s) "
+                                      "— concluding"))
+                    break
+                if count_text(pad) <= PAD_TAIL_TOKENS * 2:
+                    # Everything here would survive as the verbatim tail, so
+                    # there is nothing to distil — a checkpoint round would only
+                    # spend budget to make the pad bigger.
+                    self.emit(ev("notice", level="info",
+                                 text=f"thinking filled the context after {laps} lap(s), "
+                                      "too little to compact — concluding"))
+                    break
+                compacted = await self._compact_pad(call_round, pad, answer_cap)
+                compactions += 1
+                # On failure keep the pad we already have: concluding from a
+                # complete pad is the fallback, losing it is never.
+                if not compacted:
+                    break
+                pad = compacted
+                continue   # re-test the walls against the smaller pad
+            laps += 1
+            self.emit(ev("notice", level="info",
+                         text=f"reasoning cut off — resuming it (lap {laps} of "
+                              f"{self.engine.max_reasoning_rounds}, pad ~{count_text(pad)} tok)"))
+            result = await call_round(overrides={"max_tokens": lap_cap}, pad=pad)
+            pad += result.reasoning or ""
+            if result.text:
+                # The model closed the block itself and answered. Take that only
+                # if it actually finished: a lap runs under the small per-lap
+                # cap, so an answer that hit the cap is half a sentence, and one
+                # that was pure tool markup is nothing once stripped. Either way
+                # the pad is complete — fall through and let the closing round
+                # write the answer properly, under the answer budget.
+                text = strip_tool_markup(result.text)
+                if text and result.finish_reason != "length":
+                    return ChatResult(text)
+                break
+            if result.finish_reason != "length":
+                break  # stopped without text and without being cut off
+        else:
+            self.emit(ev("notice", level="info",
+                         text=f"{self.engine.max_reasoning_rounds} thinking laps used "
+                              "— concluding"))
+
+        # Answer phase: we write </think> ourselves, so this cap buys answer only.
+        #
+        # Tools are offered here, and only here. A lap must not call one: there
+        # is no way to splice a tool result into the middle of an unclosed
+        # thinking block, so an interrupted lap would forfeit the pad — the very
+        # work this exists to keep. By the closing round the pad has already done
+        # its job of deciding what to do, so spending it to launch a call is a
+        # fair trade, and the turn continues with the result in hand.
+        #
+        # The raw transport is the exception: /completion has no tool-call
+        # parser, so a call there would reach the user as <tool_call> markup.
+        # There the directive from base.md rides along instead (without joining
+        # the conversation) to ask for words rather than an action.
+        tools = self.schemas if (self.schemas and tools_ok) else None
+        self.emit(ev("notice", level="info",
+                     text=f"closing thinking (~{count_text(pad)} tok) and writing the "
+                          f"answer under {answer_cap or 'the model default'} tok"
+                          f"{'' if tools else ' (no tools)'}"))
+        result = await call_round(
+            overrides={"max_tokens": answer_cap}, pad=pad, closing=True,
+            tools=tools,
+            extra_messages=None if tools else
+            [{"role": "user", "content": self.manager.conclude_directive}])
+        if result.wants_tool and not truncated_tool_calls(result):
+            self.emit(ev("notice", level="info",
+                         text="the conclusion is an action — running it and "
+                              "continuing the turn"))
+            return result
+        if result.wants_tool:
+            # The answer budget went on a call that never finished generating.
+            # Spending one more round on words beats ending the turn on nothing.
+            self.emit(ev("notice", level="warn",
+                         text="the closing round was cut off mid tool call — "
+                              "asking for words instead"))
+            result = await call_round(
+                overrides={"max_tokens": answer_cap}, pad=pad, closing=True,
+                extra_messages=[{"role": "user",
+                                 "content": self.manager.conclude_directive}])
+        text = strip_tool_markup(result.text)
+        if not text:
+            self.emit(ev("notice", level="warn",
+                         text="the answer phase came back empty — raising "
+                              "max_output_tokens may help"))
+        return ChatResult(text)
+
+    @staticmethod
+    def _pad_tail(pad, tokens=None):
+        """The last `tokens` worth of pad, word-for-word.
+
+        A checkpoint may replace the distant past, but never the tail: the model
+        has to resume *mid-sentence*, and it cannot do that from a summary of
+        where it was. The end of this string is the exact point it left off.
+
+        The default is read here rather than bound as an argument default, so
+        the module constant stays the single source of truth for both this and
+        the "too little to compact" test in _think_pad.
+        """
+        tokens = PAD_TAIL_TOKENS if tokens is None else tokens
+        if count_text(pad) <= tokens:
+            return pad
+        tail = pad[-tokens * 4:]          # ~4 chars/token, then trimmed to fit
+        while tail and count_text(tail) > tokens:
+            tail = tail[len(tail) // 8 or 1:]
+        return tail
+
+    async def _compact_pad(self, call_round, pad, cap):
+        """Distil a pad that has filled the context, so thinking can continue.
+
+        The same move `roll_over` makes one level up: when the room runs out,
+        keep the meaning and drop the volume. The model writes down what it has
+        established — its own words, deliberately chosen, rather than an outside
+        summariser guessing which intermediate values mattered — and that note
+        plus the verbatim tail becomes the new pad.
+
+        Lossy by construction, which is why it is off unless asked for: a
+        derivation that carries exact figures through many steps is usually
+        better concluded from a complete pad than continued from a summarised
+        one. Returns "" if the checkpoint fails, meaning: conclude instead.
+        """
+        before = count_text(pad)
+        self.emit(ev("notice", level="info",
+                     text=f"thinking filled the context (~{before} tok) — "
+                          "checkpointing it and carrying on"))
+        result = await call_round(
+            overrides={"max_tokens": cap}, pad=pad, closing=True,
+            extra_messages=[{"role": "user",
+                             "content": self.manager.checkpoint_directive}])
+        note = strip_tool_markup(result.text)
+        if not note:
+            self.emit(ev("notice", level="warn",
+                         text="the checkpoint came back empty — concluding instead"))
+            return ""
+        new_pad = f"{note}\n\n{self._pad_tail(pad)}"
+        after = count_text(new_pad)
+        if after >= before:
+            # No room bought, so another lap would trip the same wall forever.
+            self.emit(ev("notice", level="warn",
+                         text=f"the checkpoint ({after} tok) did not shrink the pad "
+                              f"({before} tok) — concluding instead"))
+            return ""
+        self.emit(ev("notice", level="info",
+                     text=f"checkpoint: pad {before} → {after} tok "
+                          f"(kept the last ~{PAD_TAIL_TOKENS} tok verbatim)"))
+        return new_pad
+
+    async def _forced_conclusion(self, call_round, cap):
+        """Fallback when the server cannot resume a cut-off round.
+
+        No prefill means the reasoning cannot be handed back, so the only lever
+        left is to say so: the directive from base.md goes in as a user message
+        and the round re-runs. The work already done is lost — this is the path
+        the thinking pad exists to avoid.
+        """
+        # Never *lower* the cap: a max_tokens above max_output_tokens would make
+        # the retry smaller than the round that just failed.
+        configured = self.engine.extra_params.get("max_tokens") or 0
+        cap = max(cap or 0, configured) or None
+        directive = self.manager.conclude_directive
+        for _ in range(self.engine.max_reasoning_rounds):
+            self.emit(ev("notice", level="warn",
+                         text=f"reasoning was cut off and this server cannot resume it "
+                              f"— forcing a conclusion under {cap or 'the model default'} tok"))
+            self.history.append({"role": "user", "content": directive})
+            try:
+                result = await call_round(overrides={"max_tokens": cap} if cap else None)
+            except BaseException:
+                self.history.pop()  # a directive that never got a round is noise
+                raise
+            if result.text:
+                return ChatResult(strip_tool_markup(result.text))
+            self.history.pop()  # a directive with no answer is noise next turn
+            if result.finish_reason != "length":
+                break
+        self.emit(ev("notice", level="warn",
+                     text="forced conclusions came back empty — raising "
+                          "max_output_tokens may help"))
+        return ChatResult("")
 
     async def _after_turn(self, measured_used):
         trip = int(self.budget * self.rollover_pct / 100) if self.budget and self.rollover_pct else 0
@@ -923,9 +1404,11 @@ class SessionManager:
         # an empty base; the core keeps starting.
         self.base_behavior = self._behavior_sync(
             config.get("behavior", {}).get("base_file") or DEFAULT_BASE_FILE)
+        self.conclude_directive = extract_conclude_directive(self.base_behavior)
+        self.checkpoint_directive = extract_checkpoint_directive(self.base_behavior)
         self._engine_lock = asyncio.Lock()
         tools_cfg = config.get("tools", {})
-        workdir = tools_cfg.get("workdir") or str(Path(__file__).parent)
+        workdir = tools_cfg.get("workdir") or str(paths.REPO_ROOT)
         from tools import build_tools
         # Built once: Tool objects are stateless, and the schemas are identical
         # for every session, so count_tools is paid once rather than per session.
@@ -945,9 +1428,7 @@ class SessionManager:
     def _behavior_sync(self, path):
         """Cached read, synchronous: a missing file is a warning and ""."""
         if path not in self._behaviors:
-            p = Path(path)
-            if not p.is_absolute():
-                p = Path(__file__).parent / p
+            p = paths.resolve(path)
             self._behaviors[path] = p.read_text() if p.exists() else ""
             if not p.exists():
                 logger.warning("behavior file not found: %s", p)
@@ -1014,8 +1495,10 @@ class SessionManager:
         # how an edited base.md reaches the live sessions.
         self.base_behavior = await self._behavior_text(
             fresh.get("behavior", {}).get("base_file") or DEFAULT_BASE_FILE)
+        self.conclude_directive = extract_conclude_directive(self.base_behavior)
+        self.checkpoint_directive = extract_checkpoint_directive(self.base_behavior)
         tools_cfg = fresh.get("tools", {})
-        workdir = tools_cfg.get("workdir") or str(Path(__file__).parent)
+        workdir = tools_cfg.get("workdir") or str(paths.REPO_ROOT)
         from tools import build_tools
         self._tools = build_tools(tools_cfg, workdir=workdir)
         self._schemas = [t.spec for t in self._tools]
@@ -1041,6 +1524,8 @@ class SessionManager:
                               str(new_conv.get("rollover_mode", DEFAULT_ROLLOVER_MODE)).lower()),
             ("prompt_timeout", int(old_conv.get("prompt_timeout", 60)),
                                int(new_conv.get("prompt_timeout", 60))),
+            ("rollover_before_think", bool(old_conv.get("rollover_before_think", True)),
+                                      bool(new_conv.get("rollover_before_think", True))),
         ]
 
         updated = deferred = 0

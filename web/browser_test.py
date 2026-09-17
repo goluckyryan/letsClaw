@@ -567,7 +567,7 @@ async def run_token_gate(http):
     tmp = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
     tmp.write(cfg)
     tmp.close()
-    proc = subprocess.Popen([sys.executable, str(ROOT / "server.py"), "--config", tmp.name],
+    proc = subprocess.Popen([sys.executable, str(ROOT / "source" / "server.py"), "--config", tmp.name],
                             cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         for _ in range(60):
@@ -639,7 +639,7 @@ async def run_persistence(http):
 
     async def start():
         nonlocal proc
-        proc = subprocess.Popen([sys.executable, str(ROOT / "server.py"),
+        proc = subprocess.Popen([sys.executable, str(ROOT / "source" / "server.py"),
                                  "--config", tmp.name],
                                 cwd=ROOT, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
@@ -748,9 +748,12 @@ async def run_persistence(http):
         if not await start():
             check("core restarts after a delete", False, "never became healthy")
             return None
+        # Both halves in the detail: a bare file listing cannot tell you whether
+        # the file survived or a session came back without one.
+        remaining = await listed()
         check("a deleted session does not come back",
-              not await listed() and not list(Path(live).glob("*.json")),
-              str(os.listdir(live)))
+              not remaining and not list(Path(live).glob("*.json")),
+              f"listed={sorted(remaining)} files={os.listdir(live)}")
         return None
     finally:
         if t:
@@ -795,7 +798,7 @@ async def run_reload(http):
             return (await ws.receive_json())["budget"]
 
     try:
-        proc = subprocess.Popen([sys.executable, str(ROOT / "server.py"),
+        proc = subprocess.Popen([sys.executable, str(ROOT / "source" / "server.py"),
                                  "--config", tmp.name],
                                 cwd=ROOT, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
@@ -918,7 +921,7 @@ async def run_reload(http):
         # Reached in-process: a session only auto-disables its own rollover deep
         # inside a turn, and there is no client-side way to make it happen. Building
         # a manager here opens no sockets and touches no disk, so it costs nothing.
-        sys.path.insert(0, str(ROOT))
+        sys.path.insert(0, str(ROOT / "source"))
         import core as corelib
         cfg["conversation"]["rollover_at_percent"] = 90
         write(cfg)

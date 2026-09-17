@@ -22,6 +22,8 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+import paths
+
 logger = logging.getLogger("letclaw.session")
 
 # One core process now holds many conversations. Two of them rolling over in the
@@ -31,8 +33,9 @@ _seq = itertools.count(1)
 _handoff_lock = asyncio.Lock()
 
 # Anchor relative paths to the repo, not the working directory, so the app
-# behaves the same however it was launched.
-REPO_DIR = Path(__file__).parent
+# behaves the same however it was launched. This module lives in source/, so the
+# root is a level up — paths.REPO_ROOT is the one place that knows it.
+REPO_DIR = paths.REPO_ROOT
 
 DEFAULT_SESSIONS_DIR = "state/sessions"
 DEFAULT_LONG_TERM = "state/memory_store/long_term.md"
@@ -53,8 +56,7 @@ OPEN: bullet list of what still needs doing"""
 
 def _resolve(path, default):
     """Config paths are repo-relative unless absolute."""
-    p = Path(path or default).expanduser()
-    return p if p.is_absolute() else REPO_DIR / p
+    return paths.resolve(path, default)
 
 
 def _stamp():

@@ -5,7 +5,7 @@ The core (server.py) holds the conversation; this renders it. Start the core
 first — there is no in-process fallback:
 
     ./serve.sh          then, in another shell:
-    ./run.sh
+    ./terminalUI.sh
 
 Two things here are less obvious than they look:
 

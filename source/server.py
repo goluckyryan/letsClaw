@@ -3,8 +3,8 @@
 
 Start this first; the terminal, a WebUI and a Discord bot are all just clients:
 
-    ./serve.sh            (or: python server.py)
-    ./run.sh              (terminal client, in another shell)
+    ./serve.sh            (or: python source/server.py)
+    ./terminalUI.sh       (terminal client, in another shell)
 
 HTTP:  GET /health  GET /models  GET /sessions  DELETE /sessions/<name>
 WS:    /ws?session=<name>&last_seq=<n>
@@ -22,10 +22,12 @@ from pathlib import Path
 from aiohttp import WSCloseCode, WSMsgType, web
 
 import core
+import paths
 
 logger = logging.getLogger("letclaw.server")
 
-WEB_DIR = Path(__file__).parent / "web"
+# The browser assets stay at the repo root, beside the code rather than inside it.
+WEB_DIR = paths.REPO_ROOT / "web"
 
 
 def _configure_logging(config):
@@ -36,9 +38,7 @@ def _configure_logging(config):
     path = cfg.get("file")
     if path:
         try:
-            p = Path(path)
-            if not p.is_absolute():
-                p = Path(__file__).parent / p
+            p = paths.resolve(path)
             p.parent.mkdir(parents=True, exist_ok=True)
             handlers.append(logging.FileHandler(p))
         except OSError as e:

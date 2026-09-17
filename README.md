@@ -18,16 +18,16 @@ cd ~/letsClaw
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt   # openai, pyyaml, aiohttp, tiktoken
 
-./serve.sh                        # 1. the core — start this first, leave it running
-./run.sh                          # 2. the terminal client, in another shell
+./serve.sh                               # 1. the core — start this first, leave it running
+./terminalUI.sh                          # 2. the terminal client, in another shell
 ```
 
 Both pass their arguments straight through:
 
 ```bash
 ./serve.sh --config other.yaml --bind 0.0.0.0 --port 9000
-./run.sh -s daq-notes               # attach to a session other than 'terminal'
-./run.sh --url http://lab-box:8770  # a core on another machine
+./terminalUI.sh -s daq-notes               # attach to a session other than 'terminal'
+./terminalUI.sh --url http://lab-box:8770  # a core on another machine
 ```
 
 …or open <http://127.0.0.1:8770/> for the same thing in a browser. The WebUI is
@@ -94,6 +94,109 @@ graph TD
   `command` / `rollover_reply` / `stop`.
 - **`web/`** is the same client in a browser, speaking the same protocol. Dotted
   arrows are not built yet.
+
+### Repo layout
+
+```
+letsClaw/
+  serve.sh                 the core          — start this first
+  terminalUI.sh            the terminal client
+  config.yaml              your settings (gitignored — it holds API keys)
+  config.example.yaml      the documented template to copy from
+  models/                  behavior Markdown: base.md + per-model
+  web/                     browser client: index.html, app.js, style.css
+  source/                  all Python
+    paths.py                 where the repo root is — one definition
+    server.py  core.py       the core service and the session logic
+    chat.py    ui.py         the terminal client
+    llm_engine.py            talking to the model server
+    session.py               persistence, archives, rollover handoffs
+    tools.py  token_counter.py
+  state/                   live conversations + archived transcripts (gitignored)
+  logs/                    (gitignored)
+```
+
+Two things worth knowing about this shape:
+
+- **The scripts stay at the root and the code lives in `source/`.** `serve.sh`
+  runs `source/server.py`, which puts `source/` on the import path, so the modules
+  import each other by plain name (`import core`) with no package machinery.
+- **Everything the code reads is at the root, not beside it** — config, `models/`,
+  `web/`, `state/`, `logs/`. `source/paths.py` holds the single definition of
+  where the root is (`REPO_ROOT`) and a `resolve()` for config paths, which are
+  taken as-is when absolute and root-relative otherwise. Anything needing a repo
+  path should use those rather than computing its own from `__file__`.
+
+## Terminology
+
+These words appear throughout this README, in the progress notices during a
+turn, and in the code. They nest, largest first.
+
+### Session, turn, round
+
+| word | means | how many |
+|---|---|---|
+| **session** | one named, persistent conversation — its history, model and settings. `chat-1`, `discord-…`. Survives restarts. | lives until deleted |
+| **turn** | one thing you asked → one answer you got back. Starts at `turn_start`, ends at `turn_end`. | many per session |
+| **round** | one request to the model server, and its reply. | **one or many per turn** |
+
+A **round** and a **request** are the same thing seen from two sides: a round is
+one question-and-answer with the model, a request is the HTTP call carrying it.
+The README says "round" for the unit of work and "request" when the network
+matters.
+
+The important one is that **a turn is not a round**. A simple question is one
+turn, one round. A question that needs a file read, some thinking, and an answer
+is still *one turn* — but five or six rounds.
+
+### The kinds of round
+
+All of these are rounds. They differ in what the model is being asked for:
+
+| kind | what it is | what caps it |
+|---|---|---|
+| **first round** | the opening request of a turn | `max_tokens` |
+| **tool round** | a round that came back asking to run a tool | `max_tokens` |
+| **lap** | a round that *resumes* a thought that ran out of room — the notepad handed back, still open | `max_tokens` |
+| **checkpoint round** | condenses a full notepad so thinking can continue | `max_output_tokens` |
+| **closing round** | the last one: the thought is shut and the model writes the reply | `max_output_tokens` |
+
+So **every lap is a round, but not every round is a lap.** A lap is specifically
+the resume kind. The word comes from laps of a track: the model goes round the
+same question again, each time further along, carrying the same notepad.
+
+You will see the count in the live notices:
+
+```
+reasoning cut off — resuming it (lap 2 of 3, pad ~320 tok)
+```
+
+`lap 2 of 3` is the second resume out of `max_reasoning_rounds: 3` allowed.
+
+### The paper
+
+| word | means |
+|---|---|
+| **notepad** (or **pad**) | everything the model has thought so far this turn, accumulated across laps. Lives in memory for one turn, never joins the conversation. |
+| **page** | what one round can write — `max_tokens`. A full page is what triggers the next lap. |
+| **answer sheet** | the separate allowance for the final reply — `max_output_tokens`. |
+| **checkpoint** | the model's own note of what it has established, written when the notepad fills up, replacing the older pages. |
+
+### Limits
+
+| word | means |
+|---|---|
+| **wall** | any limit that stops the thinking: time, space, or pages. Whichever hits first, the answer still gets written. |
+| **rollover** | the *conversation* outgrew the model's window, so it is archived and restarted from a summary. One level up from a checkpoint, which is the same idea applied to a single turn's notepad. |
+| **context window** | `context_length` — the total the model can hold at once: conversation **plus** notepad **plus** the reserved answer sheet. |
+
+### Wiring
+
+| word | means |
+|---|---|
+| **transport** | how this server is asked to resume a thought — `chat` or `raw`. See [Which servers can do this](#which-servers-can-do-this). |
+| **client** | a terminal, browser or bot attached to a session. Several can watch the same one. |
+| **event** | one message from core to client — `text`, `reasoning`, `notice`, `tool_call`, `turn_end`… |
 
 ## Behavior Files
 
@@ -171,6 +274,14 @@ first, `off` only warns. **`/new` forces a rollover at any time**, in any mode �
 unlike `/clear`, which discards the conversation, `/new` files it and carries the
 thread forward.
 
+There is a second, earlier trigger. A window that is nearly full still has room for
+one more exchange, but none to *think* in — so a thinking model would have its
+reasoning squeezed out exactly where a hard question needs it (see
+[Reasoning](#reasoning-the-notepad-and-the-answer-sheet)). With
+`rollover_before_think` the core rolls over *before* such a turn rather than after
+one that was already degraded. Auto mode only: `ask` must not put a question before
+the turn has even started, and `off` means off.
+
 Two directories under `state/`, easily confused: **`state/live/` is the conversation
 you are having** — rewritten as you go and reloaded at startup — while
 **`state/sessions/` is the archive**, a write-once record of a window that filled up.
@@ -180,6 +291,243 @@ The trigger reads the server's own `usage.prompt_tokens`, so the percentage is e
 Servers that withhold usage fall back to a local estimate, scaled up deliberately —
 rolling over early costs a summary, rolling over late costs a rejected request. The
 `~` in the stats line marks an estimated figure.
+
+## Reasoning: the Notepad and the Answer Sheet
+
+### The picture
+
+Think of the model as a student at a desk with a **notepad** for working things
+out and an **answer sheet** for the reply you actually see.
+
+The awkward fact about a thinking model is that, left alone, it has only one
+sheet of paper for both. It works out the problem, and it writes the answer, out
+of the same allowance. Fill the sheet with working-out and you get no answer at
+all — just a page of half-finished thought and a `finish_reason=length`.
+
+letsClaw gives it two separate things instead:
+
+- a **notepad** it can keep writing on, page after page
+- an **answer sheet** that is kept aside, untouched, until the thinking is done
+
+### How the notepad works
+
+The catch is that a server will only ever hand over one page at a time. You
+cannot ask for one enormous uninterrupted thought; `max_tokens` is a hard
+per-request ceiling.
+
+So the core does it a page at a time. When a page fills up:
+
+1. it keeps the page (this is the part that used to be thrown away),
+2. hands the whole pad back to the model with the thought still **open**, and
+3. the model carries on from the exact word it stopped at — not from the
+   beginning.
+
+Each of those is a **lap** — the word you will see in the progress notices
+during a turn (`reasoning cut off — resuming it (lap 2 of 3, pad ~320 tok)`).
+The notepad grows lap by lap, and because the thought is never closed in
+between, it reads as one continuous piece of reasoning rather than several
+restarts. You see it stream in live, exactly like a normal reply.
+
+### How the answer sheet works
+
+When the thinking has to stop, the core closes the thought itself by writing
+`</think>`, and only then asks for the answer, under its own separate cap.
+
+Closing it is doing two jobs at once. It guarantees the budget really is
+separate — once the model is past that mark it *cannot* go back to thinking. And
+it guarantees you get an answer at all: a model left inside an open thought will
+very often just keep thinking and never come out on its own.
+
+### Thinking room and answer room
+
+These are the two budgets, and they are completely separate. That separation is
+the whole reason the core closes the thought itself before asking for a reply.
+
+```
+thinking room  =  max_tokens  ×  max_reasoning_rounds
+                  (one page)     (how many pages)
+
+answer room    =  max_output_tokens
+                  (a fresh sheet, after the thinking is shut)
+```
+
+| setting | it is | it is **not** |
+|---|---|---|
+| `max_tokens` | the size of **one page** of the notepad | a limit on how much the model may think |
+| `max_reasoning_rounds` | **how many pages** it gets | anything to do with the reply's length |
+| `max_output_tokens` | the size of the **answer sheet** | anything to do with thinking |
+
+Worked through with your `qwen38-local` settings:
+
+| | |
+|---|---|
+| `max_tokens: 32768` | one page holds ~32,768 tokens |
+| `max_reasoning_rounds: 3` | three pages |
+| **thinking room** | **~98,000 tokens** |
+| `max_output_tokens: 32768` | **answer room: 32,768 tokens**, untouched by the above |
+
+The two never compete for the same tokens. The model can spend its entire
+98,000-token thinking room and still have a full answer sheet waiting.
+
+Two things this catches people out with:
+
+- **Raising `max_output_tokens` does not buy more thinking.** It only lets the
+  final reply run longer. More thinking comes from bigger pages (`max_tokens`)
+  or more of them (`max_reasoning_rounds`).
+- **Thinking room is a ceiling, not a reservation.** Nothing is pre-allocated;
+  a simple question answers on the first page and costs one request. The room
+  only gets used if the model actually needs it.
+
+The real ceiling on thinking room is `context_length`, not these settings — the
+notepad is re-sent on every lap, so it has to fit in the window alongside the
+conversation. See [When does the thinking stop?](#when-does-the-thinking-stop)
+
+```mermaid
+graph TD
+    Start["Ask the model\none page = max_tokens"] --> Fin{"What came back?"}
+    Fin -->|"an answer"| Answer([Answer])
+    Fin -->|"a tool call"| Tools[Run the tool] --> Start
+    Fin -->|"a full page of thinking,\nno answer yet"| Seed["Keep the page —\nit becomes the notepad"]
+
+    Seed --> Wall{"Room to keep\nthinking?"}
+    Wall -->|"out of space,\nbut may condense"| Ckpt["Checkpoint: condense the old pages,\nkeep the last one word for word"]
+    Ckpt --> Wall
+    Wall -->|yes| Lap["Hand the notepad back,\nthought still open —\nmodel carries on mid-sentence"]
+    Lap --> LapFin{"How did it end?"}
+    LapFin -->|"another full page"| Grow["Add it to the notepad"] --> Wall
+    LapFin -->|"it finished and answered"| Answer
+    Wall -->|"no: out of time,\nspace or pages"| Close["Close the thought, then ask\nfor the answer on a fresh sheet\n= max_output_tokens"]
+    Close --> CFin{"The conclusion is..."}
+    CFin -->|"an answer"| Answer
+    CFin -->|"an action"| Act["Run the tool\nnotepad has served its purpose"]
+    Act --> Start
+    Answer --> Hist["Answer is kept.\nNotepad is thrown away."]
+```
+
+### Can it use tools while thinking?
+
+Not mid-thought, but yes at the end.
+
+**Mid-thought, no.** There is nowhere to put the result. A conversation has no
+way to say *"here is what `exec` returned — now carry on inside the sentence you
+were halfway through"*. Calling a tool mid-lap would mean abandoning the
+notepad, which is the one thing this whole mechanism exists to protect.
+
+**At the end, yes.** By then the notepad has done its job: it worked out *what to
+do*. If the model's conclusion is an action rather than a sentence, the tool
+runs, and the turn carries on with the result in hand — thinking afresh from
+there if it needs to. Same `max_iterations` limit as any other tool round.
+
+Two safety rails:
+
+- **A tool call that got cut off is never run.** Chopped-off arguments mean a
+  chopped-off command, and `rm -rf /tmp/scratch` truncated to `rm -rf /` is the
+  accident waiting to happen. The call is recorded as empty, the model is told it
+  was cut short, and the turn continues.
+- **On llama.cpp, tools are not offered at this stage at all**, because the
+  endpoint used for resuming returns plain text and cannot report a tool call
+  properly — you would just see raw `<tool_call>` markup. There the model is
+  asked for words instead, and any markup that shows up anyway is stripped out.
+
+### When does the thinking stop?
+
+Three things can call time on it. Whichever comes first, the answer still gets
+written — a turn never ends empty just because the thinking ran long.
+
+| what runs out | the model stops thinking when |
+|---|---|
+| **time** | the turn has been going for `turn_timeout` minus `answer_time_reserve`, so there is still time left to write the answer |
+| **space** | the notepad, the conversation so far, and the reserved answer sheet would together overflow the model's `context_length` |
+| **pages** | it has used `max_reasoning_rounds` pages |
+
+"Space" needs one sentence of explanation: the whole notepad is re-sent to the
+model on every lap — that is *how* it remembers what it was thinking — so the
+notepad takes up room in the context window while the turn is running.
+
+### Making the notepad effectively unlimited
+
+Of those three, only the space limit can be pushed back, and
+`max_pad_compactions` pushes it.
+
+When the notepad fills up, instead of stopping there the core asks the model to
+write a **checkpoint**: a note of every figure it has worked out, every
+assumption it made, and what is still to do. That note, plus the **last page or
+so kept word for word**, becomes the new notepad — and off it goes again with
+room to spare. It is the same thing [Context Rollover](#context-rollover) does
+for a conversation that fills its window: keep the meaning, drop the bulk.
+
+Keeping that last bit word for word is the whole trick, not a detail. A summary
+of where the model *was* cannot be carried on mid-sentence. So the old pages get
+condensed and the sentence it is actually in the middle of is left alone.
+
+Turn this on and thinking is limited by **time alone** — which is what the space
+limit was really standing in for.
+
+**It is off by default (`0`), on purpose.** Condensing loses detail, and for a
+calculation that carries exact numbers through many steps, finishing from a
+complete notepad usually beats carrying on from a summarised one — a lost
+intermediate value gives you a wrong answer that looks perfectly reasonable.
+Turn it up for work long enough that running out of room is the bigger risk.
+Either way two guards apply: a checkpoint that comes back empty, or one that
+fails to make the notepad any smaller, finishes from the notepad it already has
+rather than looping. The wording is yours to edit, under `## Checkpoint` in
+`models/base.md`.
+
+### What the notepad costs afterwards
+
+Nothing. It lives in memory for the length of one turn and **never becomes part
+of the conversation** — only the answer does. So a long think does not bloat the
+history or bring a rollover forward.
+
+The reverse problem is handled too. A conversation that has nearly filled its
+window still has room for one more exchange, but no room to *think* in — so with
+`rollover_before_think` the core rolls over **before** such a turn, rather than
+after one whose thinking got squeezed out. (Auto mode only; `ask` and `off` are
+never interrupted before a turn starts.)
+
+### The settings
+
+| setting (per model) | default | what it does |
+|---|---|---|
+| `max_tokens` | — | **one page of the notepad** — how much the model may write in a single request |
+| `max_reasoning_rounds` | `3` | **how many pages** it may use (`0` turns the notepad off entirely) |
+| `max_output_tokens` | `32768` | **the answer sheet** — the separate allowance for the final reply |
+| `max_pad_compactions` | `0` | how many times a full notepad may be condensed so thinking can go on (`0` = stop and answer) |
+| `turn_timeout` | `36000` | seconds one whole turn may take, thinking included (`0` = no limit) |
+| `answer_time_reserve` | `120` | seconds of that held back so the answer still gets written |
+| `resume_mode` | `auto` | how to resume a thought on this server — normally leave it alone |
+| `reasoning_effort` | unset | how hard to tell the model to think, if its template supports it |
+
+Rules of thumb: for **more thinking**, raise `max_tokens` or
+`max_reasoning_rounds`. For a **longer final answer**, raise
+`max_output_tokens`. For a **faster, shorter-thinking** model, lower
+`reasoning_effort`.
+
+> Worth checking on llama.cpp: `reasoning_effort` defaults to **`xhigh`** there,
+> which quietly adds *"think carefully… validate key assumptions, consider
+> plausible alternatives"* to every request. That alone causes a good share of
+> the pages that fill up without an answer. `medium` adds nothing at all.
+
+`turn_timeout` also sets the network read timeout, because the client's own
+600-second default would otherwise drop a long request at the socket before the
+model had finished. If the wall is hit mid-request the turn is cancelled exactly
+as `/stop` would do it — the conversation is repaired and saved.
+
+### Which servers can do this
+
+Resuming a thought means asking the server to *continue* a half-written reply
+instead of starting a new one. Not every server exposes that, so
+`resume_mode: auto` tests yours once and picks the right method:
+
+| server | method |
+|---|---|
+| vLLM, SGLang | `continue_final_message` on the normal chat endpoint |
+| llama.cpp | its raw `/completion` endpoint, with the prompt built by `/apply-template` — its chat endpoint ignores a half-written reply |
+
+If a server can do neither (or you set `resume_mode: off`), the core falls back
+to the old approach: it tells the model *"you ran out of room, answer now"* and
+asks again from scratch. That throws the thinking away — it is exactly what the
+notepad was built to avoid, so it is a fallback and nothing more.
 
 ## Token Counting
 
@@ -201,8 +549,9 @@ separately.
 Beside it, `(N this session)` is a running total, also shown by `/info`. It is an
 odometer, not a gauge: it counts what the session has ever generated, so `/clear` does
 not rewind it and it comes back with the session after a restart. Deleting the session
-is what resets it. A turn that produces no answer at all — the model spending its whole
-budget on reasoning — still says what it spent, so the cost is never invisible.
+is what resets it. A turn that still produces no answer — rare now that reasoning is
+resumed rather than discarded, but possible if even the closing round comes back
+empty — says what it spent anyway, so the cost is never invisible.
 
 ## The Core
 
@@ -300,7 +649,7 @@ silent. Read-only commands (`/info`, `/behavior`, bare `/model` and `/models`) c
 
 ## Terminal Client
 
-`./run.sh` is a thin client: it renders events and sends `submit` / `command` /
+`./terminalUI.sh` is a thin client: it renders events and sends `submit` / `command` /
 `rollover_reply` / `stop`, and holds no conversation state of its own. Two flags —
 `-s/--session` picks the session name (default `terminal`), `--url` points at a core
 somewhere other than the `core.bind`/`core.port` in the config.

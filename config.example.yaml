@@ -11,7 +11,7 @@ behavior:
 # Model registry — every entry is self-contained: it names its own server, so
 # reading one entry tells you everything about that model.
 #   default_model: which entry to start with
-#   -m <name>     : override at startup (./run.sh -m <name>)
+#   -m <name>     : override at startup (./terminalUI.sh -m <name>)
 #   provider_name: the exact model ID the server reports (check /v1/models)
 #   base_url     : required — the OpenAI-compatible endpoint serving this model
 #   api_key      : omit or "" when the server needs no key
@@ -26,7 +26,48 @@ models:
     behavior_file: "models/default.md"
     context_length: 12000
     temperature: 0.7
+    # On a thinking model max_tokens caps reasoning AND the answer together, so
+    # this is really "how much the model may generate per lap" — not a limit on
+    # how much it may think. A round cut off mid-reasoning is resumed, not
+    # re-asked; see "Reasoning" in the README.
     max_tokens: 4096
+    # The answer sheet. Once thinking has been closed with </think>, the closing
+    # round runs under this cap and every token of it buys answer, not
+    # reasoning. 0 = the closing round keeps max_tokens.
+    max_output_tokens: 32768
+    # How many resume laps the thinking pad may run before the answer phase
+    # takes over. Bounded so a runaway model costs extra laps, never a loop.
+    # 0 = no pad: a cut-off round falls back to the base.md directive.
+    max_reasoning_rounds: 3
+    # Hard wall for one turn, in seconds — a limit on a round, thinking model or
+    # not. It also sets the HTTP client's read timeout, so a round that runs
+    # longer is cut off and the turn cancelled (the conversation is saved).
+    # 0 = no wall. Default 36000 (10 h).
+    turn_timeout: 36000
+    # Seconds held back from turn_timeout so the answer still fits inside the
+    # wall after a long think. Thinking stops at turn_timeout - this.
+    answer_time_reserve: 120
+    # When the pad fills the context, distil it to a checkpoint (the model's own
+    # note of what it has established) plus the last ~2000 tokens kept verbatim,
+    # then carry on thinking. This is the only wall that can be pushed back, so
+    # it is what makes thinking bounded by time rather than by context.
+    # 0 (default) = never compact: fill the context and conclude. Compaction is
+    # lossy, and a derivation carrying exact values through many steps is
+    # usually better concluded from a whole pad than continued from a summary —
+    # raise this only for analyses long enough that running out of room is the
+    # worse outcome. The note comes from "## Checkpoint" in the base file.
+    max_pad_compactions: 0
+    # How a cut-off round is resumed:
+    #   auto - probe the server once and pick (default)
+    #   chat - OpenAI-compatible prefill (vLLM/SGLang continue_final_message)
+    #   raw  - llama.cpp /apply-template + /completion
+    #   off  - no resume; fall back to the base.md directive, losing the work
+    resume_mode: auto
+    # Passed to the chat template. Qwen3 turns this into a system directive;
+    # llama.cpp defaults to xhigh, which on its own causes a lot of the
+    # mid-reasoning cut-offs. "medium" adds no directive at all. Omit to leave
+    # the server's default alone.
+    reasoning_effort: medium
     top_p: 0.95
   # Example: a second model on another server (e.g. llama.cpp + GGUF)
   qwen38:
@@ -68,6 +109,9 @@ conversation:
   rollover_at_percent: 90       # % of the model's context_length that trips a rollover (0 = never)
   rollover_mode: "auto"         # auto = roll over and say so | ask = prompt [y/N] | off = warn only
                                 # /new forces a rollover in any mode
+  rollover_before_think: true   # roll over BEFORE a turn with no context left to think in,
+                                # rather than after one whose thinking was squeezed out.
+                                # auto mode only; ask/off are never interrupted pre-turn.
   sessions_dir: "state/sessions"  # archived transcripts land here
   live_dir: "state/live"        # live conversations; reloaded when the core restarts
   prompt_timeout: 60            # seconds to wait for a rollover answer before keeping the session
