@@ -45,6 +45,11 @@ def _configure_logging(config):
             print(f"⚠️  cannot log to {path}: {e}", file=sys.stderr)
     logging.basicConfig(level=level, handlers=handlers,
                         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    # Third-party chatter at the configured level would drown the app's own
+    # lines: the WebUI polls /sessions every 5 s (aiohttp.access), and every
+    # model call is logged by httpx. Both go to WARNING.
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
 
 
 def _authorised(request):
