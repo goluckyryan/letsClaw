@@ -21,10 +21,15 @@ class thinking_indicator:
     - Only draws after a short grace period, so fast answers stay clean.
     - No animation when stdout is not a TTY (timing still recorded).
     - stop() is idempotent; safe to call multiple times.
+    - `tokens`, when set, rides along on the line: the core's running count of
+      what the model has thought this turn. Writable while running — the caller
+      just assigns to it — and passed to the constructor so a spinner restarted
+      after a tool result picks the count back up instead of dropping it.
     """
 
-    def __init__(self, label="thinking"):
+    def __init__(self, label="thinking", tokens=None):
         self.label = label
+        self.tokens = tokens
         self.ttft = None
         self._task = None
         self._t0 = None
@@ -49,7 +54,8 @@ class thinking_indicator:
             frame = _FRAMES[i % len(_FRAMES)]
             i += 1
             self._visible = True
-            sys.stdout.write(f"\r🐱 {frame} {self.label}… {elapsed:.1f}s\x1b[K")
+            thought = f" · {self.tokens:,} tok" if self.tokens else ""
+            sys.stdout.write(f"\r🐱 {frame} {self.label}… {elapsed:.1f}s{thought}\x1b[K")
             sys.stdout.flush()
 
     def stop(self):

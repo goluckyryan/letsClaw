@@ -133,6 +133,18 @@ async def index(request):
                             headers={"Cache-Control": "no-cache"})
 
 
+async def _no_cache_static(request, response):
+    """Make the browser revalidate app.js and style.css on every load.
+
+    index.html already says no-cache, but it references the other two by a fixed
+    path. Without this, a browser is free to serve them from its own cache for
+    as long as it likes — and a page that keeps running last week's app.js
+    against this week's core is a bug report nobody can reproduce.
+    """
+    if request.path.startswith("/static/"):
+        response.headers.setdefault("Cache-Control", "no-cache")
+
+
 async def _writer(ws, sub):
     """Owns the socket. The turn never touches it, so a stalled peer can't
     stall generation — it just overflows its queue and gets dropped."""
@@ -280,6 +292,7 @@ def build_app(config, config_path=None):
     ])
     if (WEB_DIR / "index.html").exists():
         app.add_routes([web.get("/", index), web.static("/static", WEB_DIR)])
+        app.on_response_prepare.append(_no_cache_static)
     else:
         logger.warning("no %s — the WebUI will not be served", WEB_DIR)
     app.on_startup.append(_on_startup)

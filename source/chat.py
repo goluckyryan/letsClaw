@@ -114,6 +114,7 @@ class Renderer:
         self.in_turn = False
         self.opened = None      # None | "text" | "reasoning"
         self.ind = None
+        self.thought = 0        # tokens thought this turn, from the core
         self.prompt_shown = False
 
     # ---- low-level -------------------------------------------------------
@@ -147,7 +148,9 @@ class Renderer:
 
     def spinner(self):
         self._stop_spinner()
-        self.ind = thinking_indicator()
+        # Carries the turn's count into the new spinner: the thinking a tool
+        # round already did did not stop counting while the tool ran.
+        self.ind = thinking_indicator(tokens=self.thought)
         self.ind.start()
 
     # ---- events ----------------------------------------------------------
@@ -158,7 +161,15 @@ class Renderer:
             self.hello(e)
         elif t == "turn_start":
             self.in_turn = True
+            self.thought = 0
             self.spinner()
+        elif t == "reasoning_stat":
+            # The count only has somewhere to go while the spinner is up, which
+            # is precisely when the thinking is hidden — with it shown, the
+            # thinking itself is the progress report.
+            self.thought = e["tokens"]
+            if self.ind:
+                self.ind.tokens = self.thought
         elif t == "reasoning":
             if self.show_reasoning:
                 self._open("reasoning", "\n🧠 ")

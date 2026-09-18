@@ -180,6 +180,11 @@ async def run(http):
           await tab.until("document.querySelectorAll('.msg.user').length === 1", 20))
     check("spinner shows while waiting",
           await tab.until("!!document.querySelector('.waiting')", 10))
+    # The live thinking counter, fed by the core's reasoning_stat. Captured while
+    # the spinner is still up — it is gone by the time the turn ends.
+    thought_live = await tab.until(
+        "/[0-9] tok/.test((document.querySelector('.waiting .wait-tok')||{}).textContent||'')", 90)
+    check("live thinking counter shows tokens", thought_live)
     check("turn completes",
           await tab.until("document.querySelectorAll('.slab.stats').length === 1", 180))
     check("spinner cleared after the turn", not await tab.js("!!document.querySelector('.waiting')"))
@@ -197,6 +202,16 @@ async def run(http):
     # a separate figure from `assistant N tok` and carries its own ~ when the server
     # withheld usage, so assert on the label rather than on any particular number.
     check("stats line reports output tokens", " out " in stats_txt, stats_txt)
+    # What the thinking cost, left on screen after the spinner cleared. Both
+    # figures come from the same running count in the core, so they must agree —
+    # asserted only when the model actually thought, since a model answering
+    # straight out has nothing to stamp.
+    reasoned = re.search(r"reasoning (\d+) tok", stats_txt)
+    if reasoned:
+        stamp = await tab.js("(document.querySelector('.thought')||{}).textContent || ''")
+        check("thinking stamp left behind", "thought" in stamp, stamp)
+        check("stamp agrees with the stats line",
+              f"{int(reasoned.group(1)):,} tok" in stamp, f"{stamp} vs {reasoned.group(0)}")
     check("output count is a real number", re.search(r"out ~?(\d+) tok", stats_txt)
           and int(re.search(r"out ~?(\d+) tok", stats_txt).group(1)) > 0, stats_txt)
     check("gauge updated from stats",

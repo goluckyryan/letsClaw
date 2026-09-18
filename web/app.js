@@ -164,12 +164,76 @@ function renderMd(src) {
 
 let waitEl = null;
 let waitTimer = null;
-// Reasoning characters seen this turn, for the live counter in the waiting slab.
-// Characters, not tokens: the browser has no tokeniser, so the figure shown is
-// an estimate and wears a ~ to say so. The exact count arrives in the ⚡ stats
-// line at the end of the turn, from the server.
-let reasonChars = 0;
+
+/* The thinking counter. The core counts the tokens with the same tokeniser the
+   ⚡ stats line uses and pushes a running total (reasoning_stat), so the figure
+   climbing in the spinner is the one the turn ends on. Characters are still
+   counted as a fallback: against an older core no stat ever arrives, and a
+   chars/4 guess under a ~ beats no counter at all. */
 const CHARS_PER_TOKEN = 4;   // the same fallback ratio token_counter.py uses
+let think = newThink();
+
+function newThink() {
+  return {
+    chars: 0,        // reasoning characters this turn (the fallback's raw material)
+    tok: 0,          // tokens this turn, from the core
+    exact: false,    // has a reasoning_stat landed? (drops the ~)
+    stamped: 0,      // tokens already written to a 🧠 stamp
+    blockT0: 0,      // when the current run of thinking began
+    last: 0,         // when thinking last moved — the stamp's end point
+    samples: [],     // [ms, tokens] for the rate, trimmed to RATE_WINDOW
+  };
+}
+
+const RATE_WINDOW = 5000;
+
+function thinkTokens() {
+  return think.exact ? think.tok : Math.round(think.chars / CHARS_PER_TOKEN);
+}
+
+/* Tokens per second over the last few seconds, or 0 while there is too little
+   to divide by — a rate off two samples 80 ms apart is noise, not information. */
+function thinkRate() {
+  const s = think.samples;
+  if (s.length < 2) return 0;
+  const [t0, n0] = s[0], [t1, n1] = s[s.length - 1];
+  const dt = (t1 - t0) / 1000;
+  return dt >= 1 ? Math.round((n1 - n0) / dt) : 0;
+}
+
+/* One reasoning event's worth of progress, from either source. */
+function thinkGrew() {
+  const now = Date.now();
+  if (!think.blockT0) think.blockT0 = now;
+  think.last = now;
+  think.samples.push([now, thinkTokens()]);
+  while (think.samples.length > 2 && now - think.samples[0][0] > RATE_WINDOW) {
+    think.samples.shift();
+  }
+}
+
+/* Called when a run of thinking has plainly ended — the answer started, or a
+   tool was called. Leaves what it cost on screen, since the spinner carrying
+   the live figure is about to be cleared. */
+function stampThinking() {
+  const tok = thinkTokens() - think.stamped;
+  if (tok <= 0) return;
+  const secs = think.blockT0 ? Math.max(0, (think.last - think.blockT0) / 1000) : 0;
+  think.stamped += tok;
+  think.blockT0 = 0;
+  think.samples = [];
+  const text = `🧠 thought ${think.exact ? '' : '~'}${tok.toLocaleString()} tok`
+             + (secs >= 0.1 ? ` in ${secs.toFixed(1)}s` : '');
+  // Onto the thinking block when there is one to hang it off, so the figure sits
+  // with the text it measures; on its own line when the thinking is hidden.
+  const on = S.turn && S.turn.reasonEl;
+  if (on) {
+    const tag = node('thought', esc(text));
+    on.appendChild(tag);
+  } else {
+    slab('thought', esc(text));
+  }
+}
 
 function atBottom() {
   return log.scrollHeight - log.scrollTop - log.clientHeight < 80;
@@ -247,10 +311,14 @@ function setWaiting(label) {
     // every resumed lap of a thinking pad — while the clock restarts with each
     // wait. On a long think it is the only sign the model is still getting
     // somewhere, which is why it shows even when the thinking text is hidden.
-    const tok = Math.round(reasonChars / CHARS_PER_TOKEN);
-    const thought = tok ? ` · ~${tok.toLocaleString()} tok thought` : '';
+    const tok = thinkTokens();
+    const rate = thinkRate();
+    const thought = tok
+      ? `<span class="wait-tok">🧠 ${think.exact ? '' : '~'}${tok.toLocaleString()} tok`
+        + `${rate > 0 ? ` · ${rate.toLocaleString()} tok/s` : ''}</span>`
+      : '';
     waitEl.innerHTML = `<span class="spin">${FRAMES[i++ % FRAMES.length]}</span> `
-      + `${esc(label)}… ${s.toFixed(1)}s${thought}`;
+      + `${esc(label)}… <span class="wait-clock">${s.toFixed(1)}s</span>${thought}`;
   };
   tick();
   waitTimer = setInterval(tick, 100);
@@ -429,7 +497,7 @@ function handle(e) {
 
   case 'turn_start':
     S.turn = { textEl: null, reasonEl: null, tools: new Map() };
-    reasonChars = 0;
+    think = newThink();
     setBusy(true);
     msg('user', '👤').querySelector('.body').textContent = e.text;
     setWaiting('thinking');
@@ -438,7 +506,8 @@ function handle(e) {
   case 'reasoning':
     // Counted before the display check on purpose: with the thinking hidden
     // this counter is the only feedback that the model is still working.
-    reasonChars += e.delta.length;
+    think.chars += e.delta.length;
+    thinkGrew();
     if (!S.showReasoning) return;
     if (!S.turn) S.turn = { textEl: null, reasonEl: null, tools: new Map() };
     if (!S.turn.reasonEl) S.turn.reasonEl = msg('reasoning', '🧠').querySelector('.body');
@@ -446,14 +515,28 @@ function handle(e) {
     if (atBottom()) log.scrollTop = log.scrollHeight;
     return;
 
+  // The core's own count, pushed a few times a second while it thinks. It
+  // arrives whether or not this client displays the thinking, and it is the
+  // same figure the ⚡ line ends the turn on.
+  case 'reasoning_stat':
+    think.tok = e.tokens;
+    think.exact = true;
+    thinkGrew();
+    return;
+
   case 'text':
+    // Thinking is over the moment words start: stamp what it cost before the
+    // spinner holding the live figure goes away.
+    stampThinking();
     clearWaiting();
     if (!S.turn) S.turn = { textEl: null, reasonEl: null, tools: new Map() };
+    else S.turn.reasonEl = null;   // any further thinking opens its own block
     if (!S.turn.textEl) S.turn.textEl = msg('assistant', '🐱').querySelector('.body');
     stream(S.turn.textEl, e.delta);
     return;
 
   case 'tool_call': {
+    stampThinking();
     clearWaiting();
     if (S.turn) { flushStream(S.turn.textEl); S.turn.textEl = null; S.turn.reasonEl = null; }
     const el = toolSlab(e.name, e.arguments);
@@ -499,6 +582,9 @@ function handle(e) {
   }
 
   case 'turn_end':
+    // A turn can end on thinking alone — budget gone, nothing said. The stamp is
+    // the only record of it until the ⚡ line, which that turn may never reach.
+    stampThinking();
     clearWaiting();
     if (S.turn) flushStream(S.turn.textEl);
     S.turn = null;
@@ -607,8 +693,10 @@ function hello(e) {
   S.budget = e.budget;
   // Zeroed before the replay below: attaching to a turn already in flight, we
   // never saw its earlier thinking, so counting on from a previous turn's total
-  // would invent tokens. A replayed turn_start resets it again, harmlessly.
-  reasonChars = 0;
+  // would invent tokens. A replayed turn_start resets it again, harmlessly. The
+  // core's next reasoning_stat carries the turn's real total, so a mid-turn
+  // attach catches up within a quarter-second rather than counting from zero.
+  think = newThink();
   S.tripPct = (e.rollover && e.rollover.percent) || 0;
   S.rollovers = (e.rollover && e.rollover.count) || 0;
   S.session = e.session;

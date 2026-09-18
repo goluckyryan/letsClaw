@@ -451,6 +451,16 @@ main {
 
 .waiting { color: var(--dim); font: 12.5px var(--mono); }
 .waiting .spin { display: inline-block; width: 1em; color: var(--accent); }
+/* Fixed width on the clock so the token figure beside it does not jog left and
+   right as the seconds roll over from 9.9 to 10.0. */
+.waiting .wait-clock { display: inline-block; min-width: 4.2em; }
+/* Its own margin, not a space in the markup: on a wait long enough to outgrow
+   the clock's min-width, the two would otherwise run together. */
+.waiting .wait-tok { color: var(--accent); margin-left: .6em; }
+
+/* What a run of thinking cost, left behind when the spinner clears. */
+.thought { font: 11.5px var(--mono); color: var(--dim); }
+.msg .body > .thought { margin-top: 6px; opacity: .85; }
 
 /* ---------- composer ---------- */
 

@@ -66,6 +66,10 @@ MIN_THINK_HEADROOM = 4000
 # distant past, but the model must still resume *mid-sentence*, so the tail it
 # left off in is never summarised.
 PAD_TAIL_TOKENS = 2000
+# How often the live thinking-token count goes out to the clients. Fast enough
+# to read as a counter rather than a stopwatch, slow enough that the tokeniser
+# runs a few times a second instead of once per delta.
+REASONING_STAT_INTERVAL = 0.25
 
 # Marks the forced-conclusion directive in base.md. The core extracts the
 # paragraph after this line and re-sends it as a user message when a cut-off
@@ -245,6 +249,9 @@ class Subscriber:
         self.overflowed = False
 
     def push(self, event):
+        # Only the thinking *text* is withheld. reasoning_stat is a token count,
+        # and a client that hides the thinking is exactly the one with nothing
+        # else to show for a two-minute think, so the count always goes out.
         if event["t"] == "reasoning" and not self.wants_reasoning:
             return
         if len(self.queue) == self.queue.maxlen:
@@ -425,7 +432,10 @@ class Session:
                 self.turn_events[-1]["seq"] = event["seq"]
             else:
                 self.turn_events.append(dict(event))
-        elif event["t"] != "reasoning":  # reasoning is live-only, never replayed
+        # Both are live-only, never replayed: the thinking text because it is not
+        # kept, its running count because a reconnect would otherwise replay
+        # hundreds of superseded figures to land on the one that is current.
+        elif event["t"] not in ("reasoning", "reasoning_stat"):
             self.turn_events.append(dict(event))
         for sub in self.subscribers:
             sub.push(event)
@@ -692,6 +702,16 @@ class Session:
         last_finish = None   # finish_reason of the last round that returned
         last_reasoning = ""  # that round's reasoning — the seed of a thinking pad
         reasoning_parts = []
+        # The live thinking-token figure the clients count up with. Produced here
+        # rather than in the browser so it is the same tiktoken count the ⚡ line
+        # ends the turn on — a chars/4 guess lands 10-20% away on Qwen, and two
+        # numbers for one quantity read as a bug. Spans the whole turn: every
+        # round, every pad lap, and the waits between them.
+        reason_tok = 0         # counted so far
+        reason_pending = []    # deltas that arrived since the last count
+        reason_t0 = None       # first reasoning delta of the turn
+        reason_sent = 0.0      # monotonic of the last figure pushed
+
         # Output accounting. A turn can span several rounds, and every one of
         # them generates: text, reasoning, and the tool-call arguments. The
         # server's completion_tokens covers all three exactly, so it is summed
@@ -700,6 +720,31 @@ class Session:
         # accumulated the same way, and the figure goes out marked estimated.
         rounds = out_reported = 0
         out_measured = out_estimated = 0
+
+        def push_reasoning_stat(now, flush=False):
+            """Count whatever has arrived since the last push and send the total.
+
+            Counted a slice at a time, so a push costs the new text rather than
+            the whole turn's thinking. Each slice ends just *before* its last
+            space, and the rest is held back to open the next one: a token
+            carries its leading space (" alpha" is one token, "alpha" and " "
+            are two), so cutting anywhere else inflates the running sum. `flush`
+            counts the held-back tail too, for when no more is coming.
+            """
+            nonlocal reason_tok, reason_sent, reason_t0
+            if reason_t0 is None:
+                reason_t0 = turn_t0
+            if reason_pending:
+                text = "".join(reason_pending)
+                cut = len(text) if flush else text.rfind(" ")
+                if cut > 0:
+                    reason_tok += count_text(text[:cut])
+                    reason_pending.clear()
+                    if text[cut:]:
+                        reason_pending.append(text[cut:])
+            reason_sent = now
+            self.emit(ev("reasoning_stat", tokens=reason_tok,
+                         thinking=round(now - reason_t0, 1)))
 
         def tally(result, history_shaped=True):
             """Fold one round's usage in. Shared by the loop and its fallback.
@@ -712,6 +757,7 @@ class Session:
             were genuinely generated.
             """
             nonlocal last_prompt, rounds, out_reported, out_measured, out_estimated
+            nonlocal reason_tok   # re-synced below, on the round boundary
             rounds += 1
             if history_shaped and result.prompt_tokens is not None:
                 last_prompt = result.prompt_tokens
@@ -720,6 +766,16 @@ class Session:
                 out_measured += result.completion_tokens
             if result.reasoning:
                 reasoning_parts.append(result.reasoning)
+                # Re-sync the live count on the round boundary: counting the
+                # whole thing at once settles any drift the slices left, and
+                # picks up a round whose reasoning arrived on the result instead
+                # of through on_reasoning (the non-streaming path).
+                # Never downwards, though — a counter that ticks back a few
+                # tokens mid-think reads as a bug, and the ⚡ line quotes this
+                # same figure, so the two still cannot disagree.
+                reason_pending.clear()
+                reason_tok = max(reason_tok, count_text("".join(reasoning_parts)))
+                push_reasoning_stat(time.monotonic())
             out_estimated += count_text(result.text or "") + count_text(result.reasoning or "")
             for tc in result.tool_calls or []:
                 out_estimated += (count_text(tc.get("name") or "")
@@ -742,10 +798,23 @@ class Session:
             def on_text(chunk, box=ttft_box):
                 if box["v"] is None:
                     box["v"] = time.monotonic() - t0  # measured at the model, not the client
+                # First words of the round: the thinking behind them is over, so
+                # settle the count before this delta goes out. Clients close the
+                # thinking off when text arrives, and a figure a throttle window
+                # short is the one they would close it on.
+                if reason_pending:
+                    push_reasoning_stat(time.monotonic(), flush=True)
                 self.emit(ev("text", delta=chunk))
 
             def on_reasoning(chunk):
+                nonlocal reason_t0
                 self.emit(ev("reasoning", delta=chunk))
+                now = time.monotonic()
+                if reason_t0 is None:
+                    reason_t0 = now
+                reason_pending.append(chunk)
+                if now - reason_sent >= REASONING_STAT_INTERVAL:
+                    push_reasoning_stat(now)
 
             # extra_messages ride along for this one round without entering the
             # conversation: the closing round needs the "do not call tools"
@@ -867,6 +936,12 @@ class Session:
                     self.history.pop()  # drop the user message that never landed
                     return
 
+        # Deltas from a round that died before tally() could re-sync are still
+        # uncounted here. Counting them now keeps the figure below — and the last
+        # one the clients were given — the same number.
+        if reason_pending:
+            push_reasoning_stat(time.monotonic(), flush=True)
+
         # The server's figure only if every round supplied one: a partial sum is
         # worse than the estimate, because it looks exact while missing rounds.
         out_exact = rounds > 0 and out_reported == rounds
@@ -890,7 +965,10 @@ class Session:
                          ttft=last_ttft,
                          user_tokens=user_tok,
                          assistant_tokens=count_text(full_response),
-                         reasoning_tokens=count_text("".join(reasoning_parts)),
+                         # The running count the spinner has been showing all
+                         # turn, not a fresh tally of the same text: one number,
+                         # so the live figure and this one cannot disagree.
+                         reasoning_tokens=reason_tok,
                          tool_calls=tools_used,
                          # Everything generated this turn, across every round:
                          # the answer, the reasoning, and the tool-call arguments.
