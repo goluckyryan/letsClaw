@@ -43,8 +43,9 @@ def check(name, ok, detail=""):
 class Tab:
     """One Chrome tab, driven over CDP."""
 
-    def __init__(self, http, ws):
+    def __init__(self, http, ws, target=None):
         self.http, self.ws = http, ws
+        self.target = target          # Chrome's id for the page, so close() can shut it
         self._id = 0
         self.console = []
         self.pending = {}
@@ -96,15 +97,30 @@ class Tab:
         return False
 
     async def close(self):
+        """Drop the CDP connection *and* shut the page.
+
+        Both halves matter. A page left open goes on running app.js, which
+        reconnects to the core on its own — so a test that deletes a session and
+        restarts the core would find the session back, re-created by the tab
+        nobody was watching any more. That failure lands on whichever check runs
+        when the backoff happens to fire, which is to say: at random.
+        """
         self.reader.cancel()
         await self.ws.close()
+        if self.target:
+            try:
+                async with self.http.get(
+                        f"http://127.0.0.1:9222/json/close/{self.target}"):
+                    pass
+            except aiohttp.ClientError:
+                pass
 
 
 async def open_tab(http, url):
     async with http.put(f"http://127.0.0.1:9222/json/new?{url}") as r:
         info = await r.json()
     ws = await http.ws_connect(info["webSocketDebuggerUrl"], max_msg_size=0)
-    tab = Tab(http, ws)
+    tab = Tab(http, ws, target=info.get("id"))
     await tab.cmd("Runtime.enable")
     await tab.cmd("Page.enable")
     return tab
@@ -188,10 +204,10 @@ async def run(http):
     check("turn completes",
           await tab.until("document.querySelectorAll('.slab.stats').length === 1", 180))
     check("spinner cleared after the turn", not await tab.js("!!document.querySelector('.waiting')"))
-    check("assistant answer rendered",
-          (await tab.js("document.querySelectorAll('.msg.assistant').length")) >= 1)
+    check("LLM answer rendered",
+          (await tab.js("document.querySelectorAll('.msg.llm').length")) >= 1)
 
-    html = await tab.js("document.querySelector('.msg.assistant .body').innerHTML")
+    html = await tab.js("document.querySelector('.msg.llm .body').innerHTML")
     check("markdown became real elements",
           "<pre" in html and re.search(r"<h[2-6]", html) and "<ul>" in html, html[:200])
     check("code block got a copy button", 'class="copy"' in html)
@@ -199,7 +215,7 @@ async def run(http):
     stats_txt = await tab.js("document.querySelector('.slab.stats').textContent")
     check("stats line rendered", "context" in stats_txt, stats_txt)
     # The output counter: what the model generated, not what the prompt cost. It is
-    # a separate figure from `assistant N tok` and carries its own ~ when the server
+    # a separate figure from `LLM N tok` and carries its own ~ when the server
     # withheld usage, so assert on the label rather than on any particular number.
     check("stats line reports output tokens", " out " in stats_txt, stats_txt)
     # What the thinking cost, left on screen after the spinner cleared. Both
@@ -277,8 +293,8 @@ async def run(http):
         "(() => { const a = document.querySelector('.msg.user .body').getBoundingClientRect().left;"
         "  const b = document.querySelector('.slab.tool .slab-box').getBoundingClientRect().left;"
         "  return Math.abs(a - b) < 2; })()"))
-    check("no empty assistant bubble before the tool call", await tab.js(
-        "[...document.querySelectorAll('.msg.assistant .body')]"
+    check("no empty LLM bubble before the tool call", await tab.js(
+        "[...document.querySelectorAll('.msg.llm .body')]"
         "  .every(b => b.textContent.trim().length > 0)"))
 
     # --- events that are hard to provoke on demand, injected verbatim ---------
@@ -331,7 +347,7 @@ async def run(http):
     check("second tab replays the history",
           (await tab2.js("document.querySelectorAll('.msg.user').length")) == 2)
     check("replayed answer is rendered markdown",
-          "<pre" in (await tab2.js("document.querySelector('.msg.assistant .body').innerHTML") or ""))
+          "<pre" in (await tab2.js("document.querySelector('.msg.llm .body').innerHTML") or ""))
     check("replayed tool call is paired with its result",
           "chars" in (await tab2.js("document.querySelector('.slab.tool').textContent") or ""))
     # Replay builds the log from history, not from events, so it needs its own check.
@@ -464,7 +480,7 @@ async def run(http):
       document.querySelector('#send').click();
     })()""")
     check("a re-homed client can still send",
-          await tab.until("document.querySelectorAll('.msg.assistant').length >= 1", 180),
+          await tab.until("document.querySelectorAll('.msg.llm').length >= 1", 180),
           await tab.js("document.querySelector('#status').textContent"))
     check("the re-homed session came back empty",
           (await tab.js("document.querySelectorAll('.msg.user').length")) == 1)

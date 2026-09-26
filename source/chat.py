@@ -115,6 +115,7 @@ class Renderer:
         self.opened = None      # None | "text" | "reasoning"
         self.ind = None
         self.thought = 0        # tokens thought this turn, from the core
+        self.thought_base = 0   # the total when the current run of thinking began
         self.prompt_shown = False
 
     # ---- low-level -------------------------------------------------------
@@ -150,8 +151,17 @@ class Renderer:
         self._stop_spinner()
         # Carries the turn's count into the new spinner: the thinking a tool
         # round already did did not stop counting while the tool ran.
-        self.ind = thinking_indicator(tokens=self.thought)
+        self.ind = thinking_indicator(tokens=self.thought - self.thought_base,
+                                      total=self.thought)
         self.ind.start()
+
+    def _end_think_block(self):
+        """Words or a tool call: this run of thinking is over, the next starts at 0.
+
+        The same boundary the WebUI stamps at — the terminal has no stamp to
+        leave, so the block figure simply restarts and the turn total carries on.
+        """
+        self.thought_base = self.thought
 
     # ---- events ----------------------------------------------------------
 
@@ -161,7 +171,7 @@ class Renderer:
             self.hello(e)
         elif t == "turn_start":
             self.in_turn = True
-            self.thought = 0
+            self.thought = self.thought_base = 0
             self.spinner()
         elif t == "reasoning_stat":
             # The count only has somewhere to go while the spinner is up, which
@@ -169,17 +179,21 @@ class Renderer:
             # thinking itself is the progress report.
             self.thought = e["tokens"]
             if self.ind:
-                self.ind.tokens = self.thought
+                self.ind.tokens = self.thought - self.thought_base
+                self.ind.total = self.thought
         elif t == "reasoning":
             if self.show_reasoning:
                 self._open("reasoning", "\n🧠 ")
                 sys.stdout.write("\x1b[2m" + e["delta"] + "\x1b[0m")
                 sys.stdout.flush()
         elif t == "text":
+            if self.opened != "text":
+                self._end_think_block()
             self._open("text", "\n🐱 ")
             sys.stdout.write(e["delta"])
             sys.stdout.flush()
         elif t == "tool_call":
+            self._end_think_block()
             self.line(f"⚙️ {e['name']} {e.get('arguments','')[:150]}")
             self.spinner()
         elif t == "tool_result":
@@ -203,6 +217,8 @@ class Renderer:
         elif t == "session_state":
             if e["what"] == "cleared":
                 self.line("\n🧹 History cleared (discarded — /new archives it instead).")
+                if e.get("record"):
+                    self.line(f"   📓 what was said is still in {e['record']}")
             elif e["what"] == "model":
                 self.line(f"\n🤖 Switched to {e['model']} — context budget {e['budget']} tok.")
             elif e["what"] == "reloaded":
@@ -244,7 +260,7 @@ class Renderer:
         pct = (used * 100) // budget if budget else 0
         warn = "  ⚠️ over budget" if budget and used > budget else ""
         # Output is everything the model generated this turn — answer, thinking and
-        # tool arguments across every round — which is more than the assistant text
+        # tool arguments across every round — which is more than the LLM text
         # above and is what a metered endpoint bills. Its own ~ : the prompt side
         # and the output side can be measured or estimated independently.
         out = ""
@@ -253,12 +269,17 @@ class Renderer:
             out = f" · out {oapprox}{e['output_tokens']} tok"
             if e.get("output_total"):
                 out += f" ({e['output_total']} this session)"
-        self.line(f"⚡{ttft} user {e['user_tokens']} + assistant {e['assistant_tokens']} "
+        self.line(f"⚡{ttft} user {e['user_tokens']} + LLM {e['llm_tokens']} "
                   f"tok{rtok}{tparts}{out} · context {approx}{used}/{budget} ({pct}%){warn}")
 
     def show_info(self, r):
         i = r["info"]
         self.line(f"\n🤖 Model: {i['model']} @ {i['base_url']}")
+        # The id, not just the name: it is what the archive filenames and
+        # logs/session_ID.log are keyed on, and unlike the name it never changes.
+        sid = i.get("session_id")
+        self.line(f"🆔 Session: {i['session']}"
+                  + (f"  (id {sid} — archives are {sid}_*)" if sid else ""))
         self.line(f"💬 History: {i['messages']} messages")
         self.line("📜 Recent history:")
         for m in i["recent"]:

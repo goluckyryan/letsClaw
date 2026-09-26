@@ -201,6 +201,26 @@ function thinkRate() {
   return dt >= 1 ? Math.round((n1 - n0) / dt) : 0;
 }
 
+/* The figure beside the clock: what this run of thinking has produced, over the
+   turn's running total once a tool round has split the turn into more than one
+   run. While a tool runs nothing is being thought, so only the total is left
+   standing — and it says so, or it reads as the tool's own count. */
+function thinkFigure() {
+  const total = thinkTokens();
+  if (!total) return '';
+  const block = total - think.stamped;
+  const n = (v) => v.toLocaleString();
+  // One ~ at the front covers both numbers: a core too old to send a count
+  // leaves every figure here a chars/4 estimate, not just the first.
+  const tilde = think.exact ? '' : '~';
+  const rate = block ? thinkRate() : 0;
+  const body = !block ? `${tilde}${n(total)} tok this turn`
+             : block === total ? `${tilde}${n(total)} tok`
+             : `${tilde}${n(block)} / ${n(total)} tok`;
+  return `<span class="wait-tok">🧠 ${body}`
+       + `${rate > 0 ? ` · ${n(rate)} tok/s` : ''}</span>`;
+}
+
 /* One reasoning event's worth of progress, from either source. */
 function thinkGrew() {
   const now = Date.now();
@@ -307,18 +327,12 @@ function setWaiting(label) {
   let i = 0;
   const tick = () => {
     const s = (Date.now() - t0) / 1000;
-    // The token figure keeps counting across a whole turn — several rounds, and
-    // every resumed lap of a thinking pad — while the clock restarts with each
-    // wait. On a long think it is the only sign the model is still getting
-    // somewhere, which is why it shows even when the thinking text is hidden.
-    const tok = thinkTokens();
-    const rate = thinkRate();
-    const thought = tok
-      ? `<span class="wait-tok">🧠 ${think.exact ? '' : '~'}${tok.toLocaleString()} tok`
-        + `${rate > 0 ? ` · ${rate.toLocaleString()} tok/s` : ''}</span>`
-      : '';
+    // The clock restarts with each wait; the token figure does not — a resumed
+    // lap is the same thinking continuing, and the turn total spans the lot. On
+    // a long think it is the only sign the model is still getting somewhere,
+    // which is why it shows even when the thinking text is hidden.
     waitEl.innerHTML = `<span class="spin">${FRAMES[i++ % FRAMES.length]}</span> `
-      + `${esc(label)}… <span class="wait-clock">${s.toFixed(1)}s</span>${thought}`;
+      + `${esc(label)}… <span class="wait-clock">${s.toFixed(1)}s</span>${thinkFigure()}`;
   };
   tick();
   waitTimer = setInterval(tick, 100);
@@ -531,7 +545,7 @@ function handle(e) {
     clearWaiting();
     if (!S.turn) S.turn = { textEl: null, reasonEl: null, tools: new Map() };
     else S.turn.reasonEl = null;   // any further thinking opens its own block
-    if (!S.turn.textEl) S.turn.textEl = msg('assistant', '🐱').querySelector('.body');
+    if (!S.turn.textEl) S.turn.textEl = msg('llm', '🐱').querySelector('.body');
     stream(S.turn.textEl, e.delta);
     return;
 
@@ -564,11 +578,11 @@ function handle(e) {
   case 'stats': {
     const p = [];
     if (e.ttft != null) p.push(`ttft ${e.ttft.toFixed(1)}s`);
-    p.push(`user ${e.user_tokens} + assistant ${e.assistant_tokens} tok`);
+    p.push(`user ${e.user_tokens} + LLM ${e.llm_tokens} tok`);
     if (e.reasoning_tokens) p.push(`reasoning ${e.reasoning_tokens} tok`);
     if (e.tool_calls) p.push(`${e.tool_calls} tool call${e.tool_calls === 1 ? '' : 's'}`);
     // Everything generated this turn — answer, thinking and tool arguments across
-    // every round — which is more than the assistant text above. Its own ~: the
+    // every round — which is more than the LLM text above. Its own ~: the
     // prompt side and the output side are measured or estimated independently.
     if (e.output_tokens != null) {
       const tot = e.output_total ? ` (${e.output_total} this session)` : '';
@@ -619,6 +633,7 @@ function handle(e) {
       clearWaiting();
       log.innerHTML = '';
       notice('🧹 History cleared (discarded — /new archives it instead).');
+      if (e.record) notice(`📓 what was said is still in ${e.record}`);
       setGauge(0, S.budget, false);
     } else if (e.what === 'model') {
       S.model = e.model;
@@ -734,16 +749,18 @@ function replayHistory(messages) {
   for (const m of messages) {
     if (m.role === 'user') {
       msg('user', '👤').querySelector('.body').textContent = m.content || '';
+    // 'assistant' here is the wire role the server stores, not a display name:
+    // the chat template switches on that exact string. The bubble is .msg.llm.
     } else if (m.role === 'assistant' && m.tool_calls) {
       // .trim(): a model heading straight for a tool usually still emits "\n\n",
       // which is truthy and would replay as an avatar beside an empty bubble.
-      if ((m.content || '').trim()) msg('assistant', '🐱', renderMd(m.content));
+      if ((m.content || '').trim()) msg('llm', '🐱', renderMd(m.content));
       for (const tc of m.tool_calls) {
         pending.set(tc.id, toolSlab(tc.function.name, tc.function.arguments));
       }
     } else if (m.role === 'assistant') {
       if (!(m.content || '').trim()) continue;
-      msg('assistant', '🐱', renderMd(m.content));
+      msg('llm', '🐱', renderMd(m.content));
     } else if (m.role === 'tool') {
       const el = pending.get(m.tool_call_id);
       if (!el) continue;
@@ -804,7 +821,7 @@ function response(e) {
     let md = '';
     if (e.base) md += '**base**\n```markdown\n' + e.base + '\n```\n';
     if (e.behavior) md += '**model**\n```markdown\n' + e.behavior + '\n```\n';
-    return msg('assistant', '📄', renderMd(md || '_No behavior file loaded._'));
+    return msg('llm', '📄', renderMd(md || '_No behavior file loaded._'));
   }
   if (e.configured) {
     return notice(`🤖 current: ${e.current}   ·   configured: ${e.configured.join(', ') || '(none)'}`);
@@ -834,7 +851,11 @@ function showInfo(i) {
   }).join('<br>');
   slab('notice',
     `<b>🤖 ${esc(i.model)}</b> @ ${esc(i.base_url)}<br>` +
-    `💬 ${i.messages} messages in session '${esc(i.session)}'<br>` +
+    // The id as well as the name: archives are filed under it, and it is the
+    // half that survives a rename.
+    `💬 ${i.messages} messages in session '${esc(i.session)}'` +
+    (i.session_id ? ` (id <b>${esc(i.session_id)}</b> — archives are ${esc(i.session_id)}_*)` : '') +
+    '<br>' +
     `⚡ context ~${i.used}/${i.budget} tok (${pct}%) · ${i.tools_tokens} tok of tool schemas<br>` +
     (i.output_total != null
       ? `📤 ${i.output_total} output tok generated in this session (an odometer — /clear does not rewind it)<br>`

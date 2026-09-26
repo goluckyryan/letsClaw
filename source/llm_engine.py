@@ -68,9 +68,10 @@ class LLMEngine:
         # Hard wall for one turn, in seconds (models.<name>.turn_timeout).
         # 0 = no wall. The engine is per model, so the wall is per model.
         self.turn_timeout = 0
-        # How many resume laps a thinking pad may run before the answer phase
-        # takes over (models.<name>.max_reasoning_rounds). 0 = no pad at all.
-        self.max_reasoning_rounds = 0
+        # Whether a cut-off round is resumed at all (models.<name>.reasoning).
+        # False = no pad: a round that runs out mid-thought is simply the answer.
+        # There is no round budget — the pad grows until time or context stops it.
+        self.reasoning = True
         # How a cut-off round is resumed (models.<name>.resume_mode):
         #   chat - OpenAI-compatible prefill (SGLang: continue_final_message)
         #   raw  - llama.cpp /apply-template + /completion
@@ -110,8 +111,8 @@ class LLMEngine:
             headers = ({"Authorization": f"Bearer {self.api_key}"}
                        if self.api_key else {})
             # force_close: llama.cpp hangs up on idle keep-alive connections
-            # between laps, and a reused dead socket surfaces as
-            # ServerDisconnectedError mid-turn. A fresh connection per lap costs
+            # between rounds, and a reused dead socket surfaces as
+            # ServerDisconnectedError mid-turn. A fresh connection per round costs
             # nothing next to a generation call, and server-side prompt caching
             # (cache_prompt) is unaffected by it.
             self._session = aiohttp.ClientSession(
@@ -390,7 +391,7 @@ class LLMEngine:
                            max_tokens: int | None = None,
                            on_text=None, on_reasoning=None,
                            tools: list | None = None) -> ChatResult:
-        """One lap of a thinking pad: resume `pad` instead of re-asking.
+        """One round of a thinking pad: resume `pad` instead of re-asking.
 
         closing=False grows the pad — the block is handed back unclosed, so the
         model carries on mid-sentence. closing=True ends thinking: we write

@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import logging
 import sys
+import weakref
 from pathlib import Path
 
 from aiohttp import WSCloseCode, WSMsgType, web
@@ -174,13 +175,20 @@ async def ws_handler(request):
     mgr = request.app["mgr"]
     ws = web.WebSocketResponse(heartbeat=20)  # detect half-open peers
     await ws.prepare(request)
+    # Tracked so shutdown can close it. Weak, so a socket that goes away on its
+    # own is not kept alive here by the bookkeeping meant to tidy it up.
+    request.app["websockets"].add(ws)
 
     name = request.query.get("session", "terminal")
     last_seq = int(request.query.get("last_seq", 0) or 0)
     want_reasoning = request.query.get("reasoning", "1") != "0"
 
     try:
-        session = await mgr.get(name)
+        # ?model= applies only where mgr.get() uses it — when this attach is what
+        # creates the session. Re-attaching never switches an existing session's
+        # model: that is /model's job, and doing it silently on reconnect would
+        # move a conversation out from under whoever else is attached to it.
+        session = await mgr.get(name, request.query.get("model"))
     except ValueError as e:
         await ws.send_json(core.ev("error", msg=str(e), fatal=True))
         await ws.close()
@@ -228,9 +236,15 @@ async def ws_handler(request):
                 if turn and not turn.done():
                     await ws.send_json(core.ev("busy", reason="a turn is already running"))
                     continue
+                # Who is speaking, when the client knows something the session
+                # name does not — the Discord bot sends "discord:<username>" so
+                # one channel's session still shows who typed. Clamped because
+                # it is client-supplied and rides in every turn_start; falls
+                # back to the session name, which is what it always used to be.
+                origin = str(data.get("origin") or name)[:64] or name
                 # A task, not an await: the reader must stay live to receive
                 # `stop` and `rollover_reply` while the turn is running.
-                turn = asyncio.create_task(session.run_turn(text, origin=name))
+                turn = asyncio.create_task(session.run_turn(text, origin=origin))
             elif kind == "command":
                 reply = await session.command(data.get("name", ""), data.get("args", ""))
                 reply.update({"t": "response", "request_id": data.get("request_id")})
@@ -270,6 +284,16 @@ async def _on_startup(app):
 
 
 async def _on_shutdown(app):
+    # Close the sockets first, and actually close them. Detaching only stops
+    # events reaching a client; the handler stays parked in `async for msg in
+    # ws` waiting for a message an idle client will never send, and aiohttp
+    # waits for that handler before it will let the process die. Without this
+    # a Ctrl-C with one client attached took ~31 s — the time for the heartbeat
+    # ping and its pong timeout to fail and tear the connection down — and
+    # longer still with the heartbeat off. With it, shutdown is immediate, and
+    # clients get a close frame instead of a socket that stops answering.
+    for ws in set(app["websockets"]):
+        await ws.close(code=WSCloseCode.GOING_AWAY, message=b"core shutting down")
     for s in app["mgr"].sessions.values():
         for sub in list(s.subscribers):
             s.detach(sub)
@@ -281,6 +305,7 @@ def build_app(config, config_path=None):
     app["config"] = config
     app["config_path"] = config_path
     app["mgr"] = core.SessionManager(config, config_path)
+    app["websockets"] = weakref.WeakSet()
     app.add_routes([
         web.get("/health", health),
         web.get("/models", models),

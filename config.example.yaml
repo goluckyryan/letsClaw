@@ -27,18 +27,30 @@ models:
     context_length: 12000
     temperature: 0.7
     # On a thinking model max_tokens caps reasoning AND the answer together, so
-    # this is really "how much the model may generate per lap" — not a limit on
-    # how much it may think. A round cut off mid-reasoning is resumed, not
-    # re-asked; see "Reasoning" in the README.
+    # this is really "how much the model may generate per round" — a chunk size,
+    # not a limit on how much it may think in total. A round cut off
+    # mid-reasoning is resumed, not re-asked; see "Reasoning" in the README.
+    # Smaller is not cheaper: the pad is re-sent every round, so halving this
+    # roughly quadruples the prompt tokens processed for the same thinking.
     max_tokens: 4096
     # The answer sheet. Once thinking has been closed with </think>, the closing
     # round runs under this cap and every token of it buys answer, not
     # reasoning. 0 = the closing round keeps max_tokens.
     max_output_tokens: 32768
-    # How many resume laps the thinking pad may run before the answer phase
-    # takes over. Bounded so a runaway model costs extra laps, never a loop.
-    # 0 = no pad: a cut-off round falls back to the base.md directive.
-    max_reasoning_rounds: 3
+    # Whether a cut-off round is resumed at all. There is deliberately no budget
+    # on how many times it may resume: the pad grows until time or context stops
+    # it, or until a round comes back having written nothing.
+    # false = no pad: a cut-off round falls back to the base.md directive.
+    reasoning: true
+    # Keep the "## Checkpoint" and "## Forced conclusion" blocks out of the
+    # system prompt for this model. They are templates the core sends as user
+    # messages at the moment each applies, and they sit in base.md only so they
+    # can be tuned; a local thinking model ignores the copy in its prompt, but a
+    # hosted assistant reads the whole prompt as standing instruction and obeys
+    # it — Claude via ANL's Argo, told every turn that "this is not the final
+    # answer", replies with nothing at all. Extraction is unaffected either way.
+    # Leave false for local models; set true for a hosted API.
+    strip_directives: false
     # Hard wall for one turn, in seconds — a limit on a round, thinking model or
     # not. It also sets the HTTP client's read timeout, so a round that runs
     # longer is cut off and the turn cancelled (the conversation is saved).
@@ -92,6 +104,52 @@ core:
                         # client. Everything else in this file is picked up by /reload
                         # (or the ♻️ button) without stopping the core.
 
+# Discord client — a client like the terminal and the WebUI, in its own process
+# (./run_discord.sh). The core never imports discord.py and does not know this
+# exists. Omit the whole section if you do not want a bot.
+#
+# ⚠️  A bot is a remote shell. The tools below are unconfined, so anyone who can
+# get a message to this bot can run commands on the machine hosting the core.
+# Anyone on Discord can DM a bot by default, and in a guild the only wall is
+# Discord's own channel permissions — so `users` is a REQUIRED allowlist of
+# snowflake IDs, and an empty list refuses everybody. That is the safe default,
+# not an oversight: fill it in deliberately.
+#
+# To get a bot: https://discord.com/developers/applications → New Application →
+# Bot → copy the token below, and switch ON "Message Content Intent" under
+# Privileged Gateway Intents or every message arrives empty. Invite it with the
+# `bot` scope and the Send Messages + Read Message History permissions.
+# discord:
+#   token: ""             # bot token — config.yaml is gitignored, so it stays put
+#   core: "ws://127.0.0.1:8770"   # default: built from core.bind/core.port above
+#   core_token: ""        # defaults to core.token; set only if the bot runs elsewhere
+#   # Who may talk to the bot. Snowflake IDs (Discord → Settings → Advanced →
+#   # Developer Mode, then right-click a user → Copy User ID). Empty = nobody.
+#   users:
+#     - 123456789012345678
+#   # Guild channels: only answer when @mentioned or replied to. Hygiene, not
+#   # security — it keeps the bot quiet in a busy channel. DMs always answer.
+#   # With this false, a bare "yes" in the channel can also answer a pending
+#   # rollover question, which is reason enough to leave it on.
+#   mention_only: true
+#   # Close an idle channel's socket after this long. The conversation is NOT
+#   # lost — the core keeps the session, and the next message re-attaches to it.
+#   idle_detach_min: 60
+#   # How many messages one answer may become before the whole thing goes up as
+#   # an answer.md attachment instead of flooding the channel.
+#   max_messages: 8
+#   max_lines: 17         # soft cap per message; Discord collapses tall ones
+#   # Pretty session names for the WebUI sidebar. Without one a channel is
+#   # `discord-<channel_id>`, a thread `discord-<thread_id>`, a DM
+#   # `discord-dm-<user_id>`. The id is the identity either way, so renaming a
+#   # channel in Discord never loses its conversation.
+#   aliases:
+#     "987654321098765432": "daq-notes"
+#   # Per-channel model, applied when that channel's session is first created.
+#   # Re-attaching never switches an existing session — use /model for that.
+#   channels:
+#     "987654321098765432": {model: "qwen38"}
+
 # Agent tools
 tools:
   enabled: true
@@ -113,6 +171,18 @@ conversation:
                                 # rather than after one whose thinking was squeezed out.
                                 # auto mode only; ask/off are never interrupted pre-turn.
   sessions_dir: "state/sessions"  # archived transcripts land here
+  # The journal: a Markdown record written as the turn runs, holding every
+  # round's reasoning, every tool call and every tool result in FULL — none of
+  # which the JSON transcript beside it can carry (reasoning never enters
+  # history, and tool output is clipped to max_output_chars before it does).
+  # It lands in sessions_dir as <id>_<name>_<timestamp>.md, is closed by a
+  # rollover, and the new window is told to grep it before repeating an
+  # investigation. This is what stops the model re-deriving what it already
+  # worked out one window ago.
+  journal: true
+  # Cap on one recorded block, so a runaway `cat` costs a megabyte and not the
+  # volume. Nothing you would deliberately run comes close.
+  journal_max_block_chars: 1000000
   live_dir: "state/live"        # live conversations; reloaded when the core restarts
   prompt_timeout: 60            # seconds to wait for a rollover answer before keeping the session
 

@@ -3,6 +3,13 @@
 Each tool is a name + description + JSON parameter schema + async handler.
 Handlers return strings, which are fed back to the model as role="tool"
 messages. Output is truncated so one tool can't blow up the context.
+
+Truncation happens in Tool.run, not in the handlers, so there is exactly one
+place that knows the cap and exactly one place holding the full output before
+it is thrown away. run_full() hands both halves back: the clipped string for
+the model, the whole thing for the journal. A 300 KB grep result clipped to
+8000 chars is a fine tool message and a useless record — the next window
+searching the journal needs the matches that fell in the middle.
 """
 
 import asyncio
@@ -22,9 +29,11 @@ def _truncate(s: str, limit: int) -> str:
 
 
 class Tool:
-    def __init__(self, name, description, parameters, handler):
+    def __init__(self, name, description, parameters, handler,
+                 max_output=DEFAULT_MAX_OUTPUT):
         self.name = name
         self.handler = handler
+        self.max_output = int(max_output)
         self.spec = {
             "type": "function",
             "function": {
@@ -34,17 +43,26 @@ class Tool:
             },
         }
 
-    async def run(self, arguments: str) -> str:
-        """Execute with a JSON string of args. Always returns a string."""
+    async def run_full(self, arguments: str) -> tuple[str, str]:
+        """Execute with a JSON string of args. Returns (full, clipped).
+
+        Both are always strings, and `clipped` is what the model is given.
+        A caller that has nowhere to put the full text should use run().
+        """
         try:
             kwargs = json.loads(arguments) if arguments else {}
             if not isinstance(kwargs, dict):
                 raise ValueError("arguments must be a JSON object")
-            return str(await self.handler(**kwargs))
+            out = str(await self.handler(**kwargs))
         except (json.JSONDecodeError, TypeError, ValueError) as e:
-            return f"invalid arguments: {e}"
+            out = f"invalid arguments: {e}"
         except Exception as e:
-            return f"error: {type(e).__name__}: {e}"
+            out = f"error: {type(e).__name__}: {e}"
+        return out, _truncate(out, self.max_output)
+
+    async def run(self, arguments: str) -> str:
+        """Execute with a JSON string of args. Always returns a string."""
+        return (await self.run_full(arguments))[1]
 
 
 def _kill_group(proc):
@@ -105,7 +123,7 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None) -> list:
             parts.append(f"stdout:\n{out_s}")
         if err_s:
             parts.append(f"stderr:\n{err_s}")
-        return _truncate("\n\n".join(parts), max_out)
+        return "\n\n".join(parts)
 
     # These three touch the disk. In the shared core one slow read would stall every
     # session's token stream, so the blocking part runs off the event loop.
@@ -113,7 +131,7 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None) -> list:
         p = Path(path).expanduser()
         if not p.is_file():
             return f"error: not a file: {path}"
-        return _truncate(p.read_text(errors="replace"), max_out)
+        return p.read_text(errors="replace")
 
     async def read_file(path: str) -> str:
         return await asyncio.to_thread(_read_file, path)
@@ -137,7 +155,7 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None) -> list:
                 lines.append(f"{e.name}/")
             else:
                 lines.append(f"{e.name}  ({e.stat().st_size} bytes)")
-        return _truncate("\n".join(lines) or "(empty)", max_out)
+        return "\n".join(lines) or "(empty)"
 
     async def list_dir(path: str = ".") -> str:
         return await asyncio.to_thread(_list_dir, path)
@@ -154,7 +172,7 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None) -> list:
                  "timeout": {"type": "integer",
                              "description": f"Max seconds to wait (default: {exec_timeout})"}},
              "required": ["command"]},
-            exec_,
+            exec_, max_out,
         ),
         "read_file": Tool(
             "read_file",
@@ -162,7 +180,7 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None) -> list:
             {"type": "object",
              "properties": {"path": {"type": "string", "description": "File path"}},
              "required": ["path"]},
-            read_file,
+            read_file, max_out,
         ),
         "write_file": Tool(
             "write_file",
@@ -172,7 +190,7 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None) -> list:
                  "path": {"type": "string", "description": "File path"},
                  "content": {"type": "string", "description": "Full file content"}},
              "required": ["path", "content"]},
-            write_file,
+            write_file, max_out,
         ),
         "list_dir": Tool(
             "list_dir",
@@ -181,7 +199,7 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None) -> list:
              "properties": {"path": {"type": "string",
                                      "description": "Directory path (default: current dir)"}},
              "required": []},
-            list_dir,
+            list_dir, max_out,
         ),
     }
     return [tools[k] for k in tools if k in allow]

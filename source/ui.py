@@ -21,20 +21,35 @@ class thinking_indicator:
     - Only draws after a short grace period, so fast answers stay clean.
     - No animation when stdout is not a TTY (timing still recorded).
     - stop() is idempotent; safe to call multiple times.
-    - `tokens`, when set, rides along on the line: the core's running count of
-      what the model has thought this turn. Writable while running — the caller
-      just assigns to it — and passed to the constructor so a spinner restarted
-      after a tool result picks the count back up instead of dropping it.
+    - `tokens` and `total`, when set, ride along on the line: what this run of
+      thinking has produced, over the turn's running total once a tool round has
+      split the turn into more than one run. Both are writable while running —
+      the caller just assigns to them — and both are constructor arguments, so a
+      spinner restarted after a tool result picks the count back up instead of
+      dropping it.
     """
 
-    def __init__(self, label="thinking", tokens=None):
+    def __init__(self, label="thinking", tokens=None, total=None):
         self.label = label
         self.tokens = tokens
+        self.total = total
         self.ttft = None
         self._task = None
         self._t0 = None
         self._visible = False
         self._tty = sys.stdout.isatty()
+
+    def _thought(self):
+        """' · 6 / 839 tok' — this run of thinking over the turn's total."""
+        total = self.total or self.tokens or 0
+        block = self.tokens or 0
+        if not total:
+            return ""
+        if not block:            # a tool is running; nothing is being thought
+            return f" · {total:,} tok this turn"
+        if block >= total:       # one run so far, so the two are the same number
+            return f" · {block:,} tok"
+        return f" · {block:,} / {total:,} tok"
 
     def start(self):
         """Begin timing (and animate, on a TTY)."""
@@ -54,8 +69,8 @@ class thinking_indicator:
             frame = _FRAMES[i % len(_FRAMES)]
             i += 1
             self._visible = True
-            thought = f" · {self.tokens:,} tok" if self.tokens else ""
-            sys.stdout.write(f"\r🐱 {frame} {self.label}… {elapsed:.1f}s{thought}\x1b[K")
+            sys.stdout.write(
+                f"\r🐱 {frame} {self.label}… {elapsed:.1f}s{self._thought()}\x1b[K")
             sys.stdout.flush()
 
     def stop(self):

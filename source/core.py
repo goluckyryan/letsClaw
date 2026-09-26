@@ -21,6 +21,7 @@ import itertools
 import json
 import logging
 import re
+import secrets
 import time
 from collections import deque
 from datetime import datetime
@@ -42,9 +43,18 @@ CONFIG_PATH = paths.REPO_ROOT / "config.yaml"
 DEFAULT_CONTEXT_LENGTH = 12000
 DEFAULT_ROLLOVER_PCT = 90
 DEFAULT_ROLLOVER_MODE = "auto"
-HANDOFF_MAX_TOKENS = 800
+# The handoff is the only thing that survives a rollover besides one exchange, so
+# it is the whole of the session's memory afterwards. Four sections now share it
+# (RULED OUT was added so dead ends are not re-walked), and 800 could not hold
+# them. It costs this many tokens of system prompt permanently — cheap next to
+# re-exploring an approach that was already rejected.
+HANDOFF_MAX_TOKENS = 1500
 HANDOFF_MIN_TOKENS = 256
 HANDOFF_MARGIN = 200
+# The handoff never takes more than 1/this of the window. At 100k+ the absolute
+# cap binds first and this does nothing; on a small model it is what stops the
+# summary becoming a permanent tax on the context it was meant to save.
+HANDOFF_WINDOW_SHARE = 20
 # cl100k plus our framing under-counts this stack by ~30% (chat-template markers
 # and the server's own tool rendering are invisible to us). Only used when the
 # server withholds usage: rolling over early costs a summary, late costs a 400.
@@ -56,9 +66,12 @@ CARRYOVER_MARKER = "\n\n=== CONTINUED SESSION ===\n"
 # wall after a long think. Thinking stops at turn_timeout - this.
 DEFAULT_ANSWER_TIME_RESERVE = 120
 # Slack left between the pad and the context ceiling. The pad rides in the
-# prompt and grows every lap, and our token count runs low (see ESTIMATE_SCALE),
-# so the headroom wall trips this far short of the real edge.
+# prompt and grows every round, and our token count runs low (see
+# ESTIMATE_SCALE), so the headroom wall trips this far short of the real edge.
 PAD_CONTEXT_MARGIN = 2000
+# How many times a server that cannot resume is asked to conclude before we give
+# up. Only the fallback path uses it; resumable servers never come here.
+FORCED_CONCLUSION_TRIES = 3
 # Below this much free context there is no room to think in, so the pad is not
 # worth starting — the pre-turn check rolls over instead where it may.
 MIN_THINK_HEADROOM = 4000
@@ -147,15 +160,16 @@ def build_engine(config, model_name=None):
     engine.context_length = entry.get("context_length", DEFAULT_CONTEXT_LENGTH)
     # The answer sheet: the cap the closing round runs under, once thinking has
     # been shut with </think>. Every token of it buys answer, not reasoning.
-    # 0 = the closing round keeps the per-lap max_tokens.
+    # 0 = the closing round keeps the per-round max_tokens.
     engine.max_output = int(entry.get("max_output_tokens", 32768) or 0)
     # Hard wall for one turn, in seconds — a limit on a round, thinking model or
     # not. 0 = no wall. It must reach the HTTP client too, whose 600 s read
     # timeout would otherwise kill a long round.
     engine.turn_timeout = int(entry.get("turn_timeout", 36000) or 0)
-    # How many resume laps the thinking pad may run before the answer phase
-    # takes over. Bounded so a runaway model costs extra laps, never a loop.
-    engine.max_reasoning_rounds = int(entry.get("max_reasoning_rounds", 3) or 0)
+    # Whether a cut-off round is resumed at all. There is deliberately no round
+    # budget: the pad grows until time or context stops it, both of which are
+    # real limits. A round that reasons nothing ends it (see _think_pad).
+    engine.reasoning = bool(entry.get("reasoning", True))
     # Seconds held back from turn_timeout so the answer still fits inside the
     # wall after a long think. Thinking stops at turn_timeout - this.
     engine.answer_time_reserve = int(entry.get("answer_time_reserve",
@@ -320,6 +334,30 @@ def strip_tool_markup(text):
     return cleaned.strip()
 
 
+def strip_directive_sections(base_behavior):
+    """The base behavior minus the two blocks the core sends on its own.
+
+    "## Checkpoint" and "## Forced conclusion" are templates, not behavior: each
+    is extracted and sent as a *user* message at the one moment it applies. They
+    live in base.md so they can be tuned without a code change, but they are
+    also, redundantly, part of every system prompt — and a model that reads its
+    whole system prompt as standing instruction will simply obey them. Claude
+    Opus 5 over Argo answers nothing at all, having been told on every turn that
+    "This is not the final answer".
+
+    Local thinking models ignore them, so stripping is opt-in per model
+    (models.<name>.strip_directives) rather than done for everyone. Extraction
+    is unaffected: the directives still reach the model when they are meant to.
+    """
+    out, skipping = [], False
+    for line in base_behavior.splitlines(keepends=True):
+        if line.startswith("## "):
+            skipping = line.strip() in (CHECKPOINT_MARKER, CONCLUDE_MARKER)
+        if not skipping:
+            out.append(line)
+    return "".join(out).rstrip() + "\n"
+
+
 def extract_conclude_directive(base_behavior):
     """The paragraph that forces a cut-off round to conclude. See extract_directive."""
     return extract_directive(base_behavior, CONCLUDE_MARKER, CONCLUDE_FALLBACK)
@@ -401,6 +439,19 @@ class Session:
         # it counts the session's life, not the current window.
         self.rollover_count = 0
 
+        # Stable identity, unlike self.name, which the user may change at any
+        # time. Everything written to disk carries this, so the archives of one
+        # conversation stay findable across every name it has ever had.
+        # Overwritten by load_state for a session restored from its live file.
+        #
+        # 4 bytes = 8 hex, matching live_path's digest. Short enough to type into
+        # a grep, and the index accumulates for the life of the install, so the
+        # birthday bound is what matters rather than the live session count: at
+        # 8 hex a thousand sessions collide with probability ~0.01%, at 4 hex
+        # a hundred collide with probability ~7% — and a collision silently
+        # merges two conversations in the index, which is worse than no index.
+        self.session_id = secrets.token_hex(4)
+
         self.lock = asyncio.Lock()
         self.subscribers = set()
         self.dead = False       # deleted; sockets still on it must be re-homed
@@ -416,6 +467,12 @@ class Session:
         self._persisted = False  # has this session ever been written to disk?
         # A reload that arrived mid-turn, waiting for the turn to end.
         self._pending_config = None
+
+        # The append-only record of what this session generates — reasoning
+        # included, tool output untruncated. Opened on the first thing worth
+        # recording and closed by a rollover; see store.Journal.
+        self.journal_on = bool(conv.get("journal", True))
+        self._journal = None
 
     # ---- events ----------------------------------------------------------
 
@@ -558,6 +615,34 @@ class Session:
         self.emit(ev("session_state", what="reloaded", model=self.model_name,
                      budget=self.budget, changed=blob["changed"]))
 
+    # ---- the journal -----------------------------------------------------
+
+    async def jot(self, header, body=""):
+        """Record one block, if journalling is on. Never raises, never blocks
+        for long: the write is off the event loop and a failed one is dropped.
+
+        Called from inside a turn, so it must stay cheap — it is a file append
+        after the generation it records, not on the token path.
+        """
+        if not self.journal_on:
+            return
+        if self._journal is None:
+            self._journal = store.Journal(self.session_id, self.name,
+                                          self.model_name, self.config)
+        await self._journal.write(header, body)
+
+    async def close_journal(self):
+        """End the current segment. Returns its path, or None if it is empty."""
+        journal, self._journal = self._journal, None
+        if journal is None:
+            return None
+        try:
+            return await journal.close()
+        except OSError as e:
+            self.emit(ev("notice", level="warn",
+                         text=f"could not close the journal: {e}"))
+            return None
+
     # ---- persistence -----------------------------------------------------
 
     async def persist(self):
@@ -580,6 +665,11 @@ class Session:
         payload = {
             "v": store.LIVE_SCHEMA,
             "name": self.name,
+            # Deliberately additive rather than a LIVE_SCHEMA bump: a bump makes
+            # load_live skip every file written before it, which would throw away
+            # the user's live conversations to gain an id. load_state mints one
+            # for a file that predates this field instead.
+            "session_id": self.session_id,
             "model": self.model_name,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             # Restored so a client reconnecting with an old last_seq is told it
@@ -610,6 +700,9 @@ class Session:
 
     def load_state(self, payload):
         """Take the non-history half of a saved payload. See restore()."""
+        # A file written before session_id existed has none; the one minted in
+        # __init__ stands and is persisted on the next save.
+        self.session_id = payload.get("session_id") or self.session_id
         self.last_seq = int(payload.get("last_seq") or 0)
         self._seq = itertools.count(self.last_seq + 1)
         self.turn_id = int(payload.get("turn_id") or 0)
@@ -692,6 +785,9 @@ class Session:
         await self._headroom_check()
         self.history.append({"role": "user", "content": text})
         user_tok = count_text(text)
+        # After the headroom check, so the question opens the segment it is
+        # actually answered in rather than the one that just rolled away.
+        await self.jot(f"turn {self.turn_id} user", text)
 
         turn_t0 = time.monotonic()
         tools_used = 0
@@ -706,7 +802,7 @@ class Session:
         # rather than in the browser so it is the same tiktoken count the ⚡ line
         # ends the turn on — a chars/4 guess lands 10-20% away on Qwen, and two
         # numbers for one quantity read as a bug. Spans the whole turn: every
-        # round, every pad lap, and the waits between them.
+        # round, every pad resume, and the waits between them.
         reason_tok = 0         # counted so far
         reason_pending = []    # deltas that arrived since the last count
         reason_t0 = None       # first reasoning delta of the turn
@@ -785,7 +881,7 @@ class Session:
                              extra_messages=None):
             """One model round: stream, tally, and return the result.
 
-            Shared by the tool loop, the thinking-pad laps and the fallback
+            Shared by the tool loop, the thinking-pad resumes and the fallback
             conclusion rounds, so every one of them lands in the same accounting
             and emits the same events. With `pad` set the round is a resume —
             the pad is handed back to the model instead of the question being
@@ -833,6 +929,17 @@ class Session:
                 last_ttft = ttft_box["v"]
             # A resumed round's prompt is history + pad, not history: see tally.
             tally(result, history_shaped=pad is None)
+            # Journalled here rather than at the call sites, so every path
+            # through the model lands in the record by construction: the tool
+            # loop, each pad resume, a compaction, the closing round. The pad
+            # in particular exists nowhere else — it never enters history — so
+            # this is the only place its reasoning can be kept at all.
+            phase = "closing" if closing else ("resume" if pad is not None else "round")
+            tag = f"turn {self.turn_id} {phase} {rounds}"
+            if result.reasoning:
+                await self.jot(f"{tag} reasoning", result.reasoning)
+            if result.text:
+                await self.jot(f"{tag} text", result.text)
             last_finish = result.finish_reason
             last_reasoning = result.reasoning or ""
             return result
@@ -871,27 +978,38 @@ class Session:
                 # Emitted BEFORE the call: a 120-second exec used to be silent.
                 self.emit(ev("tool_call", id=tc["id"], name=tc["name"],
                              arguments=tc["arguments"]))
+                tag = f"turn {self.turn_id} round {rounds}"
+                # Recorded before the call runs, so a command that hangs until
+                # the turn wall still leaves behind what was attempted.
+                await self.jot(f"{tag} tool_call {tc['name']} {tc['id']}",
+                               tc["arguments"])
                 tool = next((t for t in self.tools if t.name == tc["name"]), None)
                 if id(tc) in cut:
                     out = ("error: the call was cut off at the output limit and "
                            "its arguments are incomplete, so it was not run. "
                            "Issue it again, more briefly.")
+                    full = out
                     self.emit(ev("notice", level="warn",
                                  text=f"{tc['name']} call was truncated mid-arguments "
                                       "— not run"))
                 elif tool is None:
-                    out = f"error: tool '{tc['name']}' is not enabled"
+                    out = full = f"error: tool '{tc['name']}' is not enabled"
                 else:
-                    out = await tool.run(tc["arguments"])
+                    # The full output goes to the journal and the clipped one to
+                    # the model. Searching a record of elided middles finds
+                    # nothing, which is the whole reason the record exists.
+                    full, out = await tool.run_full(tc["arguments"])
                 tools_used += 1
                 slots[tc["id"]]["content"] = out
+                await self.jot(
+                    f"{tag} tool_result {tc['name']} {tc['id']} {len(full)} chars", full)
                 self.emit(ev("tool_result", id=tc["id"], name=tc["name"], size=len(out)))
 
         def was_cut_off(result):
             """Reasoning ate the whole budget: thought hard, said nothing."""
             return (not result.text and not result.wants_tool
                     and result.finish_reason == "length"
-                    and self.engine.max_reasoning_rounds)
+                    and self.engine.reasoning)
 
         try:
             for _ in range(self.max_tool_rounds):
@@ -930,6 +1048,8 @@ class Session:
                 try:
                     full_response = await self.engine.chat(self.history)
                     self.emit(ev("text", delta=full_response))
+                    # The one answer that never goes through call_round.
+                    await self.jot(f"turn {self.turn_id} fallback text", full_response)
                     had_error = False
                 except Exception as e2:
                     self.emit(ev("error", msg=f"{type(e2).__name__}: {e2}", fatal=False))
@@ -964,7 +1084,7 @@ class Session:
             self.emit(ev("stats",
                          ttft=last_ttft,
                          user_tokens=user_tok,
-                         assistant_tokens=count_text(full_response),
+                         llm_tokens=count_text(full_response),
                          # The running count the spinner has been showing all
                          # turn, not a fresh tally of the same text: one number,
                          # so the live figure and this one cannot disagree.
@@ -972,7 +1092,7 @@ class Session:
                          tool_calls=tools_used,
                          # Everything generated this turn, across every round:
                          # the answer, the reasoning, and the tool-call arguments.
-                         # assistant_tokens above is the final answer alone, which
+                         # llm_tokens above is the final answer alone, which
                          # is the smaller and more useful number to read; this is
                          # the one that was actually paid for.
                          output_tokens=out_tok,
@@ -985,7 +1105,7 @@ class Session:
             # how much, or a turn spent entirely on reasoning looks free.
             # finish_reason says whether the cap was actually hit, so the advice
             # matches the cause instead of guessing.
-            if last_finish == "length" and not self.engine.max_reasoning_rounds:
+            if last_finish == "length" and not self.engine.reasoning:
                 # The forced-conclusion loop is off, so the cap advice is still
                 # the useful one; with it on, the loop said what it did already.
                 self.emit(ev("notice", level="warn",
@@ -1013,12 +1133,12 @@ class Session:
         """Roll over *before* a turn when there is no room left to think in.
 
         A session sitting just under the rollover threshold has a full window
-        and no headroom, so the pad's context wall would trip on the first lap —
+        and no headroom, so the pad's context wall would trip on the first round —
         thinking would be off exactly where a hard question needs it. Rolling
         first gives the turn a fresh window. Only in auto mode: `ask` must not
         put a question before the turn has even started, and `off` means off.
         """
-        if not (self.engine and self.engine.max_reasoning_rounds and self.budget):
+        if not (self.engine and self.engine.reasoning and self.budget):
             return
         if self.rollover_mode != "auto" or not self.rollover_before_think:
             return
@@ -1044,7 +1164,7 @@ class Session:
         The model's reasoning and its answer come out of one budget, so a round
         can end having thought hard and said nothing. Rather than bin that work,
         the reasoning becomes a *pad*: handed back unclosed, so the model carries
-        on mid-sentence. The pad grows lap by lap until a wall trips, and then
+        on mid-sentence. The pad grows round by round until a wall trips, and then
         the answer phase closes the thinking block itself — which both forces an
         answer (models often never close it) and makes the answer's budget
         genuinely separate, since past `</think>` no more reasoning can happen.
@@ -1067,28 +1187,30 @@ class Session:
         # Only the chat transport parses tool calls; see the answer phase below.
         tools_ok = allow_tools and transport == "chat"
 
-        laps = compactions = 0
-        # A while loop, not a range: a compaction is not a lap and must not
-        # spend one — it buys room for the laps that follow.
-        while laps < self.engine.max_reasoning_rounds:
+        rounds = compactions = 0
+        # Unbounded on purpose. There is no round budget, because a count is not
+        # a limit the machine actually has: the pad is stopped by time, by
+        # context, or by the model running dry, and each of those is real. The
+        # loop still cannot spin — see the no-progress guard at the bottom.
+        while True:
             if think_deadline and time.monotonic() >= think_deadline:
                 self.emit(ev("notice", level="info",
                              text=f"thinking stopped at the {reserve} s answer reserve "
-                                  f"after {laps} lap(s) — concluding"))
+                                  f"after {rounds} round(s) — concluding"))
                 break
             if self._pad_headroom() - count_text(pad) <= 0:
                 if compactions >= self.engine.max_pad_compactions:
                     self.emit(ev("notice", level="info",
-                                 text=f"thinking filled the context after {laps} lap(s) "
-                                      "— concluding"))
+                                 text=f"thinking filled the context after {rounds} "
+                                      "round(s) — concluding"))
                     break
                 if count_text(pad) <= PAD_TAIL_TOKENS * 2:
                     # Everything here would survive as the verbatim tail, so
                     # there is nothing to distil — a checkpoint round would only
                     # spend budget to make the pad bigger.
                     self.emit(ev("notice", level="info",
-                                 text=f"thinking filled the context after {laps} lap(s), "
-                                      "too little to compact — concluding"))
+                                 text=f"thinking filled the context after {rounds} "
+                                      "round(s), too little to compact — concluding"))
                     break
                 compacted = await self._compact_pad(call_round, pad, answer_cap)
                 compactions += 1
@@ -1098,35 +1220,41 @@ class Session:
                     break
                 pad = compacted
                 continue   # re-test the walls against the smaller pad
-            laps += 1
+            rounds += 1
             self.emit(ev("notice", level="info",
-                         text=f"reasoning cut off — resuming it (lap {laps} of "
-                              f"{self.engine.max_reasoning_rounds}, pad ~{count_text(pad)} tok)"))
+                         text=f"reasoning cut off — resuming it (round {rounds}, "
+                              f"pad ~{count_text(pad)} tok)"))
             result = await call_round(overrides={"max_tokens": lap_cap}, pad=pad)
             pad += result.reasoning or ""
             if result.text:
                 # The model closed the block itself and answered. Take that only
-                # if it actually finished: a lap runs under the small per-lap
-                # cap, so an answer that hit the cap is half a sentence, and one
-                # that was pure tool markup is nothing once stripped. Either way
-                # the pad is complete — fall through and let the closing round
-                # write the answer properly, under the answer budget.
+                # if it actually finished: a resumed round runs under the small
+                # per-round cap, so an answer that hit the cap is half a
+                # sentence, and one that was pure tool markup is nothing once
+                # stripped. Either way the pad is complete — fall through and let
+                # the closing round write the answer under the answer budget.
                 text = strip_tool_markup(result.text)
                 if text and result.finish_reason != "length":
                     return ChatResult(text)
                 break
             if result.finish_reason != "length":
                 break  # stopped without text and without being cut off
-        else:
-            self.emit(ev("notice", level="info",
-                         text=f"{self.engine.max_reasoning_rounds} thinking laps used "
-                              "— concluding"))
+            if not result.reasoning:
+                # The no-progress guard, and the only thing standing in for the
+                # round counter that used to bound this loop. Cut off at the cap
+                # having written nothing: the pad cannot grow, so the context
+                # wall will never move and every further round would be
+                # identical. Everything else here shrinks headroom or stops.
+                self.emit(ev("notice", level="info",
+                             text=f"reasoning stopped making progress after {rounds} "
+                                  "round(s) — concluding"))
+                break
 
         # Answer phase: we write </think> ourselves, so this cap buys answer only.
         #
-        # Tools are offered here, and only here. A lap must not call one: there
+        # Tools are offered here, and only here. A resume must not call one: there
         # is no way to splice a tool result into the middle of an unclosed
-        # thinking block, so an interrupted lap would forfeit the pad — the very
+        # thinking block, so an interrupted resume would forfeit the pad — the very
         # work this exists to keep. By the closing round the pad has already done
         # its job of deciding what to do, so spending it to launch a call is a
         # fair trade, and the turn continues with the result in hand.
@@ -1217,7 +1345,7 @@ class Session:
         new_pad = f"{note}\n\n{self._pad_tail(pad)}"
         after = count_text(new_pad)
         if after >= before:
-            # No room bought, so another lap would trip the same wall forever.
+            # No room bought, so another round would trip the same wall forever.
             self.emit(ev("notice", level="warn",
                          text=f"the checkpoint ({after} tok) did not shrink the pad "
                               f"({before} tok) — concluding instead"))
@@ -1240,7 +1368,7 @@ class Session:
         configured = self.engine.extra_params.get("max_tokens") or 0
         cap = max(cap or 0, configured) or None
         directive = self.manager.conclude_directive
-        for _ in range(self.engine.max_reasoning_rounds):
+        for _ in range(FORCED_CONCLUSION_TRIES):
             self.emit(ev("notice", level="warn",
                          text=f"reasoning was cut off and this server cannot resume it "
                               f"— forcing a conclusion under {cap or 'the model default'} tok"))
@@ -1343,12 +1471,21 @@ class Session:
                      budget=self.budget, count=self.rollover_count))
         try:
             transcript = await store.save_transcript(
-                self.history, self.model_name, self.config, self.name)
+                self.history, self.model_name, self.config, self.name,
+                session_id=self.session_id)
         except OSError as e:
             transcript = None
             self.emit(ev("notice", level="warn", text=f"could not save transcript: {e}"))
+        # Closed here, not at the end: the path has to exist before the
+        # carryover that advertises it is built, and the next segment then
+        # opens on the first turn of the fresh window.
+        record = await self.close_journal()
 
-        summary_max = min(HANDOFF_MAX_TOKENS, self.budget - used - HANDOFF_MARGIN)
+        # Three caps: the absolute one, a share of the window so a small model
+        # does not spend an eighth of its context on the summary for ever, and
+        # what is actually free right now.
+        summary_max = min(HANDOFF_MAX_TOKENS, self.budget // HANDOFF_WINDOW_SHARE,
+                          self.budget - used - HANDOFF_MARGIN)
         handoff = ""
         if summary_max >= HANDOFF_MIN_TOKENS:
             try:
@@ -1365,11 +1502,13 @@ class Session:
         if handoff:
             try:
                 handoff_path = await store.append_handoff(
-                    handoff, self.model_name, transcript, self.config, self.name)
+                    handoff, self.model_name, transcript, self.config, self.name,
+                    journal_path=record)
             except OSError as e:
                 self.emit(ev("notice", level="warn", text=f"could not append handoff: {e}"))
 
-        fresh = self.fresh_history(store.format_carryover(handoff, transcript))
+        fresh = self.fresh_history(
+            store.format_carryover(handoff, transcript, journal_path=record))
         tail = store.last_exchange(self.history)
         if tail and (not trip or self.estimate(fresh + tail) < trip):
             fresh += tail
@@ -1379,6 +1518,7 @@ class Session:
         self.history = fresh
         self.emit(ev("rollover_done",
                      transcript=str(transcript) if transcript else None,
+                     record=str(record) if record else None,
                      handoff=str(handoff_path) if handoff_path else None,
                      used=self.estimate(), budget=self.budget,
                      count=self.rollover_count))
@@ -1397,7 +1537,8 @@ class Session:
         if name == "info":
             used = self.estimate()
             return {"ok": True, "info": {
-                "session": self.name, "model": self.model_name,
+                "session": self.name, "session_id": self.session_id,
+                "model": self.model_name,
                 "base_url": (str(self.engine.client.base_url)
                              if self.engine else None),
                 "messages": len(self.history),
@@ -1436,7 +1577,13 @@ class Session:
             if name == "clear":
                 self.history = self.fresh_history()
                 self.declined_at, self.warned_over = None, False
-                self.emit(ev("session_state", what="cleared", messages=0))
+                # /clear starts a new window as surely as a rollover does, it
+                # just does not summarise on the way. Leaving the segment open
+                # would append the next, unrelated conversation to the end of
+                # this one, with the turn numbers running straight on.
+                record = await self.close_journal()
+                self.emit(ev("session_state", what="cleared", messages=0,
+                             record=str(record) if record else None))
                 await self.persist()
                 return {"ok": True}
             if name == "new":
@@ -1493,6 +1640,9 @@ class SessionManager:
         self.sessions = {}
         self._engines = {}
         self._behaviors = {}
+        # Session ids in use, from logs/session_ID.log. None until first needed:
+        # __init__ is synchronous and this is a file read.
+        self._ids = None
         # Read synchronously at startup — one small local file, the same way
         # the config file itself is read. A missing file warns and degrades to
         # an empty base; the core keeps starting.
@@ -1519,6 +1669,40 @@ class SessionManager:
                 self._engines[name] = build_engine(self.config, name)
             return self._engines[name]
 
+    async def _new_session_id(self):
+        """A session id that is not already in logs/session_ID.log.
+
+        Random alone would already collide only about once in 4.3 billion; the
+        registry check is what turns "vanishingly unlikely" into "cannot happen",
+        which is worth having because a collision is silent — two conversations
+        would simply share a prefix in the archive and nothing would complain.
+        """
+        if self._ids is None:
+            self._ids = await store.known_ids(self.config)
+        while True:
+            sid = secrets.token_hex(4)
+            if sid not in self._ids:
+                self._ids.add(sid)
+                return sid
+
+    async def _adopt_session_id(self, session, payload=None):
+        """Give a restored session its id, minting one if the file predates them.
+
+        Live files written before session_id existed have none — this is the
+        migration, and it runs once per such session at the next restart.
+        """
+        if self._ids is None:
+            self._ids = await store.known_ids(self.config)
+        saved = (payload or {}).get("session_id")
+        if saved:
+            session.session_id = saved
+            self._ids.add(saved)
+        else:
+            session.session_id = await self._new_session_id()
+            logger.info("session %s had no id — assigned %s",
+                        session.name, session.session_id)
+        await store.register_id(session.session_id, session.name, self.config)
+
     def _behavior_sync(self, path):
         """Cached read, synchronous: a missing file is a warning and ""."""
         if path not in self._behaviors:
@@ -1537,18 +1721,26 @@ class SessionManager:
         the model's own file. Both cached; a missing file is "" (warned)."""
         base = await self._behavior_text(
             self.config.get("behavior", {}).get("base_file") or DEFAULT_BASE_FILE)
+        # Per model, because it is a property of how the model reads a prompt,
+        # not of the prompt. Applied after the cached read so the cache still
+        # holds the file as written.
+        if entry.get("strip_directives"):
+            base = strip_directive_sections(base)
         model = await self._behavior_text(entry.get("behavior_file", "models/default.md"))
         return base, model
 
     async def get(self, name, model=None):
         if name not in self.sessions:
             s = Session(name, self, self.config)
+            s.session_id = await self._new_session_id()
             s.tools = self._tools
             s.schemas = self._schemas
             s.tools_tok = self._tools_tok
             await s.use_model(model)
             self.sessions[name] = s
-            logger.info("session %s created on model %s", name, s.model_name)
+            await store.register_id(s.session_id, name, self.config)
+            logger.info("session %s created on model %s (id %s)",
+                        name, s.model_name, s.session_id)
         return self.sessions[name]
 
     async def reload(self, path=None):
@@ -1620,6 +1812,10 @@ class SessionManager:
                                int(new_conv.get("prompt_timeout", 60))),
             ("rollover_before_think", bool(old_conv.get("rollover_before_think", True)),
                                       bool(new_conv.get("rollover_before_think", True))),
+            # Turning this off leaves the open segment where it is: it closes at
+            # the next rollover, holding what was recorded before the reload.
+            ("journal_on", bool(old_conv.get("journal", True)),
+                           bool(new_conv.get("journal", True))),
         ]
 
         updated = deferred = 0
@@ -1695,9 +1891,10 @@ class SessionManager:
             # message — a model-written handoff that cannot be regenerated.
             s.history = payload["messages"]
             s.load_state(payload)
+            await self._adopt_session_id(s, payload)
             self.sessions[name] = s
-            logger.info("session %s restored: %d messages on %s",
-                        name, len(s.history) - 1, s.model_name)
+            logger.info("session %s restored: %d messages on %s (id %s)",
+                        name, len(s.history) - 1, s.model_name, s.session_id)
         return len(self.sessions)
 
     def describe(self):
@@ -1737,6 +1934,22 @@ class SessionManager:
         # stamp is what tells an attached client where it now is. Nobody is
         # disconnected: same session object, same socket, same scrollback.
         s.emit(ev("session_state", what="renamed", was=old))
+        # The index is the only record that these two names are one conversation:
+        # transcripts written before now keep the old name for ever, and the live
+        # file is about to stop mentioning it at all. Non-fatal — a rename that
+        # worked must not be reported as failed because a log line did not land.
+        try:
+            await store.append_index(
+                {"t": "rename", "id": s.session_id, "from": old, "to": new,
+                 "at": datetime.now().isoformat(timespec="seconds")}, self.config)
+        except OSError as e:
+            logger.warning("could not record the rename in the session index: %s", e)
+        # The id log names the conversation too; an entry still showing the old
+        # name would misidentify every archive written under the id from now on.
+        try:
+            await store.register_id(s.session_id, new, self.config)
+        except OSError as e:
+            logger.warning("could not update the session id log: %s", e)
         # Write the new file before unlinking the old one. Interrupted between
         # the two, the session comes back under both names — recoverable, unlike
         # coming back under neither.
@@ -1769,7 +1982,19 @@ class SessionManager:
         s.dead = True
         del self.sessions[name]
         await store.delete_live(name, self.config)
-        logger.info("session %s deleted (%d messages discarded)", name, messages)
+        # The id leaves the registry with the session. Its archives under
+        # state/sessions keep it in their filenames — they are records of a
+        # conversation that existed, and deleting a live session is not a claim
+        # that it never did.
+        if self._ids is not None:
+            self._ids.discard(s.session_id)
+        try:
+            await store.unregister_id(s.session_id, self.config)
+        except OSError as e:
+            logger.warning("could not drop %s from the session id log: %s",
+                           s.session_id, e)
+        logger.info("session %s deleted (id %s, %d messages discarded)",
+                    name, s.session_id, messages)
         return {"ok": True, "name": name, "messages": messages}
 
     async def close(self):
