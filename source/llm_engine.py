@@ -7,6 +7,8 @@ model's own entry under models: in config.yaml.
 
 import json
 import logging
+import re
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,12 +17,130 @@ from openai import AsyncOpenAI
 
 logger = logging.getLogger("letclaw.engine")
 
+# Tool-call markup, for the raw transport only. /completion has no tool-call
+# parser — it hands back the chat template's own XML as plain text — so the
+# parsing the chat endpoint would have done is done here instead. Two shapes are
+# in the wild and which one appears is the template's choice, not ours:
+#
+#   <tool_call><function=exec><parameter=command>ls</parameter></function></tool_call>
+#   <tool_call>{"name": "exec", "arguments": {"command": "ls"}}</tool_call>
+#
+# Deliberately confined to this transport. On the chat endpoint the server
+# parses tool calls properly, so markup arriving as text there is the model
+# *writing about* a tool call — prose, in an answer explaining itself — and
+# executing that would be a real hazard.
+TOOL_OPEN, TOOL_CLOSE = "<tool_call>", "</tool_call>"
+_FUNC_RE = re.compile(r"<function=([^>\s]+)\s*>(.*)</function>", re.S)
+_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.S)
+
 # The thinking block a resumed round is handed back inside. A pad is re-sent as
 # an unclosed THINK_OPEN + pad, so the model carries on mid-sentence instead of
 # starting the question over; THINK_CLOSE ends the thinking phase and is what
 # makes the answer's budget separate — past the tag the model cannot reason.
 THINK_OPEN = "<think>\n"
 THINK_CLOSE = "\n</think>\n\n"
+
+
+def _partial_suffix(text, marker):
+    """How much of `text`'s tail could still be the start of `marker`.
+
+    A marker arrives split across stream chunks as often as not, so that much
+    has to be held back rather than forwarded and regretted.
+    """
+    for n in range(min(len(text), len(marker) - 1), 0, -1):
+        if text.endswith(marker[:n]):
+            return n
+    return 0
+
+
+def parse_tool_block(block):
+    """One <tool_call> body as {"id", "name", "arguments"}, or None.
+
+    `arguments` is a JSON string, matching what the OpenAI client hands back,
+    so a recovered call is indistinguishable downstream from a parsed one —
+    including to truncated_tool_calls(), which re-reads it to decide whether
+    the call finished generating.
+    """
+    block = block.strip()
+    if not block:
+        return None
+    call = None
+    if m := _FUNC_RE.search(block):
+        params = {k: v.strip("\n") for k, v in _PARAM_RE.findall(m.group(2))}
+        call = (m.group(1), json.dumps(params))
+    elif block.startswith("{"):
+        try:
+            d = json.loads(block)
+            name = d.get("name")
+            args = d.get("arguments")
+            if name:
+                call = (name, args if isinstance(args, str)
+                        else json.dumps(args or {}))
+        except (ValueError, TypeError):
+            return None
+    if not call:
+        return None
+    # An id the model never sees but the tool-result message must echo back.
+    return {"id": secrets.token_hex(12), "name": call[0], "arguments": call[1]}
+
+
+class ToolMarkupFilter:
+    """Splits a raw text stream into text to show and tool calls to run.
+
+    Fed chunk by chunk, it returns only the text safe to forward: a complete
+    <tool_call> block is taken out and kept, and a partial one is held back
+    until it is one or the other. That is what stops a client rendering half an
+    XML tag, and what stopped Discord posting the whole call as prose.
+    """
+
+    def __init__(self):
+        self.buf = ""
+        self.blocks = []
+        self.inside = False
+
+    def feed(self, chunk):
+        self.buf += chunk
+        out = []
+        while True:
+            if self.inside:
+                end = self.buf.find(TOOL_CLOSE)
+                if end < 0:
+                    # Still inside the call; nothing here is for the reader. A
+                    # stray <tool_call> that never closes swallows the rest of
+                    # the round, which is the safe way round: better to show
+                    # nothing than to show markup.
+                    return "".join(out)
+                self.blocks.append(self.buf[:end])
+                self.buf = self.buf[end + len(TOOL_CLOSE):]
+                self.inside = False
+                continue
+            start = self.buf.find(TOOL_OPEN)
+            if start >= 0:
+                out.append(self.buf[:start])
+                self.buf = self.buf[start + len(TOOL_OPEN):]
+                self.inside = True
+                continue
+            keep = _partial_suffix(self.buf, TOOL_OPEN)
+            cut = len(self.buf) - keep
+            out.append(self.buf[:cut])
+            self.buf = self.buf[cut:]
+            return "".join(out)
+
+    def finish(self):
+        """Whatever is left once the stream ends.
+
+        An unterminated block is dropped: it never became a tool call, and it
+        is not something a reader should see either.
+        """
+        if self.inside:
+            self.buf = ""
+            return ""
+        rest, self.buf = self.buf, ""
+        return rest
+
+    def tool_calls(self):
+        calls = [parse_tool_block(b) for b in self.blocks]
+        return [c for c in calls if c]
 
 
 @dataclass
@@ -330,6 +450,16 @@ class LLMEngine:
         buf = ""           # holds back a partial `</think>` split across chunks
         finish, usage = None, {}
         close_tag = "</think>"
+        # Does for tool calls what the chat endpoint's parser would: takes them
+        # out of the text on the way past, so they can be run instead of read.
+        markup = ToolMarkupFilter()
+
+        def emit_text(part):
+            visible = markup.feed(part)
+            if visible:
+                text_parts.append(visible)
+                if on_text:
+                    on_text(visible)
 
         async with session.post(f"{self.base_url.removesuffix('/v1')}/completion",
                                 json=body) as r:
@@ -353,9 +483,7 @@ class LLMEngine:
                 if not chunk:
                     continue
                 if not in_reasoning:
-                    text_parts.append(chunk)
-                    if on_text:
-                        on_text(chunk)
+                    emit_text(chunk)
                     continue
                 buf += chunk
                 if close_tag in buf:
@@ -369,9 +497,7 @@ class LLMEngine:
                     in_reasoning, buf = False, ""
                     tail = tail.lstrip("\n")
                     if tail:
-                        text_parts.append(tail)
-                        if on_text:
-                            on_text(tail)
+                        emit_text(tail)
                 elif len(buf) > len(close_tag):
                     # Keep back only as much as a split tag could still occupy.
                     emit, buf = buf[:-len(close_tag)], buf[-len(close_tag):]
@@ -382,7 +508,16 @@ class LLMEngine:
             reason_parts.append(buf)
             if on_reasoning:
                 on_reasoning(buf)
-        return ChatResult("".join(text_parts), [], finish,
+        tail = markup.finish()
+        if tail:
+            text_parts.append(tail)
+            if on_text:
+                on_text(tail)
+        calls = markup.tool_calls()
+        if calls:
+            logger.info("recovered %d tool call(s) from /completion markup: %s",
+                        len(calls), ", ".join(c["name"] for c in calls))
+        return ChatResult("".join(text_parts), calls, finish,
                           reasoning="".join(reason_parts),
                           prompt_tokens=usage.get("prompt_tokens"),
                           completion_tokens=usage.get("completion_tokens"))
@@ -398,9 +533,11 @@ class LLMEngine:
         `</think>` ourselves, which both guarantees an answer (models often
         never close the block on their own) and makes max_tokens here buy answer
         tokens only, since the model is already past the tag.
-        tools belong to the closing round alone, and only here on the chat
-        transport: /completion streams plain text, so a tool call made there
-        could not be parsed back out. The caller decides; raw simply ignores it.
+        tools belong to the closing round alone, and are passed as such only on
+        the chat transport: /completion takes no tool schemas. It does still
+        make tool calls — the schemas reached it in the prompt the template
+        built — and it writes them as the template's own markup in the text,
+        which ToolMarkupFilter takes back out. So raw no longer drops them.
         """
         prefill = THINK_OPEN + pad + (THINK_CLOSE if closing else "")
         mode = await self.resume_transport()
@@ -431,29 +568,3 @@ class LLMEngine:
                 await self._session.close()
             except Exception as e:
                 logger.debug(f"Ignoring error while closing raw HTTP session: {e}")
-
-    async def load_behavior(self, path: str | Path) -> str:
-        """Load a behavior file (.md) and return its contents."""
-        p = Path(path) if isinstance(path, str) else path
-        if not p.exists():
-            logger.warning(f"Behavior file not found: {path}")
-            return ""
-        return p.read_text()
-
-
-# ─── Convenience helpers ───────────────────────────────────────────────
-
-def build_system_prompt(
-    bot_name: str = "letsClaw",
-    behavior: str = "",
-) -> str:
-    """Build a system prompt from config fragments."""
-    parts = [
-        f"You are {bot_name}, a lightweight technical agent engine.",
-        "",
-    ]
-    if behavior:
-        parts.append("=== BEHAVIOR ===")
-        parts.append(behavior)
-        parts.append("")
-    return "\n".join(parts)

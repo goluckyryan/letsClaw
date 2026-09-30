@@ -57,7 +57,7 @@ graph TD
         Sessions2[Sessions\ncore.py\nhistory + rollover]
         Engine[LLM Engine\nllm_engine.py]
         Config[Config\nconfig.yaml]
-        ModelFile["Behavior MD files\nbase (shared) + per-model\nper-channel (planned)"]
+        ModelFile["Behavior MD files\nbase (shared) + per-model\n+ per-session"]
     end
 
     subgraph Modules
@@ -211,7 +211,7 @@ indicator, not a countdown.
 
 ## Behavior Files
 
-The system prompt is assembled from three parts, in this order:
+The system prompt is assembled from four parts, in this order:
 
 1. **Base behavior** — `models/base.md` (config: `behavior.base_file`), shared by every
    session and every model: the identity, the working style, and the tool notes. It is
@@ -220,14 +220,33 @@ The system prompt is assembled from three parts, in this order:
    behavior as a missing per-model file.
 2. **Per-model behavior** — one MD file per model entry via `behavior_file`
    (e.g. `models/default.md`), layered on top of the base for tuning a specific LLM.
-3. **Continued session** — after a rollover, the model-written handoff and the path of
+3. **Per-session behavior** — `models/sessions/<session name>.md`
+   (config: `behavior.session_dir`; unset switches the layer off). A session with no
+   file of its own just gets the two layers above.
+4. **Continued session** — after a rollover, the model-written handoff and the path of
    the previous window's [journal](#the-journal), with the grep commands for searching
    it, carried in the system message.
 
+**The third layer is per Discord channel without the core knowing Discord exists.** It
+is keyed on the *session* name, and the bot already names each session after its channel
+(`auto_names` → `dudus-den-solaris`), so `models/sessions/dudus-den-solaris.md` is that
+channel's file. The same mechanism covers `terminal.md` and any WebUI session, which a
+channel-id-keyed design would have excluded. A directory rather than a config map,
+because sessions spring into existence on attach: dropping the file in is the whole
+operation, and `ls models/sessions/` says which sessions are tuned.
+
+The session name is turned into a filename by the same rule `state/` uses — everything
+outside `[A-Za-z0-9-_.]` becomes `_` — and the result must sit directly in `session_dir`
+or it is refused. Both guards matter: `?session=` is not validated on attach, so a
+session named `../../etc/passwd` can exist, and this is the one place a session name
+becomes a path that is *read*.
+
 The prompt is not frozen at startup: it is rebuilt when a session switches models, rolls
-over, or takes a config reload — which is also how a changed base or model file reaches a
-running session. Per-channel behavior — a Discord channel with its own MD file on top of
-the base — is not built: behavior is resolved per model today, not per session.
+over, is renamed, or takes a config reload — which is also how a changed file reaches a
+running session. Creating a file for an already-live session needs a `/reload` to be
+noticed, since the read is cached, exactly as editing `base.md` is. The carryover is
+always last: `/clear` drops it, `/rollover` writes a new one, and the three behavior
+layers sit above it.
 
 No framework-injected boilerplate: if it's not in the files above or the conversation,
 it's not sent.
@@ -332,8 +351,8 @@ without saying what was searched for — which is exactly the sentence RULED OUT
 needs to be able to write.
 
 `rollover_mode` picks the behaviour: `auto` rolls over and says so, `ask` prompts
-first, `off` only warns. **`/new` forces a rollover at any time**, in any mode — and
-unlike `/clear`, which discards the conversation, `/new` files it and carries the
+first, `off` only warns. **`/rollover` forces a rollover at any time**, in any mode — and
+unlike `/clear`, which discards the conversation, `/rollover` files it and carries the
 thread forward.
 
 There is a second, earlier trigger. A window that is nearly full still has room for
@@ -924,8 +943,9 @@ somewhere other than the `core.bind`/`core.port` in the config.
 
 | command | |
 |---|---|
-| `/clear` | discard the conversation and start over |
-| `/new` | archive the session, keep the objective, start fresh |
+| `/clear` | forget the conversation — the archives on disk are kept |
+| `/rollover` | archive it, write a handoff, carry that into a fresh window |
+| `/new` | **wipe everything** — the conversation *and* every transcript and journal this session has written. No undo |
 | `/model` , `/model <name>` | list the configured models, or switch this session to one |
 | `/models` | the model list on its own |
 | `/info` | session name and id, recent history, context usage, output total |
@@ -934,6 +954,15 @@ somewhere other than the `core.bind`/`core.port` in the config.
 | `/stop` | interrupt the turn in progress |
 | `/reload` | re-read `config.yaml` into the running core |
 | `/quit` , `/exit` | leave — the core keeps running, and so does the turn |
+
+**Three ways to end a window**, and the difference is how much of the past goes
+with it. `/clear` forgets the conversation and leaves every archive alone.
+`/rollover` archives it, has the model write a handoff, and starts the next
+window holding that summary — this is also what the context threshold triggers
+automatically. `/new` is the destructive one: it wipes the conversation *and*
+deletes every transcript and journal this session has written, matched on its
+session id so no other session's files can be caught. There is no undo, which
+is why it is `/new` and not `/clear` — the reflexive keystroke is the safe one.
 
 **Tab completes** commands, and model names after `/model `. The completion list prints
 each command with its description rather than a bare column of names. One gap to be aware
@@ -1030,27 +1059,50 @@ with empty text. Invite it with the `bot` scope and Send Messages + Read Message
 History. Then put your own user ID in `discord.users` (Discord → Settings →
 Advanced → Developer Mode, then right-click yourself → Copy User ID).
 
-**One channel is one conversation.** Sessions are keyed on Discord snowflakes,
-never on names, so renaming a channel keeps its conversation and two channels
-that share a name never collide:
+**One channel is one conversation**, named after itself:
 
 | where | session |
 |---|---|
-| guild channel | `discord-<channel_id>` |
-| thread | `discord-<thread_id>` — its own conversation, not the parent's |
-| DM | `discord-dm-<user_id>` |
+| guild channel | `<server>-<channel>` — `dudus-den-solaris` |
+| thread | the thread's own name, its own conversation, not the parent's |
+| DM | `discord-dm-<user_id>` — a DM has no channel name to use |
 
-`aliases` maps an id to a readable name for the WebUI sidebar; it changes the
-label, not the identity. `channels: {<id>: {model: …}}` picks the model for a
-channel, applied when that channel's session is first created — re-attaching
-never switches an existing session, since that would move the conversation out
-from under anyone else attached to it.
+The **snowflake is still the key**. The bot records which name it last gave each
+channel id in `state/discord_names.json`, and when Discord's name no longer
+matches it renames the *core session* rather than starting an empty one — so
+renaming `#esps` carries its conversation across. If that rename is refused
+(the session is mid-turn, or the new name is taken) it keeps using the old name
+and tries again next time, rather than splitting the conversation in two.
 
-**Talking to it.** In a guild the bot answers when @mentioned or replied to
-(`mention_only`, on by default — hygiene, so it stays quiet in a busy channel,
-not a security control). DMs never need a mention. Every slash command the
+The server prefix is not decoration: two servers each having a `#general` is the
+normal case, and without it their conversations would silently merge into one
+session. `auto_names: false` goes back to bare `discord-<channel_id>`.
+
+**Talking to it.** In a guild the bot answers when @mentioned or replied to —
+hygiene, so it stays quiet in a busy channel, not a security control. DMs never
+need a mention. `mention_only` takes four values:
+
+| | |
+|---|---|
+| `true` | always address it (the default) |
+| `false` | it answers everything |
+| `white` | address it **only** in the channels in `mention_list` |
+| `black` | address it **everywhere except** those channels |
+
+`mention_list` takes channel names, `#name`, `server/channel` when two servers
+share a channel name, or raw snowflakes — matched as slugs, so `#Ptolemy-Translation`
+and `ptolemy-translation` are the same entry. A bare name matches that channel in
+*every* server. Rather than ask you to remember which way round `white` and `black`
+go, the bot prints the resolved answer for every channel it can see at startup:
+
+```
+must @mention in: #general, #novel
+answers freely in: #solaris, #caen, #esps, #ptolemy-translation, #analysis_11c
+```
+
+An unreadable value warns and falls back to `true`, so a typo never opens the bot up. Every slash command the
 terminal has works as a plain message: `/info`, `/model [name]`, `/models`,
-`/new`, `/clear`, `/behavior`, `/stop`, `/reload`, plus a local `/help`.
+`/rollover`, `/new`, `/clear`, `/behavior`, `/stop`, `/reload`, plus a local `/help`.
 `/reasoning` is answered but does nothing — this client asks the core not to
 send the thinking at all (`reasoning=0`), so none of it crosses the wire.
 
@@ -1084,7 +1136,6 @@ reconnect-by-seq. None of the three needs a bot token or a network.
 
 - **Semantic search** — embed past messages/sessions and search them by meaning, not just keyword match
 - **Memory system** — read accumulated handoffs back in: rollover writes `state/memory_store/long_term.md`, but a new session is only seeded from its own predecessor, never from the whole history of the file
-- **Per-channel behavior files** — a Discord channel with its own behavior MD on top of the base, rather than only the per-model one. Needs a small core change: behavior is resolved per model today, not per session
 - **Discord draft streaming** — live-edited messages as the answer builds, instead of one post at `turn_end`
 
 ## Config
@@ -1096,6 +1147,6 @@ See `config.example.yaml` for full reference with comments.
 - `core` — The service itself: `bind` (loopback by default — see the security note above), `port` (the WebUI is on the same one), and `token`, an optional shared secret. `--bind` / `--port` / `--config` on `./serve.sh` override the first three.
 - `tools` — Agent tools: enable flag, allowlist, `max_iterations` (tool rounds per turn before a final answer is forced), `exec_timeout`, `max_output_chars`, and `workdir` — the base directory `exec` runs in and relative paths resolve against, defaulting to the letsClaw directory.
 - `conversation` — `max_history_messages`, a backstop that trims the oldest messages (never opening on an orphaned tool result) and only applies on turns where no rollover happened — rollover is the real mechanism, this just stops an unbounded session with rollover switched off. Then rollover policy: `rollover_at_percent` (0 disables), `rollover_mode` (`auto`/`ask`/`off`), `prompt_timeout` (seconds to wait for an answer in `ask` mode before keeping the session). Two directories: `live_dir` holds the running conversations and is reloaded at startup, `sessions_dir` holds archived transcripts and the journal segments beside them. Then the journal itself: `journal` (default true — the `.md` record of every round's reasoning and every untruncated tool result, which is what stops a rolled-over window repeating work; see [The journal](#the-journal)) and `journal_max_block_chars` (default 1,000,000, the cap on one recorded block). The context window itself is per model, under `models`.
-- `discord` — the Discord bot, and only ever read by it: `token` (the bot token), `core`/`core_token` (where the core is and its shared secret, both defaulting to the `core` section above), `users` — the **required** allowlist of snowflake IDs, empty meaning nobody — `mention_only`, `idle_detach_min`, `max_messages`/`max_lines` for how an answer is split, `aliases` for readable session names and `channels` for per-channel models. Omit the whole section if you do not want a bot. See [Discord Client](#discord-client) for the security note that goes with it.
+- `discord` — the Discord bot, and only ever read by it: `token` (the bot token), `core`/`core_token` (where the core is and its shared secret, both defaulting to the `core` section above), `users` — the **required** allowlist of snowflake IDs, empty meaning nobody — `mention_only` (`true`/`false`/`white`/`black`) with `mention_list`, `idle_detach_min`, `max_messages`/`max_lines` for how an answer is split, and `auto_names` (sessions named `<server>-<channel>`, renamed to follow Discord). Omit the whole section if you do not want a bot. See [Discord Client](#discord-client) for the security note that goes with it.
 - `memory` — `long_term_file`, where rollover handoffs accumulate
 - `logging` — `level` and `file`; the core logs there and to stderr, and every session event of consequence (restore, rename, delete, rollover, a dropped tool-call turn) is one line in it.

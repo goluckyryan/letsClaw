@@ -60,6 +60,7 @@ HANDOFF_WINDOW_SHARE = 20
 # server withholds usage: rolling over early costs a summary, late costs a 400.
 ESTIMATE_SCALE = 1.6
 
+SESSION_MARKER = "\n=== SESSION ===\n"
 CARRYOVER_MARKER = "\n\n=== CONTINUED SESSION ===\n"
 
 # Seconds held back from turn_timeout so the closing round still fits inside the
@@ -409,6 +410,9 @@ class Session:
         self.model_name = None
         self.base_behavior = ""
         self.behavior = ""
+        # models/sessions/<name>.md — per session, which for the Discord bot
+        # means per channel, since it names sessions after them.
+        self.session_behavior = ""
         self.history = []
         self.tools = []
         self.schemas = []
@@ -533,17 +537,38 @@ class Session:
         return int((count_messages(msgs) + self.tools_tok) * ESTIMATE_SCALE)
 
     def fresh_history(self, carryover=""):
-        """System message: base behavior, per-model behavior, then carryover.
+        """System message: the three behavior layers, then the carryover.
 
-        The base (identity + tool notes) comes from the shared base file and is
-        in the prompt even when the session has no per-model file.
+        base (every session) → model (per model entry) → session (per session,
+        so per channel for Discord) → carryover (the rollover handoff).
+
+        The base (identity + tool notes) is in the prompt even when a session
+        has neither of the other two. The carryover stays last, and that is
+        load-bearing: carryover() recovers it by partitioning on its marker and
+        taking everything after, so anything appended below it would be read
+        back as part of the handoff and re-appended on the next rebuild,
+        growing the prompt every turn.
         """
         content = self.base_behavior
         if self.behavior:
             content += "\n=== BEHAVIOR ===\n" + self.behavior
+        if self.session_behavior:
+            content += SESSION_MARKER + self.session_behavior
         if carryover:
             content += CARRYOVER_MARKER + carryover
         return [{"role": "system", "content": content}]
+
+    async def reload_session_behavior(self):
+        """Re-read models/sessions/<name>.md and rebuild the system message.
+
+        Called when the name changes, since that is what picks the file.
+        """
+        entry = (self.config.get("models", {}) or {}).get(self.model_name) or {}
+        _, _, self.session_behavior = await self.manager.behavior_for(
+            entry, self.name)
+        carried = self.carryover()
+        body = [m for m in self.history if m["role"] != "system"]
+        self.history = self.fresh_history(carried) + body
 
     def carryover(self):
         """The handoff a rollover parked in the system message, or "".
@@ -599,8 +624,10 @@ class Session:
 
         if blob["engine"] is not None:
             self.engine = blob["engine"]
-        if blob["behavior"] is not None and blob["behavior"] != (self.base_behavior, self.behavior):
-            self.base_behavior, self.behavior = blob["behavior"]
+        if blob["behavior"] is not None and blob["behavior"] != (
+                self.base_behavior, self.behavior, self.session_behavior):
+            (self.base_behavior, self.behavior,
+             self.session_behavior) = blob["behavior"]
         # The system message is rebuilt either way: the base file may have
         # changed under a live session, and it is the only place the tool
         # notes live now.
@@ -1226,6 +1253,17 @@ class Session:
                               f"pad ~{count_text(pad)} tok)"))
             result = await call_round(overrides={"max_tokens": lap_cap}, pad=pad)
             pad += result.reasoning or ""
+            if result.wants_tool and not truncated_tool_calls(result):
+                # The thinking decided the next step is an action. Same answer
+                # as the closing round's below: hand it back, and the tool loop
+                # runs it and carries the turn on. On the raw transport this is
+                # a call the engine recovered from the template's own markup —
+                # before, it could only be dropped, and the user was shown the
+                # XML instead.
+                self.emit(ev("notice", level="info",
+                             text="the thinking called a tool — running it and "
+                                  "continuing the turn"))
+                return result
             if result.text:
                 # The model closed the block itself and answered. Take that only
                 # if it actually finished: a resumed round runs under the small
@@ -1533,7 +1571,9 @@ class Session:
         State-changing ones take the turn lock, because a /clear landing between
         a tool-call turn and its results would corrupt the history for good.
         """
-        name = name.lstrip("/")
+        # Case-insensitive: /rollOver reads better than /rollover and a client
+        # should not have to care which one the user typed.
+        name = name.lstrip("/").lower()
         if name == "info":
             used = self.estimate()
             return {"ok": True, "info": {
@@ -1557,8 +1597,10 @@ class Session:
             }}
         if name == "behavior":
             return {"ok": True, "model": self.model_name,
+                    "session": self.name,
                     "base": self.base_behavior or "",
-                    "behavior": self.behavior or ""}
+                    "behavior": self.behavior or "",
+                    "session_behavior": self.session_behavior or ""}
         if name == "models":
             return {"ok": True, "current": self.model_name,
                     "configured": known_models(self.config)}
@@ -1586,13 +1628,31 @@ class Session:
                              record=str(record) if record else None))
                 await self.persist()
                 return {"ok": True}
-            if name == "new":
+            if name == "rollover":
                 trip = (int(self.budget * self.rollover_pct / 100)
                         if self.rollover_pct else 0)
                 await self.roll_over("on request", trip=trip)
                 self.declined_at, self.warned_over = None, False
                 await self.persist()
                 return {"ok": True}
+            if name == "new":
+                # The hard one: nothing about this session survives it. /clear
+                # forgets the conversation but leaves the archives; this takes
+                # them too, so there is nothing left to grep and nothing to
+                # carry forward. Irreversible, deliberately — a rollover is
+                # what you want when the past is worth keeping.
+                self.history = self.fresh_history()
+                self.declined_at, self.warned_over = None, False
+                self.rollover_count = 0
+                await self.close_journal()
+                files, freed = await store.purge_archives(self.session_id,
+                                                          self.config)
+                self.emit(ev("session_state", what="wiped", messages=0,
+                             files=files, bytes=freed))
+                await self.persist()
+                logger.info("session %s wiped: %d archive file(s), %d bytes",
+                            self.name, files, freed)
+                return {"ok": True, "files": files, "bytes": freed}
             if name == "model":
                 target = args.strip()
                 if not target:
@@ -1617,8 +1677,10 @@ class Session:
         engine, name, entry = await self.manager.engine_for(model_name)
         self.engine = engine
         self.model_name = name
-        # The base is shared by every session; the model file is per model.
-        self.base_behavior, self.behavior = await self.manager.behavior_for(entry)
+        # The base is shared by every session, the model file is per model,
+        # and the session file is named for this session.
+        (self.base_behavior, self.behavior,
+         self.session_behavior) = await self.manager.behavior_for(entry, self.name)
         # carryover() must be read before history[0] is replaced, and passed back
         # in: switching models after a rollover used to drop the handoff on the floor.
         carried = self.carryover()
@@ -1716,9 +1778,43 @@ class SessionManager:
         """Cached read off the event loop; a missing file is a warning and ""."""
         return await asyncio.to_thread(self._behavior_sync, path)
 
-    async def behavior_for(self, entry):
-        """(base, model) behavior for a session: the shared base file, then
-        the model's own file. Both cached; a missing file is "" (warned)."""
+    def session_behavior_path(self, session_name):
+        """models/sessions/<session>.md for this session, or None.
+
+        None when the layer is switched off (no behavior.session_dir), or when
+        the name will not make a safe filename.
+
+        Session names are not validated on attach — server.py takes ?session=
+        from the query and mgr.get() creates whatever it is handed — so a
+        session called `../../etc/passwd` can exist. This is the one place a
+        session name becomes a path that is *read*, so it is guarded twice: the
+        name is slugged to the same character set session._safe() allows, and
+        the result is then required to sit directly in session_dir. Either
+        alone would do; both is cheap, and the failure mode is an arbitrary
+        file landing in a system prompt.
+        """
+        configured = (self.config.get("behavior", {}) or {}).get("session_dir")
+        if not configured:
+            return None
+        slug = "".join(c if c.isalnum() or c in "-_." else "_"
+                       for c in str(session_name))[:64]
+        if not slug or set(slug) <= {".", "_"}:
+            return None
+        root = paths.resolve(configured)
+        candidate = (root / f"{slug}.md").resolve()
+        if candidate.parent != root.resolve():
+            logger.warning("session %r does not make a safe behavior filename "
+                           "— skipping its layer", session_name)
+            return None
+        return candidate
+
+    async def behavior_for(self, entry, session_name=None):
+        """(base, model, session) behavior — the three layers of the prompt.
+
+        The shared base file, then the model's own, then one named for the
+        session. All cached; a missing file is "" (warned), which is what makes
+        the third layer optional per session rather than per install.
+        """
         base = await self._behavior_text(
             self.config.get("behavior", {}).get("base_file") or DEFAULT_BASE_FILE)
         # Per model, because it is a property of how the model reads a prompt,
@@ -1727,7 +1823,20 @@ class SessionManager:
         if entry.get("strip_directives"):
             base = strip_directive_sections(base)
         model = await self._behavior_text(entry.get("behavior_file", "models/default.md"))
-        return base, model
+
+        session = ""
+        path = self.session_behavior_path(session_name) if session_name else None
+        if path is not None:
+            # Quietly absent, unlike the other two: most sessions have no file
+            # and are not meant to, so a warning per attach would be noise.
+            session = await asyncio.to_thread(self._session_behavior_sync, path)
+        return base, model, session
+
+    def _session_behavior_sync(self, path):
+        key = str(path)
+        if key not in self._behaviors:
+            self._behaviors[key] = path.read_text() if path.exists() else ""
+        return self._behaviors[key]
 
     async def get(self, name, model=None):
         if name not in self.sessions:
@@ -1831,7 +1940,8 @@ class SessionManager:
                 # has, which still works. Moving a live conversation onto a
                 # different model behind the user's back would be worse.
                 "engine": entry[0] if entry else None,
-                "behavior": (await self.behavior_for(entry[2])) if entry else None,
+                "behavior": (await self.behavior_for(entry[2], sess.name))
+                            if entry else None,
                 "lost_model": entry is None,
             }
             if sess.lock.locked():
@@ -1953,6 +2063,15 @@ class SessionManager:
         # Write the new file before unlinking the old one. Interrupted between
         # the two, the session comes back under both names — recoverable, unlike
         # coming back under neither.
+        # The prompt depends on the name now: models/sessions/<name>.md is the
+        # third layer, so a renamed session must pick up the file for what it
+        # is called *now* or it keeps the old channel's instructions. Carryover
+        # first, as every rebuild must.
+        try:
+            await s.reload_session_behavior()
+        except Exception:
+            logger.exception("session %s: could not re-resolve its behavior "
+                             "file after the rename", new)
         await s.persist()
         await store.delete_live(old, self.config)
         logger.info("session %s renamed to %s", old, new)

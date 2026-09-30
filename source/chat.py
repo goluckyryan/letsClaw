@@ -40,11 +40,12 @@ PROMPT = "👤 "
 COMMANDS = {
     "/quit": "leave letsClaw (the core keeps running)",
     "/exit": "leave letsClaw (the core keeps running)",
-    "/clear": "discard the conversation and start over",
-    "/new": "archive the session, keep the objective, start fresh",
+    "/clear": "forget the conversation, keep the archives",
+    "/rollover": "archive it, carry a handoff forward, start a fresh window",
+    "/new": "wipe everything — conversation and this session's archives",
     "/model": "list models, or /model <name> to switch",
     "/info": "recent history and context usage",
-    "/behavior": "print the loaded behavior files (base + model)",
+    "/behavior": "print the loaded behavior files (base + model + session)",
     "/reasoning": "toggle live display of the model's thinking",
     "/stop": "interrupt the turn in progress",
     "/reload": "re-read config.yaml into the running core",
@@ -216,9 +217,14 @@ class Renderer:
             self.line(f"   ✨ New session  {e['used']}/{e['budget']} tok")
         elif t == "session_state":
             if e["what"] == "cleared":
-                self.line("\n🧹 History cleared (discarded — /new archives it instead).")
+                self.line("\n🧹 History cleared (/rollover archives it instead).")
                 if e.get("record"):
                     self.line(f"   📓 what was said is still in {e['record']}")
+            elif e["what"] == "wiped":
+                self.line("\n🔥 Everything wiped — conversation and archives.")
+                if e.get("files"):
+                    self.line(f"   🗑️  {e['files']} archive file(s), "
+                              f"{e['bytes']:,} bytes deleted")
             elif e["what"] == "model":
                 self.line(f"\n🤖 Switched to {e['model']} — context budget {e['budget']} tok.")
             elif e["what"] == "reloaded":
@@ -295,7 +301,7 @@ class Renderer:
         n = ro.get("count") or 0
         count = f" · {n} rollover{'s' if n != 1 else ''}"
         self.line(f"  🔄 Rollover: {ro['mode']} at {ro['percent']}% ({ro['trip']} tok){count}"
-                  if ro["percent"] else f"  🔄 Rollover: disabled (/new still works){count}")
+                  if ro["percent"] else f"  🔄 Rollover: disabled (/rollover still works){count}")
 
     def show_reload(self, r):
         changed = r.get("changed") or []
@@ -366,7 +372,12 @@ async def run_client(url, session_name, render):
                         if e.get("behavior"):
                             model = f" ({e['model']})" if e.get("model") else ""
                             render.line(f"\n📄 Model behavior{model}:\n{e['behavior']}")
-                        if not e.get("base") and not e.get("behavior"):
+                        if e.get("session_behavior"):
+                            sess = f" ({e['session']})" if e.get("session") else ""
+                            render.line(f"\n📄 Session behavior{sess}:\n"
+                                        f"{e['session_behavior']}")
+                        if not any(e.get(k) for k in
+                                   ("base", "behavior", "session_behavior")):
                             render.line("\nNo behavior file loaded.")
                     elif "configured" in e:
                         render.line(f"\n🤖 Current: {e.get('current')}")
@@ -454,7 +465,8 @@ def main():
 
     print("\nletsClaw Terminal Chat")
     print(f"Connected to the core at {url}, session '{args.session}'.")
-    print("Commands: /quit, /clear, /new, /model [name], /info, /behavior, /reasoning, /stop")
+    print("Commands: /quit, /clear, /rollover, /new, /model [name], /info, "
+          "/behavior, /reasoning, /stop")
     print("(Tab completes commands and model names)")
 
     code = 0

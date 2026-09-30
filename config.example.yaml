@@ -7,6 +7,21 @@
 # startup and an empty file — the core keeps running.
 behavior:
   base_file: "models/base.md"
+  # The third layer: models/sessions/<session name>.md, injected after the
+  # model's file and before any rollover handoff. Optional — unset and the
+  # layer is off; a session with no file of its own just gets the other two.
+  #
+  # Keyed on the SESSION name, which is what makes it per-channel for Discord
+  # without the core knowing Discord exists: the bot names sessions after
+  # channels (auto_names -> dudus-den-solaris), so models/sessions/
+  # dudus-den-solaris.md is that channel's file. It works the same for the
+  # terminal (terminal.md) and any WebUI session.
+  #
+  # Drop a file in and it applies on the next rebuild of the prompt — which is
+  # any of /clear, /rollover, /new, /model or /reload. Creating a file for an
+  # already-live session needs a /reload to be noticed, the same as editing
+  # base.md does.
+  session_dir: "models/sessions"
 
 # Model registry — every entry is self-contained: it names its own server, so
 # reading one entry tells you everything about that model.
@@ -127,11 +142,20 @@ core:
 #   # Developer Mode, then right-click a user → Copy User ID). Empty = nobody.
 #   users:
 #     - 123456789012345678
-#   # Guild channels: only answer when @mentioned or replied to. Hygiene, not
-#   # security — it keeps the bot quiet in a busy channel. DMs always answer.
-#   # With this false, a bare "yes" in the channel can also answer a pending
-#   # rollover question, which is reason enough to leave it on.
-#   mention_only: true
+#   # Must the bot be addressed (@mention, or a reply to it) before it answers
+#   # in a guild channel? Hygiene, not security — it keeps the bot quiet in a
+#   # busy channel. DMs always answer whatever this says.
+#   #   true  — always          false — never
+#   #   white — only in the channels listed in mention_list
+#   #   black — everywhere EXCEPT the channels listed in mention_list
+#   # With the rule off for a channel, a bare "yes" there can also answer a
+#   # pending rollover question — reason enough to leave the busy ones on.
+#   # An unreadable value falls back to true rather than opening the bot up.
+#   mention_only: white
+#   # Channel names, "#name", "server/channel" when two servers share a name,
+#   # or raw snowflakes. Ignored when mention_only is true or false. The bot
+#   # prints which channels ended up needing a mention when it starts.
+#   mention_list: [general, novel]
 #   # Close an idle channel's socket after this long. The conversation is NOT
 #   # lost — the core keeps the session, and the next message re-attaches to it.
 #   idle_detach_min: 60
@@ -139,16 +163,17 @@ core:
 #   # an answer.md attachment instead of flooding the channel.
 #   max_messages: 8
 #   max_lines: 17         # soft cap per message; Discord collapses tall ones
-#   # Pretty session names for the WebUI sidebar. Without one a channel is
-#   # `discord-<channel_id>`, a thread `discord-<thread_id>`, a DM
-#   # `discord-dm-<user_id>`. The id is the identity either way, so renaming a
-#   # channel in Discord never loses its conversation.
-#   aliases:
-#     "987654321098765432": "daq-notes"
-#   # Per-channel model, applied when that channel's session is first created.
-#   # Re-attaching never switches an existing session — use /model for that.
-#   channels:
-#     "987654321098765432": {model: "qwen38"}
+#   # Name sessions after the server and channel — "dudus-den-solaris" — rather
+#   # than the raw snowflake, so the WebUI sidebar reads like Discord does.
+#   # The snowflake is still the key: the bot records the name it gave each
+#   # channel id in state/discord_names.json, and when Discord's name changes it
+#   # RENAMES the core session instead of starting an empty one, so a renamed
+#   # channel keeps its conversation. The server prefix is not decoration — two
+#   # servers each with a #general is the normal case, and without it their two
+#   # conversations would silently merge into one session.
+#   # false = bare `discord-<channel_id>`, `discord-<thread_id>`,
+#   # `discord-dm-<user_id>`. DMs are always keyed on the user either way.
+#   auto_names: true
 
 # Agent tools
 tools:

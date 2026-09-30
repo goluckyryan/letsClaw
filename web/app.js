@@ -18,11 +18,12 @@
 const $ = (s) => document.querySelector(s);
 
 const COMMANDS = {
-  '/clear':     'discard the conversation and start over',
-  '/new':       'archive the session, keep the objective, start fresh',
+  '/clear':     'forget the conversation, keep the archives',
+  '/rollover':  'archive it, carry a handoff forward, start a fresh window',
+  '/new':       "wipe everything — conversation and this session's archives",
   '/model':     'list models, or /model <name> to switch',
   '/info':      'recent history and context usage',
-  '/behavior':  'print the loaded behavior files (base + model)',
+  '/behavior':  'print the loaded behavior files (base + model + session)',
   '/reasoning': "toggle live display of the model's thinking",
   '/stop':      'interrupt the turn in progress',
   '/reload':    're-read config.yaml into the running core',
@@ -465,7 +466,7 @@ function rpc(name, args, silent) {
   const request_id = `w${++S.rpcId}`;
   return new Promise((resolve, reject) => {
     if (!send({ t: 'command', name, args: args || '', request_id })) return reject(new Error('offline'));
-    // /new summarises with the model before replying, so this waits minutes, not seconds.
+    // /rollover summarises with the model before replying, so this waits minutes, not seconds.
     const timer = setTimeout(() => { S.rpcs.delete(request_id); reject(new Error('timed out')); }, 300000);
     S.rpcs.set(request_id, { resolve, timer, silent });
   });
@@ -632,8 +633,13 @@ function handle(e) {
     if (e.what === 'cleared') {
       clearWaiting();
       log.innerHTML = '';
-      notice('🧹 History cleared (discarded — /new archives it instead).');
+      notice('🧹 History cleared (/rollover archives it instead).');
       if (e.record) notice(`📓 what was said is still in ${e.record}`);
+      setGauge(0, S.budget, false);
+    } else if (e.what === 'wiped') {
+      clearWaiting();
+      log.innerHTML = '';
+      notice(`🔥 Everything wiped — conversation and ${e.files || 0} archive file(s).`);
       setGauge(0, S.budget, false);
     } else if (e.what === 'model') {
       S.model = e.model;
@@ -821,6 +827,10 @@ function response(e) {
     let md = '';
     if (e.base) md += '**base**\n```markdown\n' + e.base + '\n```\n';
     if (e.behavior) md += '**model**\n```markdown\n' + e.behavior + '\n```\n';
+    if (e.session_behavior) {
+      md += `**session** (${e.session || 'this session'})\n\`\`\`markdown\n`
+          + e.session_behavior + '\n```\n';
+    }
     return msg('llm', '📄', renderMd(md || '_No behavior file loaded._'));
   }
   if (e.configured) {
@@ -862,7 +872,7 @@ function showInfo(i) {
       : '') +
     (i.rollover.percent
       ? `🔄 rollover ${esc(i.rollover.mode)} at ${i.rollover.percent}% (${i.rollover.trip} tok)${rolloverCount(i.rollover)}<br>`
-      : `🔄 rollover disabled (/new still works)${rolloverCount(i.rollover)}<br>`) +
+      : `🔄 rollover disabled (/rollover still works)${rolloverCount(i.rollover)}<br>`) +
     `<br>📜 recent:<br>${rows}`);
   setGauge(i.used, i.budget, false);
 }
@@ -971,7 +981,7 @@ function submit() {
     if (word === '/stop')      { send({ t: 'stop' }); return; }
     if (!(word in COMMANDS))   return notice(`unknown command ${word} — /help lists them`, 'warn');
 
-    if (word === '/new') setWaiting('archiving and summarising');
+    if (word === '/rollover') setWaiting('archiving and summarising');
     rpc(word.slice(1), args).catch((err) => {
       clearWaiting();
       notice(`${word}: ${err.message}`, 'warn');
@@ -1002,11 +1012,17 @@ $('#btn-info').onclick = () => rpc('info').catch(() => {});
 $('#btn-behavior').onclick = () => rpc('behavior').catch(() => {});
 
 $('#btn-clear').onclick = () => {
-  if (confirm('Discard this conversation? /new archives it instead.')) rpc('clear').catch(() => {});
+  if (confirm('Forget this conversation? The archives are kept — /rollover carries a summary forward instead.')) rpc('clear').catch(() => {});
 };
-$('#btn-new').onclick = () => {
+$('#btn-rollover').onclick = () => {
   setWaiting('archiving and summarising');
-  rpc('new').catch((err) => { clearWaiting(); notice(`/new: ${err.message}`, 'warn'); });
+  rpc('rollover').catch((err) => { clearWaiting(); notice(`/rollover: ${err.message}`, 'warn'); });
+};
+// The destructive one: it deletes this session's transcripts and journals from
+// disk, so it asks, and it says what it is about to take.
+$('#btn-new').onclick = () => {
+  if (!confirm('Wipe everything?\n\nThis deletes the conversation AND every archived transcript and journal this session has written. It cannot be undone.')) return;
+  rpc('new').catch((err) => notice(`/new: ${err.message}`, 'warn'));
 };
 $('#btn-reload').onclick = () => {
   // Errors come back as ok:false, which response() already renders — a rejected

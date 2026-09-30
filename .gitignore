@@ -16,6 +16,12 @@ logs/
 # Local test suite — kept out of the tree deliberately
 tests/
 
+# Per-session behavior files: named after whatever sessions this machine
+# happens to have, and their contents go straight into a system prompt. The
+# README explaining the directory is the one thing here worth committing.
+models/sessions/*.md
+!models/sessions/README.md
+
 # Editor / OS
 .vscode/
 .idea/

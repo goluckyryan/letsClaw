@@ -273,6 +273,45 @@ def sessions_dir(config=None):
                     DEFAULT_SESSIONS_DIR)
 
 
+async def purge_archives(session_id, config=None):
+    """Delete one session's archived transcripts and journals. (files, bytes).
+
+    Every archive this session ever wrote is named `<session_id>_…`, so the id
+    is what scopes the deletion: another session's files cannot match, and
+    archives written before session ids existed have no id prefix and are left
+    alone. There is no undo, which is why only /new calls this and /clear
+    does not.
+
+    A session with no id deletes nothing rather than falling back to the
+    `00000000` prefix that save_transcript uses for the same case — that prefix
+    is shared by every id-less writer, so matching on it could take out
+    somebody else's archive.
+    """
+    sid = _safe(str(session_id)) if session_id else ""
+    if not sid or set(sid) == {"0"}:
+        return 0, 0
+
+    def _purge():
+        directory = sessions_dir(config)
+        if not directory.exists():
+            return 0, 0
+        files = bytes_freed = 0
+        for path in directory.glob(f"{sid}_*"):
+            if not path.is_file():
+                continue
+            try:
+                size = path.stat().st_size
+                path.unlink()
+            except OSError as e:
+                logger.warning("could not delete %s: %s", path, e)
+                continue
+            files += 1
+            bytes_freed += size
+        return files, bytes_freed
+
+    return await asyncio.to_thread(_purge)
+
+
 async def append_index(record, config=None):
     """Append one record to the session index. Returns its path.
 
