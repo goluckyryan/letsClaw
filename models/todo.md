@@ -1,145 +1,89 @@
 # TODO
 
-## Third behavior layer — done (2026-09-30)
-
-Built as designed. The system prompt is four parts now:
-
-```
-<base>                 models/base.md                  every session
-=== BEHAVIOR ===
-<model>                models/<model>.md               per model entry
-=== SESSION ===
-<session>              models/sessions/<name>.md       per session  ← new
-=== CONTINUED SESSION ===
-<carryover>            the rollover handoff
-```
-
-Keyed on the session name, so it is per Discord channel without the core
-knowing Discord exists — the bot already names sessions `<server>-<channel>`.
-`behavior.session_dir` switches it on; unset and the layer is off. A session
-with no file gets the two-layer prompt it got before.
-
-Everything on the migration checklist was done, plus `Session.
-reload_session_behavior()` for the rename path. The dead `load_behavior()` /
-`build_system_prompt()` pair in `llm_engine.py` was deleted first, as the
-design said to.
-
-`tests/test_session_behavior.py` — 10 cases: layer order, the missing-file
-fallback, the layer being off, the carryover surviving, the prompt *not*
-growing across repeated rebuilds, path traversal refused, odd names slugged,
-a Discord channel name resolving, and rename re-resolving both ways. Verified
-live against a real core as well: a renamed session picked up the new
-channel's file with its handoff and conversation intact.
-
-Not done, and deliberately: per-*user* behavior inside a shared channel. One
-channel is one session and one conversation, so there is nowhere to hang it.
-
-## Dead code to delete
-
-`llm_engine.py:572 load_behavior()` and `llm_engine.py:583
-build_system_prompt()` are defined and **never called** — nothing in `source/`,
-`tests/` or `web/` references either. `build_system_prompt` is a second,
-divergent prompt assembler: it hardcodes *"You are letsClaw, a lightweight
-technical agent engine"* and emits `=== BEHAVIOR ===` with no base layer and no
-carryover. The real assembly is `Session.fresh_history()` (`core.py:535`).
-
-Delete both before adding the third layer, or the next reader will extend the
-wrong one.
+Open work only. Completed designs move to [`docs/decisions/`](../docs/decisions/)
+as dated records; the codebase itself is documented in [`docs/`](../docs/).
 
 ---
 
-## Discord client — done (2026-09-25)
+## Bugs
 
-Built as specified: a thin client like the WebUI and terminal, its own process,
-attaching to the core over the existing WS protocol. See **Discord Client** in
-the README for how to run it.
+* **`config.yaml` has `max_messages: 888888`.** The default is 8, and the
+  comment next to it says *"longer answers go up as answer.md instead of
+  flooding the channel"* — which is the **inverse** of what the value does.
+  `discord_client.py:606` uses the `answer.md` fallback only when
+  `len(chunks) > max_messages`, so at 888888 it can never fire and a long
+  answer goes out as forty messages. Almost certainly a debugging leftover.
+  (`config.yaml` is gitignored, so this is a local fix, not a commit.)
 
-### What shipped
+## Documentation gaps
 
-| file | |
-|---|---|
-| `source/discord_client.py` | the client — settings, link, bridge, gate, bot |
-| `source/chunker.py` | the fence-aware chunker, split out so it tests without discord.py |
-| `run_discord.sh` | launcher, 4 lines like the others |
-| `tests/test_chunk.py` | 15 cases — the ported `chunk.test.ts` set plus CJK and the real 2000 boundary |
-| `tests/test_discord.py` | 27 cases — gate, routing, rendering, all on fakes |
-| `tests/test_discord_live.py` | 6 cases — a real core on a temp config, protocol end to end |
-| `requirements.txt`, `config.example.yaml`, `README.md` | the section and the security note |
-| `source/server.py` | the two passthroughs below |
+* **`strip_directives` is undocumented in the README.** It is described in
+  `config.example.yaml` and in
+  [docs/design-principles.md](../docs/design-principles.md#2-behavior-is-markdown-and-some-of-that-markdown-is-machinery),
+  but appears zero times in `README.md`. It is the setting that makes hosted
+  assistants answer at all, so an operator needs to find it.
 
-### The two open decisions, resolved
+## Testing
 
-**`?model=` in `server.py`: included**, along with a second one-liner for
-`origin` — both were needed to make features the spec already described
-actually work, and `mgr.get()` already took a model. `?model=` applies only
-when the attach is what creates the session; re-attaching never switches a live
-one. `origin` is clamped to 64 chars and falls back to the session name.
-`tests/test_discord_live.py` covers both against a real core.
+* **The Discord live test is still not automated.** A real bot from the dev
+  portal, Message Content Intent on, driving a real channel. Everything below
+  the gateway is proven by `test_discord.py` (fakes) and
+  `test_discord_live.py` (a real core, no Discord); the gateway itself is
+  exercised only by hand. This is the one gap that cannot be closed with
+  fakes. See
+  [the Discord record](../docs/decisions/2026-09-25-discord-client.md#the-live-test-still-not-automated).
 
-**`dm_allowlist`: replaced by a hard-required `users` allowlist.** Not
-DM-scoped and not warn-and-open: a bot is a remote shell, so `discord.users`
-gates every surface, and an empty list — the default — refuses everybody,
-including in guild channels. A stranger who addresses the bot gets one refusal
-per ten minutes carrying their own user ID, so the owner can add them; a
-stranger who was not addressing the bot gets silence.
+* **Nothing checks that the three clients agree.** Each of `/info`,
+  `/behavior`, `/models`, `/reload`, `rollover_ask`, `session_state` and
+  `stats` has two or three independent renderers, and the three command tables
+  have already drifted. Adding a field means editing up to three places with
+  nothing to catch a miss. See
+  [clients.md](../docs/clients.md#what-is-shared-and-what-is-not) — whether to
+  fix it is a genuine trade, not an obvious win.
 
-### Deviations from the original plan, and why
+## Known rough edges
 
-* **The chunker is its own module** (`chunker.py`), not part of the ~450-line
-  single file. Its test suite was item 1 of the plan, and a pure string module
-  tests without discord.py, a token or a loop.
-* **Long answers become a file.** Past `max_messages` (default 8) the opening
-  chunks go out and the whole answer follows as `answer.md`. The plan did not
-  say what to do with a forty-chunk answer, and forty messages is not it.
-* **`reasoning=0` on the socket.** The thinking is never drawn here, so it is
-  never shipped — the plan did not mention the flag, but the core already had it.
-* **No `chunkMode: "newline"`.** That half of openclaw's chunker serves draft
-  streaming, which is a v1 non-goal; its one test case went with it.
+Carried from the code read; each is currently *accepted*, not scheduled.
 
-### Shipped since, beyond the original plan
+* **`extract_directive` returns the conclude fallback for an empty checkpoint
+  paragraph** (`core.py:397`) — a latent copy-paste, harmless today because
+  the section is non-empty.
+* **A session pinned to a model dropped from the config keeps a live engine
+  that is no longer in `_engines`**, so `SessionManager.close()` will not close
+  it at shutdown.
+* **Archive filenames are not disambiguated** — two rollovers of one session
+  inside the same second overwrite. The journal's name *is* disambiguated.
+* **The terminal client has no reconnect, no `last_seq` and no auth handling.**
+  Fine for a local REPL; the first thing to fix if it becomes more.
+* **`PROTOCOL_VERSION` is hard-coded in `web/app.js:37`** while the Python
+  clients import it. A bump means editing two places.
 
-* **Discord-native slash commands** — `_register_commands()`
-  (`discord_client.py:1261`) builds an `app_commands.CommandTree`: `/info`,
-  `/models`, `/rollover`, `/clear`, `/new`, `/behavior`, `/stop`, `/reload`,
-  plus `/model` with autocomplete and a dropdown picker, and `/ask`. Published
-  per guild at startup. Covered by `test_the_slash_tree_is_registered`
-  (`tests/test_discord.py:846`). *(This was listed as "still not built" until
-  2026-09-29 — it had shipped and the list was stale.)*
-* **Auto-naming and rename-following** — `<server>-<channel>` slugs, with the
-  channel id → name record in `state/discord_names.json` and `migrate_names()`
-  bringing existing sessions across at startup.
-* **`mention_only: white`/`black`** with `mention_list`, resolved and printed
-  per channel at startup.
-* **`/new` is now the destructive one.** `/rollover` archives and carries a
-  handoff; `/new` wipes the conversation *and* every archive this session id
-  ever wrote (`session.purge_archives()`). The reflexive keystroke is the safe
-  one.
-* **Tool-call recovery on the raw transport** — llama.cpp's `/completion` has no
-  tool-call parser, so `llm_engine.py` parses the template's own markup itself.
-  Confined to that transport on purpose: on the chat endpoint the same markup
-  arriving as text is the model *writing about* a tool call, and running it
-  would be a real hazard.
+## Wanted, not built
 
-### Still not built
+The README's [Future Features](../README.md#future-features), restated here so
+they are in one place.
 
-Draft streaming (live-edited messages as the answer builds), multi-account, and
-per-channel behavior files — the last one is the design at the top of this file.
+* **Semantic search** — embed past messages and sessions and search them by
+  meaning rather than keyword.
+* **Memory read-back** — rollover writes `state/memory_store/long_term.md`,
+  but a new window is seeded only from its own predecessor, never from the
+  whole file.
+* **Discord draft streaming** — live-edited messages as the answer builds,
+  instead of one post at `turn_end`.
 
-### Not yet done
+Both of the first two put tokens in a prompt that the user did not write, so
+whatever shape they take has to stay compatible with
+[principle 3](../docs/design-principles.md#3-no-hidden-token-injection) —
+visible and accounted for, not silent.
 
-**The live test.** Items 1 and 2 of the plan's testing section are written and
-green, and `test_discord_live.py` covers the core protocol without Discord.
-Item 3 — a real bot from the dev portal, Message Content Intent on, driving a
-real channel — has not been run as an automated test, though the bot is running
-against a real server (`Dudu#1416`, two guilds) and the slash tree publishes.
+## Rejected, deliberately
 
----
+Not oversights — listed so they are not re-proposed as new ideas.
 
-## Housekeeping
-
-* **`config.yaml` has `max_messages: 888888`.** The default is 8. At this value
-  the `answer.md` fallback can never trigger, so a long answer goes out as forty
-  messages instead of a file. Probably a debugging leftover.
-* **Nine files are modified and uncommitted** (+968/−127 against `6b1ea97`),
-  most of it the Discord client. Worth a commit before the next change lands on
-  top of it.
+* **Multi-account Discord.**
+* **Per-*user* behavior inside a shared channel.** One channel is one session
+  and one conversation, so there is nowhere to hang it. `origin` records who
+  typed but does not fork the conversation; making it do so would mean one
+  channel holding N conversations — a different feature.
+* **`chunkMode: "newline"`** — the half of openclaw's chunker that serves
+  draft streaming. Revisit only if draft streaming is built.
