@@ -813,12 +813,13 @@ class ChannelBridge:
 def _format_info(info):
     used, budget = info.get("used") or 0, info.get("budget") or 0
     pct = (used * 100) // budget if budget else 0
+    approx = "~" if info.get("estimated", True) else ""
     roll = info.get("rollover") or {}
     lines = [
         f"🤖 **{info.get('model')}** @ {info.get('base_url')}",
         f"🆔 session `{info.get('session')}` (id `{info.get('session_id')}`)",
         f"💬 {info.get('messages')} messages",
-        f"⚡ context ~{used}/{budget} tok ({pct}%) · "
+        f"⚡ context {approx}{used}/{budget} tok ({pct}%) · "
         f"{info.get('tools_tokens')} tok of tool schemas",
     ]
     if info.get("output_total") is not None:

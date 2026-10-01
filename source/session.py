@@ -581,6 +581,14 @@ def render_transcript(history):
     """
     lines = []
     for msg in history:
+        if msg.get("role") == "system":
+            # The behavior layers are re-read from disk into the fresh window,
+            # so summarising them here would put the same instructions in the
+            # prompt twice: once verbatim, once as a paraphrase that is
+            # re-summarised — and degraded again — at every later rollover.
+            # The carryover lives in this message too and must survive; it is
+            # passed to build_handoff separately, as `prior`.
+            continue
         content = (msg.get("content") or "").strip()
         calls = msg.get("tool_calls") or []
         if calls:
@@ -649,15 +657,24 @@ def format_carryover(handoff, transcript_path, journal_path=None):
     return "\n\n".join(parts)
 
 
-async def build_handoff(engine, history, max_tokens=1500):
+async def build_handoff(engine, history, max_tokens=1500, prior=""):
     """Ask the model to compress the conversation. Returns "" if it produced nothing.
 
     Runs on its own message list: the real history is never touched, and the
     request never becomes part of the conversation.
+
+    `prior` is the previous rollover's handoff, which render_transcript cannot
+    reach: it lives inside the system message, which is skipped. It has to be
+    here or the chain breaks at the second rollover — the new handoff would
+    summarise only the window just ended and silently drop everything the
+    session established before it.
     """
     body = render_transcript(history)
     if not body.strip():
         return ""
+    if prior.strip():
+        body = (f"Handoff carried in from earlier in this session:\n\n{prior.strip()}"
+                f"\n\n--- the window being summarised starts here ---\n\n{body}")
     messages = [
         {"role": "system", "content": _SUMMARISER_SYSTEM},
         {"role": "user", "content": (

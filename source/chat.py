@@ -292,8 +292,13 @@ class Renderer:
             emoji = {"system": "🤖", "user": "👤", "tool": "🔧"}.get(m["role"], "🐱")
             self.line(f"  {emoji} {m['role']}: {m['content']} ({m['tokens']} tok)")
         pct = (i["used"] * 100) // i["budget"] if i["budget"] else 0
-        self.line(f"  ⚡ Context: ~{i['used']}/{i['budget']} tok ({pct}%)   "
-                  f"(~ conservative estimate; {i['tools_tokens']} tok of tool schemas)")
+        # Same ~ convention as the per-turn stats line above: it marks the
+        # estimator's padded guess, and is absent once the server has reported
+        # a real prompt_tokens for this window.
+        approx = "~" if i.get("estimated", True) else ""
+        how = "~ conservative estimate" if approx else "counted by the server"
+        self.line(f"  ⚡ Context: {approx}{i['used']}/{i['budget']} tok ({pct}%)   "
+                  f"({how}; {i['tools_tokens']} tok of tool schemas)")
         if i.get("output_total") is not None:
             self.line(f"  📤 Output: {i['output_total']} tok generated in this session"
                       f"  (an odometer — /clear does not rewind it)")

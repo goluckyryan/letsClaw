@@ -31,7 +31,12 @@ behavior:
 #   base_url     : required — the OpenAI-compatible endpoint serving this model
 #   api_key      : omit or "" when the server needs no key
 #   context_length: total window the server was launched with — the budget the
-#                   ⚡ stats line reports against (max_tokens caps output only)
+#                   ⚡ stats line reports against (max_tokens caps output only).
+#                   Worth getting right rather than guessing low: it also sets
+#                   the pre-turn thinking-headroom check, so a value under the
+#                   server's real window rolls sessions over early. llama.cpp
+#                   reports the per-slot figure at GET /props as
+#                   default_generation_settings.n_ctx.
 models:
   default_model: "qwen36"
   qwen36:

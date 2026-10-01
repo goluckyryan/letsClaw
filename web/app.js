@@ -866,7 +866,11 @@ function showInfo(i) {
     `💬 ${i.messages} messages in session '${esc(i.session)}'` +
     (i.session_id ? ` (id <b>${esc(i.session_id)}</b> — archives are ${esc(i.session_id)}_*)` : '') +
     '<br>' +
-    `⚡ context ~${i.used}/${i.budget} tok (${pct}%) · ${i.tools_tokens} tok of tool schemas<br>` +
+    // The ~ marks the estimator's padded guess, and drops away once the server
+    // has reported a real prompt_tokens for this window — same convention as
+    // the per-turn stats line.
+    `⚡ context ${i.estimated === false ? '' : '~'}${i.used}/${i.budget} tok ` +
+    `(${pct}%) · ${i.tools_tokens} tok of tool schemas<br>` +
     (i.output_total != null
       ? `📤 ${i.output_total} output tok generated in this session (an odometer — /clear does not rewind it)<br>`
       : '') +

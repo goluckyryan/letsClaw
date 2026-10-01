@@ -241,12 +241,30 @@ or it is refused. Both guards matter: `?session=` is not validated on attach, so
 session named `../../etc/passwd` can exist, and this is the one place a session name
 becomes a path that is *read*.
 
-The prompt is not frozen at startup: it is rebuilt when a session switches models, rolls
-over, is renamed, or takes a config reload — which is also how a changed file reaches a
-running session. Creating a file for an already-live session needs a `/reload` to be
-noticed, since the read is cached, exactly as editing `base.md` is. The carryover is
-always last: `/clear` drops it, `/rollover` writes a new one, and the three behavior
-layers sit above it.
+The prompt is not frozen at startup, but it is only ever replaced at a point where that
+costs nothing. The three layers live in `history[0]`, which is the prompt prefix the
+server has already tokenised, so rewriting it mid-conversation throws away the KV cache
+for that session. Two rules follow:
+
+* **`/reload` moves settings, never the window.** It re-reads `config.yaml`, rebuilds the
+  engines and tools, and reconciles the behavior files with disk — then leaves every live
+  conversation exactly as it was. It reports which files changed and that they are
+  pending.
+* **`/rollover`, `/clear` and `/new` move the prompt.** Each rebuilds `history[0]` anyway,
+  so each re-reads all three layers on the way through and says in the transcript which
+  ones moved. A file created for an already-live session is picked up the same way.
+
+So an edited `base.md` or `models/sessions/<name>.md` lands at the session's next window
+rebuild. `/reload` tells you it is waiting; `/clear` applies it immediately if you do not
+want to wait for a rollover. A file that reads back *empty* is treated as a save in
+progress and ignored, since that is the state an editor passes through.
+
+The carryover is always last: `/clear` drops it, `/rollover` writes a new one, and the
+three behavior layers sit above it. The rollover summariser never sees those layers —
+they are re-read verbatim into the fresh window, so summarising them would put the same
+instructions in the prompt twice, the second copy degrading at every later rollover. The
+carryover itself *is* passed to the summariser, or the chain would forget everything
+before the window that just ended.
 
 No framework-injected boilerplate: if it's not in the files above or the conversation,
 it's not sent.
@@ -274,7 +292,8 @@ This matters because **a question ends the turn.** The agent loop runs while the
 model calls tools; the moment it emits text instead, the turn is over — and the
 core cannot tell a finished answer from *"shall I do A or B?"*. Nothing in the
 reasoning machinery catches that case, so if you want the model to stop asking
-and start deciding, this file is the only lever. Edit it and `/reload`.
+and start deciding, this file is the only lever. Edit it and `/reload` to stage it, or
+`/clear` to put it in front of the model straight away.
 
 ## Agent Tools
 
@@ -813,6 +832,16 @@ Otherwise it is a local estimate and carries a `~`, independently of the `~` on 
 context figure: the prompt side and the output side can be measured or estimated
 separately.
 
+The `~` on `context` means the same thing everywhere it appears, `/info` included:
+the figure is the local estimate, which carries a deliberate **+60%** pad
+(`ESTIMATE_SCALE`) for servers that withhold usage. Once the server has reported a
+`prompt_tokens` for the current window, that count is what gets shown and the `~`
+drops away. This matters beyond cosmetics — it is also the figure the pre-turn
+thinking-headroom check works from, so spending the pad when the real number is known
+rolls sessions over on context that was never there. A window rebuild (`/rollover`,
+`/clear`, `/new`) discards the measurement along with the window, so the `~` comes
+back until the next turn.
+
 Beside it, `(N this session)` is a running total, also shown by `/info`. It is an
 odometer, not a gauge: it counts what the session has ever generated, so `/clear` does
 not rewind it and it comes back with the session after a restart. Deleting the session
@@ -1137,6 +1166,7 @@ reconnect-by-seq. None of the three needs a bot token or a network.
 - **Semantic search** — embed past messages/sessions and search them by meaning, not just keyword match
 - **Memory system** — read accumulated handoffs back in: rollover writes `state/memory_store/long_term.md`, but a new session is only seeded from its own predecessor, never from the whole history of the file
 - **Discord draft streaming** — live-edited messages as the answer builds, instead of one post at `turn_end`
+- **Sub-agents** — a tool that runs a nested agent loop on a short fresh prompt and returns only its conclusion, so a big search never enters the parent's window. For context, not parallelism — see [todo.md](models/todo.md#wanted-not-built) for the measurements and the caveat about prefix-cache eviction
 
 ## Config
 

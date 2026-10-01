@@ -536,6 +536,21 @@ class Session:
         msgs = self.history if messages is None else messages
         return int((count_messages(msgs) + self.tools_tok) * ESTIMATE_SCALE)
 
+    def used_now(self):
+        """How full the window is: measured where the server told us, else estimated.
+
+        estimate() carries a deliberate +60% (ESTIMATE_SCALE) for servers that
+        withhold usage. Spending that margin when the real figure is already
+        known costs tens of thousands of phantom tokens on a large window, and
+        the pre-turn headroom check reads it as context pressure that is not
+        there.
+
+        _last_used is only ever the size of the *current* window: every path
+        that rebuilds the history from nothing clears it, so this is either a
+        measurement of what is in the window now, or None.
+        """
+        return self._last_used if self._last_used is not None else self.estimate()
+
     def fresh_history(self, carryover=""):
         """System message: the three behavior layers, then the carryover.
 
@@ -569,6 +584,38 @@ class Session:
         carried = self.carryover()
         body = [m for m in self.history if m["role"] != "system"]
         self.history = self.fresh_history(carried) + body
+
+    async def refresh_behavior(self):
+        """Re-read the three layers from disk, for a window about to be rebuilt.
+
+        Only called from rollover, /clear and /new — the paths that replace the
+        prompt prefix anyway. /reload deliberately does not call this on a live
+        window; see SessionManager.reload.
+
+        The caller rebuilds the history itself: this only moves the attributes
+        that fresh_history reads, so one rebuild serves both.
+        """
+        # Reconcile the cache with disk first, then compare against what *this
+        # session* is using. Both halves are needed, and the second is the one
+        # that is easy to get wrong: /reload also reconciles the cache, so a
+        # rollover that asked only "did disk change?" would be told no and keep
+        # serving the old text for ever. The question is whether the session's
+        # layers match the cache, not whether the cache just moved.
+        await self.manager.refresh_behaviors()
+        entry = (self.config.get("models", {}) or {}).get(self.model_name) or {}
+        fresh = await self.manager.behavior_for(entry, self.name)
+        was = (self.base_behavior, self.behavior, self.session_behavior)
+        if fresh == was:
+            return []
+        (self.base_behavior, self.behavior, self.session_behavior) = fresh
+
+        keys = self.manager.behavior_keys_for(entry, self.name)
+        names = [Path(keys[i]).name if i < len(keys) else label
+                 for i, label in enumerate(("base", "model", "session"))]
+        moved = [names[i] for i in range(3) if was[i] != fresh[i]]
+        self.emit(ev("notice", level="info",
+                     text="behavior re-read from disk: " + ", ".join(moved)))
+        return moved
 
     def carryover(self):
         """The handoff a rollover parked in the system message, or "".
@@ -624,16 +671,12 @@ class Session:
 
         if blob["engine"] is not None:
             self.engine = blob["engine"]
-        if blob["behavior"] is not None and blob["behavior"] != (
-                self.base_behavior, self.behavior, self.session_behavior):
-            (self.base_behavior, self.behavior,
-             self.session_behavior) = blob["behavior"]
-        # The system message is rebuilt either way: the base file may have
-        # changed under a live session, and it is the only place the tool
-        # notes live now.
-        carried = self.carryover()
-        body = [m for m in self.history if m["role"] != "system"]
-        self.history = self.fresh_history(carried) + body
+        # history is deliberately untouched. The three behavior layers sit in
+        # history[0], which is the prompt prefix the server has already
+        # tokenised; rebuilding it here would cost every live session its KV
+        # cache mid-conversation. An edited behavior file is already in the
+        # manager's cache and is read by refresh_behavior() at the next
+        # rollover, /clear or /new — the paths that replace that prefix anyway.
 
         if blob["lost_model"]:
             self.emit(ev("notice", level="warn",
@@ -1154,7 +1197,7 @@ class Session:
     def _pad_headroom(self):
         """Context tokens a thinking pad may still grow into."""
         answer = self.engine.max_output or (self.engine.extra_params.get("max_tokens") or 0)
-        return self.budget - self.estimate() - answer - PAD_CONTEXT_MARGIN
+        return self.budget - self.used_now() - answer - PAD_CONTEXT_MARGIN
 
     async def _headroom_check(self):
         """Roll over *before* a turn when there is no room left to think in.
@@ -1178,7 +1221,7 @@ class Session:
             return
         if self._pad_headroom() >= MIN_THINK_HEADROOM:
             return
-        used = self.estimate()
+        used = self.used_now()
         self.emit(ev("notice", level="info",
                      text=f"only {max(0, self._pad_headroom())} tok of thinking room "
                           f"left — rolling over before the turn"))
@@ -1504,7 +1547,7 @@ class Session:
         never the conversation.
         """
         self.rollover_count += 1
-        used = used if used is not None else self.estimate()
+        used = used if used is not None else self.used_now()
         self.emit(ev("rollover_start", reason=reason, used=used,
                      budget=self.budget, count=self.rollover_count))
         try:
@@ -1528,7 +1571,8 @@ class Session:
         if summary_max >= HANDOFF_MIN_TOKENS:
             try:
                 handoff = await store.build_handoff(self.engine, self.history,
-                                                      max_tokens=summary_max)
+                                                      max_tokens=summary_max,
+                                                      prior=self.carryover())
             except Exception as e:
                 self.emit(ev("notice", level="warn",
                              text=f"handoff failed ({e}) — carrying the last exchange only"))
@@ -1545,6 +1589,11 @@ class Session:
             except OSError as e:
                 self.emit(ev("notice", level="warn", text=f"could not append handoff: {e}"))
 
+        # The prompt prefix is about to be replaced wholesale, so this is the
+        # cheap moment to pick up an edited behavior file: the KV cache the
+        # re-read would cost is being thrown away regardless.
+        await self.refresh_behavior()
+
         fresh = self.fresh_history(
             store.format_carryover(handoff, transcript, journal_path=record))
         tail = store.last_exchange(self.history)
@@ -1554,6 +1603,10 @@ class Session:
             self.emit(ev("notice", level="warn",
                          text="dropped the carried exchange — it would not fit"))
         self.history = fresh
+        # Measured against the window that just ended. Keeping it would have
+        # used_now() report a full window to the next turn's headroom check,
+        # which would roll over again at once — and again after that.
+        self._last_used = None
         self.emit(ev("rollover_done",
                      transcript=str(transcript) if transcript else None,
                      record=str(record) if record else None,
@@ -1575,7 +1628,11 @@ class Session:
         # should not have to care which one the user typed.
         name = name.lstrip("/").lower()
         if name == "info":
-            used = self.estimate()
+            # The same figure the headroom check works from, so what a person
+            # reads here is what the session is actually acting on. Marked
+            # honestly: `estimated` is only true when the server withheld usage
+            # and the +60% pad is all we have.
+            used = self.used_now()
             return {"ok": True, "info": {
                 "session": self.name, "session_id": self.session_id,
                 "model": self.model_name,
@@ -1586,7 +1643,8 @@ class Session:
                             "content": (m.get("content") or "")[:120],
                             "tokens": count_text(m.get("content") or "")}
                            for m in self.history[-5:]],
-                "used": used, "budget": self.budget, "estimated": True,
+                "used": used, "budget": self.budget,
+                "estimated": self._last_used is None,
                 "tools_tokens": self.tools_tok,
                 # Since the session was created, surviving /clear and restarts.
                 "output_total": self.total_output,
@@ -1617,8 +1675,10 @@ class Session:
             # a /clear followed by a crash would otherwise bring back the
             # conversation the user just threw away.
             if name == "clear":
+                await self.refresh_behavior()
                 self.history = self.fresh_history()
                 self.declined_at, self.warned_over = None, False
+                self._last_used = None
                 # /clear starts a new window as surely as a rollover does, it
                 # just does not summarise on the way. Leaving the segment open
                 # would append the next, unrelated conversation to the end of
@@ -1641,9 +1701,11 @@ class Session:
                 # them too, so there is nothing left to grep and nothing to
                 # carry forward. Irreversible, deliberately — a rollover is
                 # what you want when the past is worth keeping.
+                await self.refresh_behavior()
                 self.history = self.fresh_history()
                 self.declined_at, self.warned_over = None, False
                 self.rollover_count = 0
+                self._last_used = None
                 await self.close_journal()
                 files, freed = await store.purge_archives(self.session_id,
                                                           self.config)
@@ -1838,6 +1900,79 @@ class SessionManager:
             self._behaviors[key] = path.read_text() if path.exists() else ""
         return self._behaviors[key]
 
+    def _stale_behaviors(self):
+        """Cache keys whose file on disk no longer matches what was read.
+
+        Content, not mtime: an editor that writes a file back byte-identical
+        should not be reported as a change, and these are a handful of small
+        local files, so reading them all costs less than being wrong. Every
+        path ever consulted is a key — a missing file caches "" — so a
+        session .md created after the session attached is caught too.
+
+        A file that has since been deleted compares as "", which is what
+        _behavior_sync would cache for it now.
+        """
+        stale = []
+        for key, cached in self._behaviors.items():
+            p = paths.resolve(key)
+            try:
+                current = p.read_text() if p.exists() else ""
+            except OSError as e:
+                # Not stale, not fatal: keep the cached text and say so. The
+                # alternative is refusing the whole reload over one unreadable
+                # file that may not even be in use any more.
+                logger.warning("behavior file unreadable, keeping cached: %s: %s", p, e)
+                continue
+            if current != cached:
+                stale.append(key)
+        return stale
+
+    def behavior_keys_for(self, entry, session_name=None):
+        """The cache keys behavior_for would read for this session.
+
+        Same strings _behavior_sync and _session_behavior_sync key on, so a
+        caller can ask which of its own three files a refresh touched.
+        """
+        keys = [self.config.get("behavior", {}).get("base_file") or DEFAULT_BASE_FILE,
+                entry.get("behavior_file", "models/default.md")]
+        path = self.session_behavior_path(session_name) if session_name else None
+        if path is not None:
+            keys.append(str(path))
+        return keys
+
+    def _refresh_behaviors_sync(self):
+        """Re-read every changed behavior file into the cache. Returns the keys.
+
+        A file that has gone *empty* having had content is treated as a save in
+        progress, not a deletion: the cached text is kept and the caller warned.
+        Truncation in general cannot be detected — empty is the case that would
+        otherwise blank a session's instructions, and it is the state an editor
+        passes through on the way to writing a file out.
+        """
+        refreshed = []
+        for key in self._stale_behaviors():
+            p = paths.resolve(key)
+            try:
+                text = p.read_text() if p.exists() else ""
+            except OSError as e:
+                logger.warning("behavior file unreadable, keeping cached: %s: %s", p, e)
+                continue
+            if not text.strip() and self._behaviors.get(key, "").strip():
+                logger.warning("behavior file %s is empty — keeping the cached text "
+                               "(a save in progress?)", p)
+                continue
+            self._behaviors[key] = text
+            refreshed.append(key)
+        return refreshed
+
+    async def refresh_behaviors(self):
+        """_refresh_behaviors_sync off the event loop.
+
+        Touches the cache and nothing else — no live window is rebuilt here, so
+        this is safe to call from /reload as well as from the rebuild paths.
+        """
+        return await asyncio.to_thread(self._refresh_behaviors_sync)
+
     async def get(self, name, model=None):
         if name not in self.sessions:
             s = Session(name, self, self.config)
@@ -1874,9 +2009,24 @@ class SessionManager:
 
         old_cfg = copy.deepcopy(self.config)
         changed = diff_config(old_cfg, fresh)
-        if not changed:
+        # The behavior files are not in the config, so diff_config cannot see an
+        # edited base.md or sessions/<name>.md. Refreshing the cache here is what
+        # makes the edit available; it is NOT applied to any live window.
+        #
+        # history[0] is the prompt prefix every server has already tokenised.
+        # Rewriting it mid-conversation discards the KV cache for every live
+        # session at once, to deliver a change the session did not ask for at a
+        # moment it did not choose. So a reload moves settings — engine, tools,
+        # scalars, directives — and leaves the window alone. The edited file
+        # lands at the next rollover, /clear or /new, each of which rebuilds that
+        # prefix anyway and re-reads on the way through.
+        refreshed = await self.refresh_behaviors()
+        if not changed and not refreshed:
             return {"ok": True, "changed": [], "updated": 0, "deferred": 0,
-                    "note": "config on disk is identical to the running one"}
+                    "note": "config and behavior files on disk are identical "
+                            "to the running ones"}
+        changed += [f"{key}: edited — applies at the next rollover, /clear or /new"
+                    for key in refreshed]
 
         # In place, never rebound: the manager, the aiohttp app and every session
         # hold this same dict, so mutating it is what makes core.token, the state
@@ -1885,9 +2035,10 @@ class SessionManager:
         self.config.update(fresh)
 
         old_engines, self._engines = self._engines, engines
-        self._behaviors.clear()
-        # The base file is re-read like any other behavior file: /reload is
-        # how an edited base.md reaches the live sessions.
+        # From the cache refresh_behaviors has just reconciled with disk. The
+        # manager's own copy is safe to move immediately: the directives below
+        # are re-sent as user messages mid-turn, not held in the prompt prefix,
+        # so updating them costs no KV cache.
         self.base_behavior = await self._behavior_text(
             fresh.get("behavior", {}).get("base_file") or DEFAULT_BASE_FILE)
         self.conclude_directive = extract_conclude_directive(self.base_behavior)
@@ -1928,8 +2079,8 @@ class SessionManager:
         ]
 
         updated = deferred = 0
-        # A list, not the live view: behavior_for awaits a file read, and a client
-        # attaching during that await would create a session mid-iteration.
+        # A list, not the live view: a client attaching mid-iteration would
+        # otherwise create a session that is handed a blob built before it existed.
         for sess in list(self.sessions.values()):
             entry = engines.get(sess.model_name)
             blob = {
@@ -1940,8 +2091,6 @@ class SessionManager:
                 # has, which still works. Moving a live conversation onto a
                 # different model behind the user's back would be worse.
                 "engine": entry[0] if entry else None,
-                "behavior": (await self.behavior_for(entry[2], sess.name))
-                            if entry else None,
                 "lost_model": entry is None,
             }
             if sess.lock.locked():
