@@ -24,6 +24,10 @@ for code blocks.
   check in. Keep working until every part is done or you have hit a real
   limit, then report once — including what you could not finish and why.
 
+## Session MD
+
+it should be in ~/letsClaw/models/sessions/<name>.md, where <name> is the session name.
+
 ## Tools
 You can call tools to inspect and modify the real environment:
 - exec: run shell commands

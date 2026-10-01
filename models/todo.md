@@ -70,10 +70,33 @@ they are in one place.
   whole file.
 * **Discord draft streaming** — live-edited messages as the answer builds,
   instead of one post at `turn_end`.
+* **Sub-agents** — a fifth tool that runs a nested agent loop on a short fresh
+  prompt and returns only its conclusion. The case is *context*, not
+  parallelism, and it holds even fully serialised: 50k tokens of grep output
+  stays out of the parent's window.
 
-Both of the first two put tokens in a prompt that the user did not write, so
-whatever shape they take has to stay compatible with
-[principle 3](../docs/design-principles.md#3-no-hidden-token-injection) —
+  Two readings from `qwen38-local` (llama.cpp `/slots`, 2026-09-30) dispose of
+  the usual objections. The server runs `-np 4` with 4 × 131072 tokens of KV
+  **pre-allocated at startup** — a second stream costs no extra memory, and
+  three slots are idle today. And decode at batch 1 is memory-bandwidth bound,
+  so a concurrent stream rides along at roughly 1.8× aggregate for 5–10% off
+  each. The real cost is neither: llama.cpp assigns a slot by longest-common-
+  prefix, so a sub-agent can evict the slot holding a 100k conversation and
+  bill the parent a full re-prefill on its next turn. Hence *short fresh
+  prompt, never a fork of the parent*. SGLang (`qwen38-dgsSpark`,
+  `qwen38-flash-spark0`) shares prefixes via RadixAttention and is free of
+  this.
+
+  Against [principle 3](../docs/design-principles.md#3-no-hidden-token-injection):
+  the parent acts on a summary of work it never saw. `Tool.run_full`
+  (`tools.py:44`) is the precedent — full transcript to the journal, summary to
+  the parent, tokens counted and attributed to the turn. Worth noting `exec`
+  can already do this crudely (a script opening a WS on a scratch session),
+  which is the cheap way to test the idea before building the tool.
+
+Semantic search, memory read-back and sub-agents all put tokens in a prompt
+that the user did not write, so whatever shape they take has to stay compatible
+with [principle 3](../docs/design-principles.md#3-no-hidden-token-injection) —
 visible and accounted for, not silent.
 
 ## Rejected, deliberately
