@@ -140,6 +140,55 @@ def load_config(path=None):
         return yaml.safe_load(f) or {}
 
 
+_THEME_KEY_RE = re.compile(r"^  theme\s*:\s*(.*)$")
+_PIN_KEY_RE = re.compile(r"^    (\w+)\s*:\s*(.*)$")
+
+
+def _yaml_scalar(v):
+    """One value as a YAML line fragment, round-tripping through safe_load.
+
+    Booleans are spelled by hand so the intent is visible at the call site;
+    everything else goes through the dumper, which quotes exactly what needs
+    quoting (a '#1e222b' color, a value containing ': ').
+    """
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    dumped = yaml.safe_dump({"_": v}, default_flow_style=False, width=10 ** 6)
+    return dumped.splitlines()[0].split(": ", 1)[1]
+
+
+def _comment_start(line):
+    """The index of the '#' that starts an inline comment, or None.
+
+    A '#' with unbalanced quotes before it is inside a quoted value — a
+    hex color like '#1e222b' — not a comment, so the scan keeps going.
+    """
+    for i, ch in enumerate(line):
+        if ch == "#" and not (line[:i].count('"') % 2 or line[:i].count("'") % 2):
+            return i
+    return None
+
+
+def _revalue(line, new_head):
+    """A key line with its value replaced, keeping the inline comment —
+    spacing and all — and the line ending. The file's own notes survive
+    the save, a hex color in the value does not read as a comment, and
+    the comment keeps the gap it had, so the column stays put."""
+    eol = "\n"
+    for ch in ("\r\n", "\n", "\r"):
+        if line.endswith(ch):
+            eol = ch
+            line = line[: -len(ch)]
+            break
+    idx = _comment_start(line)
+    if idx is None:
+        return new_head + eol
+    sp = idx
+    while sp > 0 and line[sp - 1] in " \t":
+        sp -= 1
+    return new_head + line[sp:idx] + line[idx:] + eol
+
+
 def known_models(config):
     return [k for k in config.get("models", {}) if k != "default_model"]
 
@@ -2325,6 +2374,98 @@ class SessionManager:
         logger.info("config reloaded from %s: %s (%d session(s) updated, %d deferred)",
                     path, "; ".join(changed), updated, deferred)
         return {"ok": True, "changed": changed, "updated": updated, "deferred": deferred}
+
+    async def save_webui(self, webui):
+        """Edit the webui: section of config.yaml in place and apply it live.
+
+        A line-level edit, not a YAML round-trip: the file is heavily
+        commented, and dumping the whole config would delete every comment
+        in it. Existing keys are edited in place — value replaced, inline
+        comment kept — so a file the user has annotated keeps its notes.
+        Keys the form sends that the file lacks are appended inside the
+        block; anything else in the file, including unknown keys, is left
+        exactly where it is. The finished file is parsed before it is
+        written, through a temp file renamed over the original, so a save
+        can never leave config.yaml half-written or unparseable.
+
+        The apply is the ordinary reload(): it re-reads the file, refuses
+        to change anything if it will not load, and re-themes every open
+        tab over the reloaded event.
+        """
+        if not isinstance(webui, dict):
+            return {"ok": False, "error": "webui must be a mapping"}
+        pin = webui.get("pin")
+        if pin is not None and not isinstance(pin, dict):
+            return {"ok": False, "error": "webui.pin must be a mapping"}
+        values = {}
+        if "theme" in webui:
+            values["theme"] = _yaml_scalar(webui["theme"])
+        if isinstance(pin, dict):
+            for k, v in pin.items():
+                if isinstance(v, (dict, list)):
+                    return {"ok": False, "error": f"webui.pin.{k} must be a scalar"}
+                values[f"pin.{k}"] = _yaml_scalar(v)
+
+        try:
+            text = self.config_path.read_text()
+        except OSError as e:
+            return {"ok": False, "error": f"cannot read config: {e}"}
+        out = []
+        in_block = False
+        pin_header = False
+        for line in text.splitlines(keepends=True):
+            if not in_block:
+                if line.startswith("webui:"):
+                    in_block = True
+                out.append(line)
+                continue
+            if line.strip() and line[0] not in " \t":
+                in_block = False      # the next top-level section: the block is over
+                out.append(line)
+                continue
+            if re.match(r"^  pin\s*:", line):
+                pin_header = True
+            m = _THEME_KEY_RE.match(line)
+            if m and "theme" in values:
+                out.append(_revalue(line, f"  theme: {values.pop('theme')}"))
+                continue
+            m = _PIN_KEY_RE.match(line)
+            if m and f"pin.{m.group(1)}" in values:
+                key = f"pin.{m.group(1)}"
+                out.append(_revalue(line, f"    {m.group(1)}: {values.pop(key)}"))
+                continue
+            out.append(line)
+
+        if values:
+            # Keys the form sent that the file did not have: append them at
+            # the end of the block — the end of the file when webui is the
+            # last section, as in the example config.
+            if out and not out[-1].endswith("\n"):
+                out[-1] += "\n"
+            if not in_block:
+                out.append("\nwebui:\n")
+            for path, scalar in values.items():
+                if path.startswith("pin."):
+                    if not pin_header:
+                        out.append("  pin:\n")
+                        pin_header = True
+                    out.append(f"    {path.split('.', 1)[1]}: {scalar}\n")
+                else:
+                    out.append(f"  {path}: {scalar}\n")
+
+        finished = "".join(out)
+        try:
+            fresh = yaml.safe_load(finished) or {}
+        except yaml.YAMLError as e:
+            return {"ok": False, "error": f"refusing to write a config that will not parse: {e}"}
+        if not isinstance(fresh.get("webui"), dict):
+            return {"ok": False, "error": "webui must be a mapping"}
+
+        tmp = self.config_path.with_suffix(".yaml.tmp")
+        tmp.write_text(finished)
+        tmp.replace(self.config_path)
+        logger.info("config saved from WebUI: webui section edited in place")
+        return await self.reload()
 
     async def restore(self):
         """Reload every session written to state/live/. Returns how many.

@@ -738,6 +738,7 @@ function handle(e) {
       rpc('info', '', true)
         .then((r) => r.info && setGauge(r.info.used, r.info.budget, false))
         .catch(() => {});
+      if (settingsOpen) settingsRefresh();   // the panel shows the live config — redraw it
       setHint();
     } else if (e.what === 'renamed') {
       // e.session is already the new name — emit() stamped it after the rename.
@@ -1331,6 +1332,242 @@ $('#side-add').onsubmit = (e) => {
 $('#side-name').addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { $('#side-add').hidden = true; input.focus(); }
 });
+
+/* --------------------------------------------------------------- settings */
+
+/* Everything in config.yaml, read from GET /config so the panel always shows
+   what the core is actually running — no second copy of the schema to drift.
+   Read-only except the webui section: a YAML round-trip of the whole file
+   would delete every comment in it, and the restart-only keys (core.bind,
+   core.port, logging.file) would save fine and apply never, which is worse
+   than not offering them. */
+
+const SET_ORDER = ['core', 'models', 'behavior', 'tools', 'conversation',
+                   'memory', 'logging', 'webui', 'discord'];
+const SET_RESTART = new Set(['core.bind', 'core.port', 'logging.file']);
+const SET_SECRETS = new Set(['token', 'api_key']);
+
+function deepEq(a, b) {
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || !a || !b) return false;
+  const ka = Object.keys(a), kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  return ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && deepEq(a[k], b[k]));
+}
+
+function cfgEl(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function cfgValue(v) {
+  if (v === null || v === undefined) return cfgEl('span', 'cfg-val', '(unset)');
+  if (typeof v === 'boolean')
+    return cfgEl('span', `chip ${v ? 'on' : 'off'}`, v ? 'true' : 'false');
+  if (Array.isArray(v)) {
+    const s = cfgEl('span', 'cfg-val');
+    for (const item of v) s.append(cfgEl('span', 'chip', String(item)));
+    return s;
+  }
+  return cfgEl('span', 'cfg-val', String(v));
+}
+
+function cfgSecret(key, v) {
+  const wrap = cfgEl('span', 'cfg-secret');
+  const show = cfgEl('span', 'cfg-val', String(v));
+  show.hidden = true;
+  const dots = cfgEl('span', 'dots', '••••••••');
+  const btn = cfgEl('button', '', '👁');
+  btn.title = 'reveal';
+  btn.onclick = () => {
+    show.hidden = !show.hidden;
+    dots.hidden = !dots.hidden;
+    btn.textContent = show.hidden ? '👁' : '🙈';
+  };
+  wrap.append(dots, show, btn);
+  return wrap;
+}
+
+function cfgRow(key, v, path) {
+  const row = cfgEl('div', 'cfg-row');
+  const k = cfgEl('span', 'cfg-key', key);
+  if (SET_RESTART.has(path)) k.append(cfgEl('span', 'badge', 'restart'));
+  row.append(k, SET_SECRETS.has(key) && v ? cfgSecret(key, v) : cfgValue(v));
+  return row;
+}
+
+function cfgCard(title, map, path) {
+  const card = cfgEl('div', 'cfg-card');
+  card.append(cfgEl('div', 'cfg-card-title', title));
+  for (const [k, v] of Object.entries(map)) {
+    if (v && typeof v === 'object' && !Array.isArray(v))
+      card.append(cfgCard(k, v, `${path}.${k}`));
+    else
+      card.append(cfgRow(k, v, `${path}.${k}`));
+  }
+  return card;
+}
+
+let settingsOpen = false;   // the panel is up — a reloaded event redraws it live
+let settingsCfg = null;
+let setNotice = null;       // {text, ok} — survives a re-render so "saved" is not wiped by it
+
+async function fetchConfig() {
+  const r = await fetch('/config', { headers: authHeaders() });
+  if (r.status === 401) { location.reload(); return null; }
+  if (!r.ok) throw new Error(`/config → ${r.status}`);
+  return r.json();
+}
+
+function renderSettings(data) {
+  settingsCfg = data.config;
+  $('#set-path').textContent = data.path;
+  const body = $('#set-body');
+  body.innerHTML = '';
+  const keys = [...SET_ORDER.filter((k) => k in settingsCfg),
+                ...Object.keys(settingsCfg).filter((k) => !SET_ORDER.includes(k))];
+  for (const key of keys) {
+    const val = settingsCfg[key];
+    const det = cfgEl('details');
+    if (key === 'webui') det.open = true;
+    const sum = cfgEl('summary');
+    sum.append(cfgEl('span', '', key));
+    if (val && typeof val === 'object')
+      sum.append(cfgEl('span', 'count', `${Object.keys(val).length} key(s)`));
+    if (key === 'webui') sum.append(cfgEl('span', 'editable-tag', 'editable · applies live'));
+    det.append(sum);
+    if (!val || typeof val !== 'object' || Array.isArray(val)) {
+      det.append(cfgEl('div', 'set-rows')).append(cfgRow(key, val, key));
+    } else if (key === 'webui') {
+      det.append(webuiEditor(val));
+    } else {
+      const rows = cfgEl('div', 'set-rows');
+      for (const [k, v] of Object.entries(val))
+        rows.append(v && typeof v === 'object' && !Array.isArray(v)
+                    ? cfgCard(k, v, `${key}.${k}`)
+                    : cfgRow(k, v, `${key}.${k}`));
+      det.append(rows);
+    }
+    body.append(det);
+  }
+}
+
+function webuiEditor(val) {
+  const rows = cfgEl('div', 'set-rows');
+  const orig = JSON.stringify(val);
+  const form = { theme: String(val.theme || 'auto'),
+                 pin: { background: val.pin?.background ?? 'var(--bg)',
+                        transparency: val.pin?.transparency ?? 1,
+                        font_size: val.pin?.font_size ?? '15px',
+                        font_color: val.pin?.font_color ?? 'var(--fg)' } };
+
+  const themeRow = cfgEl('div', 'cfg-row cfg-edit');
+  themeRow.append(cfgEl('span', 'cfg-key', 'theme'));
+  const sel = cfgEl('select');
+  for (const t of ['auto', 'dark', 'light']) {
+    const o = cfgEl('option', '', t);
+    o.value = t;
+    sel.append(o);
+  }
+  sel.value = form.theme;
+  const themeHint = cfgEl('span', 'set-notice', 'auto follows the OS');
+  sel.onchange = () => {
+    form.theme = sel.value;
+    themeHint.textContent = sel.value === 'auto' ? 'auto follows the OS' : `force ${sel.value}`;
+    dirty();
+  };
+  themeRow.append(sel, themeHint);
+  rows.append(themeRow);
+
+  const pinDefs = [['background', 'text', 'pin.background'],
+                   ['transparency', 'number', 'pin.transparency'],
+                   ['font_size', 'text', 'pin.font_size'],
+                   ['font_color', 'text', 'pin.font_color']];
+  for (const [k, type, label] of pinDefs) {
+    const row = cfgEl('div', 'cfg-row cfg-edit');
+    row.append(cfgEl('span', 'cfg-key', label));
+    const inp = cfgEl('input');
+    inp.type = type;
+    inp.value = String(form.pin[k]);
+    if (type === 'number') { inp.min = '0'; inp.max = '1'; inp.step = '0.05'; }
+    inp.oninput = () => {
+      form.pin[k] = type === 'number' ? Number(inp.value) : inp.value;
+      dirty();
+    };
+    row.append(inp);
+    rows.append(row);
+  }
+
+  const foot = cfgEl('div', 'set-foot');
+  const save = cfgEl('button', 'set-save', 'Save');
+  const notice = cfgEl('span', 'set-notice');
+  if (setNotice) {
+    notice.textContent = setNotice.text;
+    notice.className = `set-notice ${setNotice.ok ? 'ok' : 'err'}`;
+  }
+  save.onclick = async () => {
+    save.disabled = true;
+    notice.className = 'set-notice';
+    notice.textContent = 'saving…';
+    try {
+      const r = await fetch('/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ webui: { theme: form.theme, pin: { ...form.pin } } }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ok) {
+        setNotice = { text: j.error || `save failed (${r.status})`, ok: false };
+        notice.className = 'set-notice err';
+        notice.textContent = setNotice.text;
+        return;
+      }
+      setNotice = { text: (j.changed && j.changed.length)
+        ? j.changed.join(' · ')
+        : 'no change — the file already said this', ok: true };
+      notice.className = 'set-notice ok';
+      notice.textContent = setNotice.text;
+      if (settingsOpen) await settingsRefresh();   // redraw against the live config
+    } catch (e) {
+      setNotice = { text: String(e), ok: false };
+      notice.className = 'set-notice err';
+      notice.textContent = String(e);
+    } finally {
+      save.disabled = false;
+    }
+  };
+  // A semantic compare, not a string one: the server's key order is the file's,
+  // and the form builds its own — a string diff would call an unchanged form
+  // dirty (or the reverse) whenever the order differs.
+  const dirty = () => { save.disabled = deepEq({ theme: form.theme, pin: { ...form.pin } }, val); };
+  foot.append(save, notice);
+  rows.append(foot);
+  return rows;
+}
+
+async function settingsRefresh() {
+  try {
+    renderSettings(await fetchConfig());
+  } catch (e) {
+    console.warn('settings refresh failed', e);
+  }
+}
+
+if ($('#side-settings')) {
+  $('#side-settings').onclick = async () => {
+    settingsOpen = true;
+    setNotice = null;
+    $('#settings').hidden = false;
+    $('#set-body').innerHTML = '<div class="set-notice">loading…</div>';
+    await settingsRefresh();
+  };
+  const closeSettings = () => { settingsOpen = false; $('#settings').hidden = true; };
+  $('#set-close').onclick = closeSettings;
+  $('#settings').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeSettings(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && settingsOpen) closeSettings(); });
+}
 
 /* Poll, because the list shows *other* sessions and our socket only ever hears
    about this one. Cheap (a small JSON read against a local core), and paused

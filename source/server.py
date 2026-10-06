@@ -97,6 +97,35 @@ async def delete_session(request):
     return web.json_response(result)
 
 
+async def config_get(request):
+    """The live config dict, for the Settings panel. Authenticated like the
+    other state reads: core.token and discord.token are in it."""
+    if not _authorised(request):
+        raise web.HTTPUnauthorized()
+    return web.json_response({
+        "path": str(request.app["config_path"]),
+        "config": request.app["config"],
+    })
+
+
+async def config_save(request):
+    """Save the webui: section and apply it live. Only webui is accepted:
+    it is the one section whose change is safe to apply without a restart
+    and that a browser should not be editing byte-for-byte."""
+    if not _authorised(request):
+        raise web.HTTPUnauthorized()
+    try:
+        body = await request.json()
+    except ValueError:
+        return web.json_response({"ok": False, "error": "malformed JSON"}, status=400)
+    webui = body.get("webui") if isinstance(body, dict) else None
+    if not isinstance(webui, dict):
+        return web.json_response(
+            {"ok": False, "error": "body must be {'webui': {...}}"}, status=400)
+    result = await request.app["mgr"].save_webui(webui)
+    return web.json_response(result, status=200 if result["ok"] else 400)
+
+
 async def reload_config(request):
     """Re-read config.yaml in place. 400 and no change if the file will not load."""
     if not _authorised(request):
@@ -357,6 +386,8 @@ def build_app(config, config_path=None):
         web.delete("/sessions/{name}", delete_session),
         web.post("/sessions/{name}/rename", rename_session),
         web.post("/reload", reload_config),
+        web.get("/config", config_get),
+        web.post("/config", config_save),
         web.get("/theme.css", theme),
         web.get("/ws", ws_handler),
     ])

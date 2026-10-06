@@ -22,6 +22,10 @@
     <input id="side-name" placeholder="name…" spellcheck="false" autocomplete="off">
   </form>
   <div id="side-list"></div>
+  <!-- After #side-list, so the flex:1 list pushes it to the bottom of the bar. -->
+  <div id="side-foot">
+    <button id="side-settings" title="settings — everything in config.yaml">⚙️ settings</button>
+  </div>
   <!-- Right edge of the sidebar: drag to resize, double-click to reset. -->
   <div id="side-grip" title="drag to resize · double-click to reset" aria-hidden="true"></div>
 </aside>
@@ -80,6 +84,19 @@
     <input id="gate-token" type="password" placeholder="core.token" autocomplete="off">
     <button type="submit">Connect</button>
   </form>
+</div>
+
+<!-- Settings: everything in config.yaml. Read-only except the webui section,
+     which is the one part of the file safe to change from a live browser. -->
+<div id="settings" hidden>
+  <div class="set-box">
+    <div class="set-head">
+      <h2>⚙️ Settings</h2>
+      <span class="set-path" id="set-path"></span>
+      <button id="set-close" title="close">✕</button>
+    </div>
+    <div class="set-body" id="set-body"></div>
+  </div>
 </div>
 
 <script src="/static/app.js"></script>

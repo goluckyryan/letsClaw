@@ -23,6 +23,8 @@ Routes registered at `server.py:309-319`.
 | `DELETE /sessions/{name}` | yes | 404 if no such session, 409 if a turn is running |
 | `POST /sessions/{name}/rename` | yes | body `{"to": "..."}`. 400 malformed / bad name, 404 missing, 409 busy or taken |
 | `POST /reload` | yes | re-reads `config.yaml` in place; **400 and no change** if it will not load |
+| `GET /config` | yes | `{path, config}` — the live config dict, for the WebUI Settings panel. Authenticated because `core.token` and `discord.token` are in it |
+| `POST /config` | yes | body `{"webui": {...}}` — rewrites **only the `webui:` block** of `config.yaml` (comments and every other byte untouched; the block is appended if missing), then applies it via the ordinary reload. 400 malformed or unserialisable |
 | `GET /ws` | yes | the stream (below) |
 | `GET /` , `GET /static/*` | **no** | the WebUI from `web/` — registered only if `web/index.html` exists |
 | `GET /theme.css` | **no** | generated CSS from `webui.pin` in config.yaml — the style of the pinned prompt; `/reload` re-themes it |

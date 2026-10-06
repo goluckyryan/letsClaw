@@ -664,3 +664,215 @@ footer {
   border-radius: 6px;
   cursor: pointer;
 }
+
+/* ---------- settings sidebar button ---------- */
+
+#side-foot {
+  flex: 0 0 auto;
+  padding: 8px 12px 10px;
+  border-top: 1px solid var(--line);
+}
+#side-settings {
+  width: 100%;
+  padding: 7px 10px;
+  font: 12px var(--sans);
+  text-align: left;
+  color: var(--fg);
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  cursor: pointer;
+}
+#side-settings:hover { border-color: var(--accent); }
+
+/* ---------- settings overlay ---------- */
+
+#settings {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+/* Same trap as #gate: an explicit display: beats the hidden attribute. */
+#settings[hidden] { display: none; }
+.set-box {
+  display: flex;
+  flex-direction: column;
+  width: min(720px, 94vw);
+  height: min(640px, 90vh);
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.set-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 18px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.set-head h2 { margin: 0; font-size: 15px; }
+.set-path {
+  flex: 1;
+  font: 11px var(--mono);
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.set-close {
+  width: 26px;
+  height: 26px;
+  font-size: 13px;
+  line-height: 1;
+  background: var(--bg3);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.set-close:hover { border-color: var(--accent); }
+
+.set-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 18px 18px;
+}
+
+/* One <details> per top-level section of config.yaml. */
+.set-body details {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin-bottom: 8px;
+  background: var(--bg);
+}
+.set-body summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  font: 12px var(--mono);
+  color: var(--fg);
+  cursor: pointer;
+  user-select: none;
+}
+.set-body summary:hover { color: var(--accent); }
+.set-body summary .count { font-size: 11px; color: var(--dim); }
+.set-body summary .editable-tag {
+  margin-left: auto;
+  font: 10px var(--sans);
+  color: var(--ok);
+}
+.set-rows { padding: 2px 12px 10px; }
+
+/* One key, one value, per row. */
+.cfg-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 0;
+  border-top: 1px solid var(--line);
+  font-size: 12.5px;
+}
+.cfg-row:first-child { border-top: 0; }
+.cfg-key {
+  flex: 0 0 42%;
+  font: 12px var(--mono);
+  color: var(--dim);
+  word-break: break-all;
+}
+.cfg-key .badge {
+  font: 10px var(--sans);
+  color: var(--warn);
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  padding: 0 4px;
+  margin-left: 6px;
+  vertical-align: 1px;
+}
+.cfg-val {
+  flex: 1;
+  font: 12px var(--mono);
+  color: var(--fg);
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+.chip {
+  display: inline-block;
+  padding: 0 6px;
+  margin-right: 4px;
+  font: 11px var(--mono);
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.chip.on { border-color: var(--ok); color: var(--ok); }
+.chip.off { color: var(--dim); }
+
+/* Secrets: masked until the eye is clicked. */
+.cfg-secret {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.cfg-secret .dots { letter-spacing: 2px; color: var(--dim); }
+.cfg-secret button {
+  font-size: 11px;
+  padding: 1px 6px;
+  background: var(--bg3);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.cfg-secret button:hover { border-color: var(--accent); }
+
+/* Nested maps (models.<name>.<key>) become an indented card. */
+.cfg-card {
+  margin: 6px 0 8px 12px;
+  padding-left: 10px;
+  border-left: 2px solid var(--line);
+}
+.cfg-card .cfg-card-title {
+  font: 12px var(--mono);
+  color: var(--accent);
+  margin-bottom: 2px;
+}
+
+/* The editable webui section: real inputs, one Save for the whole block. */
+.cfg-edit select,
+.cfg-edit input[type=text],
+.cfg-edit input[type=number] {
+  padding: 4px 8px;
+  font: 12px var(--mono);
+  color: var(--fg);
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.cfg-edit select { cursor: pointer; }
+.cfg-edit input[type=number] { width: 70px; }
+.set-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px 10px;
+  border-top: 1px solid var(--line);
+}
+.set-save {
+  padding: 6px 16px;
+  font: 13px var(--sans);
+  background: var(--accent);
+  color: #fff;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.set-save:disabled { opacity: .5; cursor: default; }
+.set-notice { font: 12px var(--sans); color: var(--dim); }
+.set-notice.ok { color: var(--ok); }
+.set-notice.err { color: var(--err); }
