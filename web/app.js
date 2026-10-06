@@ -26,6 +26,7 @@ const COMMANDS = {
   '/behavior':  'print the loaded behavior files (base + model + session)',
   '/reasoning': "toggle live display of the model's thinking",
   '/stop':      'interrupt the turn in progress',
+  '/steering':       'send a correction to the turn in progress',
   '/reload':    're-read config.yaml into the running core',
   '/help':      'this list',
 };
@@ -36,9 +37,34 @@ const COMMANDS = {
 const FRAMES = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';   // the same spinner ui.py draws in the terminal
 const PROTOCOL_VERSION = 1;
 
+/* Sidebar width, user-adjustable by dragging its right edge. Persisted like the
+   other per-browser prefs (token, reasoning toggle, sidebar visibility). */
+const SIDE_W_MIN = 160, SIDE_W_MAX = 480, SIDE_W_DEF = 210;
+function clampW(w) { return Math.min(SIDE_W_MAX, Math.max(SIDE_W_MIN, w || SIDE_W_DEF)); }
+
+/* The composer's ↑ recall list is per session: what you typed while working on
+   one conversation has no business surfacing in another. The other prefs
+   (token, reasoning, sidebar) are genuinely per browser and stay shared.
+   Migration: the key was global until it leaked between sessions, so the first
+   load seeds this session's list from it and drops the old one. */
+const sentKey = (name) => `letsclaw.sent.${name}`;
+function loadSent(name) {
+  const here = localStorage.getItem(sentKey(name));
+  if (here !== null) return JSON.parse(here);
+  const legacy = localStorage.getItem('letsclaw.sent');
+  if (legacy !== null) {
+    localStorage.setItem(sentKey(name), legacy);
+    localStorage.removeItem('letsclaw.sent');
+    return JSON.parse(legacy);
+  }
+  return [];
+}
+
+const SESSION0 = new URLSearchParams(location.search).get('session') || 'web';
+
 const S = {
   ws: null,
-  session: new URLSearchParams(location.search).get('session') || 'web',
+  session: SESSION0,
   token: localStorage.getItem('letsclaw.token') || '',
   lastSeq: 0,
   model: null,
@@ -46,11 +72,13 @@ const S = {
   tripPct: 0,
   rollovers: 0,
   showReasoning: localStorage.getItem('letsclaw.reasoning') === '1',
+  theme: 'auto',
+  sideW: clampW(parseInt(localStorage.getItem('letsclaw.sideW'), 10)),
   busy: false,
   closing: false,
   backoff: 500,
   turn: null,
-  sent: JSON.parse(localStorage.getItem('letsclaw.sent') || '[]'),
+  sent: loadSent(SESSION0),
   histIdx: -1,
   rpcs: new Map(),
   rpcId: 0,
@@ -278,7 +306,18 @@ function msg(kind, who, html) {
   const el = node(`msg ${kind}`);
   el.innerHTML = `<div class="who">${who}</div><div class="body"></div>`;
   if (html !== undefined) el.querySelector('.body').innerHTML = html;
+  if (kind === 'user') pinUser(el);
   return append(el);
+}
+
+/* The newest user message pins to the top of the log for the whole turn —
+   without it, the reasoning and tool output streaming below would scroll it
+   off the top and you'd hunt up the log to re-read what you asked. One pin
+   at a time: the class moves to the next message. */
+function pinUser(el) {
+  const old = log.querySelector('.msg.user.pin');
+  if (old && old !== el) old.classList.remove('pin');
+  el.classList.add('pin');
 }
 
 /* Two elements, not one: the outer div does the positioning that lines a slab up
@@ -381,10 +420,28 @@ function setGauge(used, budget, measured) {
   trip.style.left = `${S.tripPct}%`;
 }
 
+// The gauge after /clear or /new. Never zero: the window the core just rebuilt
+// holds the three behavior layers and the tool schemas, and drawing 0% over it
+// reads as the MD files having been dropped. An older core sends no figure, so
+// fall back to zero rather than to NaN.
+function freshGauge(e) {
+  setGauge(e.used || 0, e.budget || S.budget, false);
+}
+
 function setBusy(on) {
   S.busy = on;
   $('#stop').hidden = !on;
   $('#send').disabled = on;
+}
+
+/* webui.theme from the core. auto leaves <html> unmarked so the OS
+   preference decides; dark/light set the attribute the forced palettes in
+   style.css key off. */
+function applyTheme(t) {
+  S.theme = t;
+  const root = document.documentElement;
+  if (t === 'dark' || t === 'light') root.dataset.theme = t;
+  else delete root.dataset.theme;
 }
 
 function setHint(extra) {
@@ -478,6 +535,8 @@ function switchSession(name) {
   S.session = name;
   S.lastSeq = 0;
   S.turn = null;
+  S.sent = loadSent(name);         // the recall list follows the session, not the tab
+  S.histIdx = -1;
   clearWaiting();
   log.innerHTML = '';
   history.replaceState(null, '', `?session=${encodeURIComponent(name)}`);
@@ -576,6 +635,18 @@ function handle(e) {
     return;
   }
 
+  case 'steering': {
+    // A correction landed mid-turn: the round was interrupted and the model
+    // re-plans. Close the open blocks so its next words start fresh, and show
+    // the interjection as a user message — it is one, so pinUser pins it.
+    stampThinking();
+    clearWaiting();
+    if (S.turn) { flushStream(S.turn.textEl); S.turn.textEl = null; S.turn.reasonEl = null; }
+    msg('user', '📌', esc(e.text)).classList.add('steering');
+    setWaiting('thinking');
+    return;
+  }
+
   case 'stats': {
     const p = [];
     if (e.ttft != null) p.push(`ttft ${e.ttft.toFixed(1)}s`);
@@ -620,8 +691,15 @@ function handle(e) {
     const paths = [];
     if (e.transcript) paths.push(`💾 transcript  ${esc(e.transcript)}`);
     if (e.handoff)    paths.push(`🧠 handoff     ${esc(e.handoff)}`);
+    // The compaction summary itself, not just where it was written: what the
+    // fresh window carries forward. Open by default — the user asked to see it.
+    const handoff = e.handoff_text
+      ? `<details class="handoff" open><summary>🧠 what the new window carries</summary>` +
+        `<pre>${esc(e.handoff_text)}</pre></details>`
+      : '';
     slab('roll', `✨ New session — ${e.used}/${e.budget} tok` +
-                 (paths.length ? `<div class="paths">${paths.join('<br>')}</div>` : ''));
+                 (paths.length ? `<div class="paths">${paths.join('<br>')}</div>` : '') +
+                 handoff);
     separator('fresh context from here');
     if (e.count != null) S.rollovers = e.count;
     setGauge(e.used, e.budget, false);
@@ -635,16 +713,16 @@ function handle(e) {
       log.innerHTML = '';
       notice('🧹 History cleared (/rollover archives it instead).');
       if (e.record) notice(`📓 what was said is still in ${e.record}`);
-      setGauge(0, S.budget, false);
+      freshGauge(e);
     } else if (e.what === 'wiped') {
       clearWaiting();
       log.innerHTML = '';
       notice(`🔥 Everything wiped — conversation and ${e.files || 0} archive file(s).`);
-      setGauge(0, S.budget, false);
+      freshGauge(e);
     } else if (e.what === 'model') {
       S.model = e.model;
       S.budget = e.budget;
-      $('#model').value = e.model;
+      showModel(e.model);
       notice(`🤖 Switched to ${e.model} — context budget ${e.budget} tok.`);
       setHint();
     } else if (e.what === 'reloaded') {
@@ -654,8 +732,9 @@ function handle(e) {
       // added to or dropped from the file.
       S.model = e.model;
       S.budget = e.budget;
+      if (e.theme) applyTheme(e.theme);
       notice(`♻️ Config reloaded — ${e.model}, context budget ${e.budget} tok.`);
-      loadModels().then(() => { $('#model').value = e.model; }).catch(() => {});
+      loadModels().then(() => showModel(e.model)).catch(() => {});
       rpc('info', '', true)
         .then((r) => r.info && setGauge(r.info.used, r.info.budget, false))
         .catch(() => {});
@@ -677,7 +756,11 @@ function handle(e) {
       clearWaiting();
       log.innerHTML = '';
       setGauge(0, S.budget, false);
-      notice(`🗑️ Session '${e.session}' was deleted. Anything you send starts it over, empty.`, 'warn');
+      // Name the archives too. They are the half that used to survive a
+      // delete, so saying nothing about them now reads as if they still do.
+      const arch = e.files ? ` ${e.files} archived file(s) went with it.` : '';
+      notice(`🗑️ Session '${e.session}' was deleted.${arch}`
+             + ' Anything you send starts it over, empty.', 'warn');
     }
     refreshSessions();
     return;
@@ -721,12 +804,11 @@ function hello(e) {
   S.tripPct = (e.rollover && e.rollover.percent) || 0;
   S.rollovers = (e.rollover && e.rollover.count) || 0;
   S.session = e.session;
+  applyTheme(e.theme || 'auto');
   document.title = `${e.session} · letsClaw`;
   // Empty means boot()'s /models fetch never landed. The core is plainly up now, or
   // this event would not be here, so refill the list before selecting in it.
-  const selectModel = () => {
-    if ($('#model').querySelector(`option[value="${CSS.escape(e.model || '')}"]`)) $('#model').value = e.model;
-  };
+  const selectModel = () => showModel(e.model);
   if ($('#model').options.length) selectModel(); else loadModels().then(selectModel);
   setHint();
 
@@ -961,7 +1043,7 @@ input.addEventListener('keydown', (e) => {
 function remember(text) {
   if (S.sent[S.sent.length - 1] !== text) S.sent.push(text);
   S.sent = S.sent.slice(-100);
-  localStorage.setItem('letsclaw.sent', JSON.stringify(S.sent));
+  localStorage.setItem(sentKey(S.session), JSON.stringify(S.sent));
   S.histIdx = -1;
 }
 
@@ -983,6 +1065,14 @@ function submit() {
     }
     if (word === '/reasoning') return toggleReasoning();
     if (word === '/stop')      { send({ t: 'stop' }); return; }
+    if (word === '/steering') {
+      if (!args) {
+        input.value = text; autosize();
+        return notice('/steering needs text — /steering the right IP is 10.0.0.5', 'warn');
+      }
+      if (!send({ t: 'steering', text: args })) { input.value = text; autosize(); return; }
+      return;
+    }
     if (!(word in COMMANDS))   return notice(`unknown command ${word} — /help lists them`, 'warn');
 
     if (word === '/rollover') setWaiting('archiving and summarising');
@@ -1034,9 +1124,24 @@ $('#btn-reload').onclick = () => {
   rpc('reload').catch((err) => notice(`/reload: ${err.message}`, 'warn'));
 };
 
+/* The core is what decides: the dropdown shows the session's model, and only a
+   session_state(model) event moves it. A rejected or lost switch — the socket
+   down, the core mid-reconnect — used to be swallowed, leaving the control
+   naming a model the session was not on and the next turn running on the old
+   one with nothing said. Put it back and say so instead. */
 $('#model').onchange = (e) => {
   const want = e.target.value;
-  if (want && want !== S.model) rpc('model', want).catch(() => {});
+  if (!want || want === LOST || want === S.model) return;
+  // Two ways to fail, and both used to leave the control lying. A refusal comes
+  // back as a resolved {ok:false} — response() has already drawn the error, so
+  // only put the dropdown back. A dead socket rejects, and nothing else reports
+  // that at all, so say it here.
+  rpc('model', want)
+    .then((r) => { if (r.ok === false) showModel(S.model); })
+    .catch((err) => {
+      showModel(S.model);
+      notice(`could not switch to ${want}: ${err.message}`, 'warn');
+    });
 };
 
 /* ------------------------------------------------------------------ sidebar */
@@ -1070,8 +1175,17 @@ async function refreshSessions() {
     dot.hidden = !s.busy;
     const nm = node('nm');
     nm.textContent = s.name;                      // textContent: names are user input
+    // More than one client on a session is the thing that makes a model switch
+    // look like it leaked: the other tab is on this same conversation, so it
+    // moves too — correctly. The count was already here, but only in the title
+    // tooltip, which is to say nowhere. Shown from two up; one is the normal case
+    // and a badge on every row would just be noise.
     const ct = node('ct');
     ct.textContent = s.messages || '';
+    const eyes = node('eyes');
+    eyes.hidden = !(s.clients > 1);
+    eyes.textContent = `⧉${s.clients}`;
+    eyes.title = `${s.clients} tabs are on this session — a model switch in any of them moves all of them`;
     const ren = document.createElement('button');
     ren.className = 'ren';
     // Drawn, not typed. Every pencil codepoint falls back to the colour-emoji face
@@ -1087,7 +1201,7 @@ async function refreshSessions() {
     del.textContent = '✕';
     del.title = `delete ${s.name}`;
 
-    row.append(dot, nm, ct, ren, del);
+    row.append(dot, nm, eyes, ct, ren, del);
     el.appendChild(row);
   }
 }
@@ -1133,17 +1247,25 @@ async function renameSession(name) {
 async function deleteSession(name) {
   const row = [...$('#side-list').children].find((r) => r.dataset.name === name);
   const n = row ? row.querySelector('.ct').textContent : '';
-  // Discards the conversation and writes nothing, so ask first — and say how
-  // much is about to go, which is the number that makes people hesitate.
+  // Discards the conversation AND every transcript and journal it archived, so
+  // ask first — and say how much is about to go, which is the number that makes
+  // people hesitate. The file count is not one of them: the core knows it, the
+  // browser does not, so the archives are named rather than counted.
   if (!confirm(`Delete session "${name}"?`
-             + (n ? `\n\n${n} message${n === '1' ? '' : 's'} will be discarded.` : '')
+             + (n ? `\n\n${n} message${n === '1' ? '' : 's'} will be discarded,` : '\n\nThis discards the conversation')
+             + ' along with every archived transcript and journal this session has written.'
              + '\n\nThis cannot be undone.')) return;
   try {
     const r = await fetch(`/sessions/${encodeURIComponent(name)}`,
                           { method: 'DELETE', headers: authHeaders() });
+    const d = await r.json().catch(() => ({}));
     if (!r.ok) {
-      const d = await r.json().catch(() => ({}));
       notice(`could not delete ${name}: ${d.error || r.status}`, 'warn');
+    } else if (name !== S.session) {
+      // Only when we were not attached to it: a tab that was gets the same news
+      // from the session_state event, and two notices for one click is noise.
+      const arch = d.files ? `, with ${d.files} archived file(s)` : '';
+      notice(`🗑️ Deleted '${name}'${arch}.`);
     }
   } catch {
     notice(`could not delete ${name}: the core is unreachable`, 'warn');
@@ -1156,6 +1278,39 @@ $('#side-toggle').onclick = () => {
   side.hidden = !side.hidden;
   localStorage.setItem('letsclaw.side', side.hidden ? '0' : '1');
 };
+
+/* Drag the right edge of the session sidebar to resize it. Pointer events, so it
+   works with a mouse or a finger; the width is remembered across reloads. */
+{
+  const grip = $('#side-grip');
+  const side = $('#side');
+  let dragging = false;
+
+  grip.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    grip.setPointerCapture(e.pointerId);
+    document.body.classList.add('resizing');
+    e.preventDefault();
+  });
+  grip.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    S.sideW = clampW(e.clientX);   // the sidebar starts at x=0, so the pointer's x is the width
+    side.style.width = S.sideW + 'px';
+  });
+  const end = () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove('resizing');
+    localStorage.setItem('letsclaw.sideW', String(S.sideW));
+  };
+  grip.addEventListener('pointerup', end);
+  grip.addEventListener('pointercancel', end);
+  grip.addEventListener('dblclick', () => {
+    S.sideW = SIDE_W_DEF;
+    side.style.width = S.sideW + 'px';
+    localStorage.setItem('letsclaw.sideW', String(S.sideW));
+  });
+}
 
 $('#side-new').onclick = () => {
   const form = $('#side-add');
@@ -1207,13 +1362,41 @@ async function loadModels() {
   if (!r.ok) return null;
   const { configured, default: def } = await r.json();
   $('#model').innerHTML = configured.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
-  $('#model').value = S.model || def;
+  showModel(S.model || def);
   return true;
+}
+
+/* Point the dropdown at the model the session is actually on — always, even when
+   that model is not in the configured list.
+
+   The old code only assigned when a matching <option> existed, so a session on a
+   model since dropped from config.yaml left the control showing whatever it held
+   before: the default, or the model of the session this tab was looking at a
+   moment ago. A dropdown that quietly names the wrong model is worse than an
+   empty one, because every other surface agrees with it. The stand-in carries
+   the real name, is disabled so it cannot be chosen again once left, and is
+   rebuilt each time so only one is ever present. */
+const LOST = '__lost__';
+function showModel(name) {
+  const sel = $('#model');
+  sel.querySelector(`option[value="${LOST}"]`)?.remove();
+  if (!name) return;
+  if (!sel.querySelector(`option[value="${CSS.escape(name)}"]`)) {
+    const o = document.createElement('option');
+    o.value = LOST;
+    o.disabled = true;
+    o.textContent = `${name} (not in config)`;
+    sel.append(o);
+    sel.value = LOST;
+    return;
+  }
+  sel.value = name;
 }
 
 async function boot() {
   $('#btn-reasoning').classList.toggle('on', S.showReasoning);
   $('#side').hidden = localStorage.getItem('letsclaw.side') === '0';
+  $('#side').style.width = S.sideW + 'px';
   document.title = `${S.session} · letsClaw`;
   setHint();
 

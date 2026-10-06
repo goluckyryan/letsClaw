@@ -678,6 +678,12 @@ class ChannelBridge:
         elif t == "rollover_start":
             await self.say(f"_🔄 rolling over — {_one_line(event.get('reason'))}_")
         elif t == "rollover_done":
+            text = event.get("handoff_text")
+            if text:
+                # The compaction summary: what the fresh window carries. say()
+                # hard-splits past the 2000-unit wire limit, so a long handoff
+                # is posted as a sequence of messages, not lost.
+                await self.say(f"🧠 *handoff — what the new window carries:*\n{text}")
             await self.say(f"_✨ fresh window — {event.get('used')}/"
                            f"{event.get('budget')} tok_")
         elif t == "rollover_ask":

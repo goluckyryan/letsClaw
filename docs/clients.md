@@ -32,8 +32,13 @@ REPL and is the first thing to fix if it ever becomes more than that.
 
 ## Browser — `web/`
 
-`index.html` + `app.js` + `style.css`, served by the core from `/`. **Vanilla
-JS, no build step, no dependencies** — edit and reload.
+`index.html` + `app.js` + `style.css`, served by the core from `/`,
+plus `GET /theme.css` — generated from `webui.pin` in config.yaml so the
+pinned prompt (band color, transparency, text size and color) is a config
+setting. The page theme is `webui.theme` (`auto`/`dark`/`light`); it rides
+the `hello` and `reloaded` events rather than a stylesheet, because a live
+tab cannot be made to re-fetch one — so `/reload` re-themes every open tab
+immediately. **Vanilla JS, no build step, no dependencies** — edit and reload.
 
 Does the most: session sidebar (polling `GET /sessions` every 5 s), markdown
 rendering, collapsible thinking blocks with a live token count, rename and

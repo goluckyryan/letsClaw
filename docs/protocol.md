@@ -25,6 +25,7 @@ Routes registered at `server.py:309-319`.
 | `POST /reload` | yes | re-reads `config.yaml` in place; **400 and no change** if it will not load |
 | `GET /ws` | yes | the stream (below) |
 | `GET /` , `GET /static/*` | **no** | the WebUI from `web/` — registered only if `web/index.html` exists |
+| `GET /theme.css` | **no** | generated CSS from `webui.pin` in config.yaml — the style of the pinned prompt; `/reload` re-themes it |
 
 **Auth** (`_authorised`, `server.py:56-62`): the token is `core.token`; empty
 means everything is open. Accepts `Authorization: Bearer <tok>` **or**
@@ -81,6 +82,7 @@ non-fatal `error`; non-text frames are ignored.
 | `command` | `name`, `args`, `request_id` | the reply comes back as `response` **to this client only** |
 | `rollover_reply` | `request_id`, `yes` | a stale or duplicate reply is dropped at debug level |
 | `stop` | — | cancels the turn task |
+| `steering` | `text` | a correction for the turn in flight: queued as a user message, interrupts the streaming round, and is answered by the next round. With no turn running the core answers with a `notice` |
 | `ping` | — | → `pong` |
 
 `submit` runs as `asyncio.create_task(session.run_turn(...))` and is **never
@@ -101,8 +103,9 @@ Every event carries `seq` and `session`, stamped by `Session.emit`
 
 | `t` | payload | |
 |---|---|---|
-| `hello` | `session, seq, proto, model, budget, busy, messages, rollover{}, missed[], gap` | the snapshot; `messages` excludes the system message, `gap` is true when the replay buffer could not cover `last_seq` |
+| `hello` | `session, seq, proto, model, budget, busy, theme, messages, rollover{}, missed[], gap` | the snapshot; `theme` is `webui.theme` (`auto`/`dark`/`light`); `messages` excludes the system message, `gap` is true when the replay buffer could not cover `last_seq` |
 | `turn_start` | `turn_id, text, origin` | the core's echo of your own message |
+| `steering` | `turn_id, text` | a `/steering` interjection was taken: the round was interrupted (or the correction queued at a round boundary) and the model re-plans with it. It is a real user message, so a fresh attach sees it in `hello.messages` instead |
 | `text` | `delta` | |
 | `reasoning` | `delta` | **live only, never replayed**; suppressed for `reasoning=0` |
 | `reasoning_stat` | `tokens, …` | **live only**; a reconnect would replay hundreds of superseded counts |
@@ -113,7 +116,7 @@ Every event carries `seq` and `session`, stamped by `Session.emit`
 | `notice` | `level` (`info`/`warn`), `text` | ~30 emit sites |
 | `error` | `msg`, `fatal` | |
 | `busy` | `reason` | |
-| `session_state` | `what` ∈ `reloaded`/`cleared`/`wiped`/`model`/`renamed`/`deleted` | |
+| `session_state` | `what` ∈ `reloaded`/`cleared`/`wiped`/`model`/`renamed`/`deleted` | `reloaded` also carries `theme` (the new `webui.theme`); `wiped` and `deleted` also carry `files` + `bytes`: the archives that went with the conversation |
 | `rollover_start` / `rollover_ask` / `rollover_done` | | `rollover_ask` is the **only** server→client request |
 | `response` | `request_id` + the command's reply | unicast, not broadcast |
 | `pong` | — | |

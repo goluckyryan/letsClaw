@@ -224,3 +224,18 @@ memory:
 logging:
   level: "INFO"
   file: "logs/letclaw.log"
+# WebUI — style of the pinned prompt (the newest user message, stuck to the top
+# of the log while a turn runs). Served to the page as /theme.css; /reload
+# re-themes it with no restart. Omit any key to keep the built-in default.
+webui:
+  # Page theme: auto = follow the OS (default), dark, or light. A typo falls
+  # back to auto. /reload re-themes every open tab immediately (it rides the
+  # reloaded event — a stylesheet cannot be re-fetched under a live tab).
+  theme: auto
+  pin:
+    background: "var(--bg)"   # CSS color of the band behind the pinned message
+    transparency: 1           # 0 = fully see-through, 1 = opaque (default)
+    font_size: "15px"         # CSS length; the message text
+    font_color: "var(--fg)"   # CSS color; the message text
+                              # var(--bg) / var(--fg) follow the page's light
+                              # and dark themes; any literal works too ("#1e222b")

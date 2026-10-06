@@ -22,6 +22,27 @@ python3 -m venv .venv
 ./terminalUI.sh                          # 2. the terminal client, in another shell
 ```
 
+If `python3 -m venv` stops with *"You may need to use sudo"*, the distro ships
+`ensurepip` separately — Ubuntu 26 does. Install it:
+
+```bash
+sudo apt install python3.14-venv      # match the version to your python3
+```
+
+With no sudo to hand, build the venv without pip and fill it from the system pip
+instead — same result:
+
+```bash
+python3 -m venv --without-pip .venv
+python3 -m pip --python .venv/bin/python install -r requirements.txt pip
+```
+
+A venv does not survive a distro upgrade: `.venv/bin/python3` points at the
+unversioned `/usr/bin/python3`, so it follows the new interpreter, while the packages
+stay behind in `.venv/lib/python3.<old>` — along with every `.so` built for the old
+ABI. The symptom is a bare `ModuleNotFoundError` on the first import. Delete `.venv`
+and rebuild it; nothing else is lost.
+
 `./serve.sh` also starts the **Discord bot** when `discord.token` is set, and says so
 and carries on when it is not — so it stays the right command either way. Ctrl-C stops
 both.
@@ -523,10 +544,11 @@ It does two jobs:
   original creation time, so the registry never points at a conversation by a
   name it no longer answers to.
 
-A deleted session's id is removed, returning it to the pool. Its archives keep
-that id in their filenames — deleting a live conversation is not a claim that it
-never existed — and with 32 bits the chance of a future session drawing the same
-id and landing beside them is negligible.
+A deleted session's id is removed, returning it to the pool. Nothing on disk
+still carries it: the archives that named it are purged in the same breath, so
+a future session drawing the same id inherits nothing. (With 32 bits that draw
+is a ~1-in-4.3-billion event anyway, which is the remaining argument for the one
+case that can leave files behind — a purge that failed.)
 
 A live session file written before ids existed has none; it is assigned one at
 the next restart, registered, and persisted from then on.
@@ -1029,12 +1051,16 @@ running: every event is stamped with the session's name, so a rename mid-turn wo
 split one turn's output across two names. Transcripts already archived under `state/`
 keep the old name in their filename — they record what the session was called then.
 
-`✕` **discards the conversation and writes nothing**, so it asks first and tells you
-how many messages are about to go. It is refused (409) while a turn is running, since
-dropping the session out of the registry would not stop the turn. Anyone attached to a
-deleted session keeps their socket: they get a notice, and their next message
-transparently lands on a fresh, empty session of the same name. Past rollover
-transcripts under `state/` are archives of their own and are left alone.
+`✕` **discards the conversation and every file it wrote**, so it asks first and
+tells you how many messages are about to go. Along with the live conversation go
+all of this session's archived transcripts and journals under `state/sessions`,
+matched on its id rather than its name so that anything written before a rename
+goes too; the reply says how many files that was. It is refused (409) while a
+turn is running, since dropping the session out of the registry would not stop
+the turn. Anyone attached to a deleted session keeps their socket: they get a
+notice, and their next message transparently lands on a fresh, empty session of
+the same name. What survives is `models/sessions/<name>.md`, which is authored
+input rather than state and belongs to the name, not the conversation.
 
 Everything the terminal client can
 do is there: streaming answers with markdown and copyable code blocks, tool calls

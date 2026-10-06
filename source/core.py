@@ -31,7 +31,7 @@ import yaml
 
 import paths
 import session as store
-from llm_engine import ChatResult, LLMEngine
+from llm_engine import ChatResult, LLMEngine, RoundInterrupted
 from token_counter import count_messages, count_text, count_tools
 
 logger = logging.getLogger("letclaw.core")
@@ -118,6 +118,16 @@ DEFAULT_BASE_FILE = "models/base.md"
 def ev(t, **kw):
     """An event is just a tagged dict; 13 types don't warrant a class each."""
     return {"t": t, **kw}
+
+
+def config_theme(config):
+    """webui.theme: auto (follow the OS), dark, or light.
+
+    Anything else — a missing section, a typo — degrades to auto rather than
+    forcing a palette the user did not ask for.
+    """
+    t = str((config.get("webui", {}) or {}).get("theme", "auto")).lower()
+    return t if t in ("auto", "dark", "light") else "auto"
 
 
 def load_config(path=None):
@@ -464,6 +474,14 @@ class Session:
         self.turn_events = []   # current turn only; history serves fresh attaches
         self.turn_id = 0
         self.pending_ask = None  # (request_id, Future)
+        # The turn in flight, if any. On the session rather than on whichever
+        # socket happened to start it: a turn belongs to the conversation, and
+        # every client attached to it watches the same output, so every one of
+        # them must be able to stop it. Held by the server as a local, /stop
+        # worked only from the submitting socket — so a second tab could not
+        # stop what it was watching, and neither could the first one after a
+        # reconnect handed it a fresh handler with no handle in it.
+        self._turn_task = None
         self._last_used = None   # measured size of the next prompt, if known
         # Serialises this session's own writes to state/live/. Not self.lock:
         # every save point below is already inside it.
@@ -471,6 +489,11 @@ class Session:
         self._persisted = False  # has this session ever been written to disk?
         # A reload that arrived mid-turn, waiting for the turn to end.
         self._pending_config = None
+        # /steering interjections queued for the turn in flight. add_steering appends
+        # from the socket reader (lock-free — the turn holds self.lock for its
+        # whole duration, and taking it there would deadlock); _turn drains
+        # them, because it alone may move the history.
+        self._steering = []
 
         # The append-only record of what this session generates — reasoning
         # included, tool output untruncated. Opened on the first thing worth
@@ -518,7 +541,8 @@ class Session:
                   proto=PROTOCOL_VERSION,
                   model=self.model_name,
                   budget=self.budget,
-                  busy=self.lock.locked(),
+                  busy=self.busy,
+                  theme=config_theme(self.config),
                   messages=[m for m in self.history if m.get("role") != "system"],
                   rollover={"mode": self.rollover_mode, "percent": self.rollover_pct,
                             "count": self.rollover_count},
@@ -530,6 +554,17 @@ class Session:
     @property
     def budget(self):
         return getattr(self.engine, "context_length", DEFAULT_CONTEXT_LENGTH)
+
+    @property
+    def busy(self):
+        """Is a turn in flight?
+
+        The lock alone is not enough: start_turn creates a task that does not
+        reach `async with self.lock` until the loop next runs it, and two
+        submits arriving in one batch would both pass a lock-only test.
+        """
+        return self.lock.locked() or bool(self._turn_task
+                                          and not self._turn_task.done())
 
     def estimate(self, messages=None):
         """Deliberately conservative context size, for servers that hide usage."""
@@ -683,7 +718,8 @@ class Session:
                          text=f"model '{self.model_name}' is no longer in the config — "
                               f"this session keeps using it, but /model cannot return to it"))
         self.emit(ev("session_state", what="reloaded", model=self.model_name,
-                     budget=self.budget, changed=blob["changed"]))
+                     budget=self.budget, theme=config_theme(self.config),
+                     changed=blob["changed"]))
 
     # ---- the journal -----------------------------------------------------
 
@@ -787,6 +823,71 @@ class Session:
 
     # ---- the turn --------------------------------------------------------
 
+    def start_turn(self, text, origin=None):
+        """Run one turn as a task owned by the session. Returns it, or None if
+        a turn is already in flight.
+
+        The gate is here rather than in the caller so that _turn_task always
+        points at a turn that is really running. A refused submit returns
+        immediately, and letting that task overwrite the handle would leave
+        /stop cancelling something already finished while the real turn ran on.
+        """
+        if self.busy:
+            self.emit(ev("busy", reason="a turn is already running in this session"))
+            return None
+        task = asyncio.create_task(self.run_turn(text, origin=origin))
+        self._turn_task = task
+
+        def done(t):
+            # Only if it is still ours: by the time this runs the next turn may
+            # already have claimed the slot.
+            if self._turn_task is t:
+                self._turn_task = None
+            # run_turn handles its own exceptions, but persist() in its finally
+            # can still raise. Retrieved so it is logged here rather than
+            # surfacing later as "exception was never retrieved".
+            if not t.cancelled() and t.exception() is not None:
+                logger.error("session %s: turn task died", self.name,
+                             exc_info=t.exception())
+
+        task.add_done_callback(done)
+        return task
+
+    def stop_turn(self):
+        """Cancel the turn in flight, whoever started it. True if there was one."""
+        task = self._turn_task
+        if task is None or task.done():
+            return False
+        task.cancel()
+        logger.info("session %s: turn cancelled by /stop", self.name)
+        return True
+
+    def add_steering(self, text):
+        """Queue a /steering for the turn in flight. True if it was taken.
+
+        A /steering is extra information for a turn already running — the model
+        picks it up at the next round. It is a real user message, so it enters
+        the history (and is replayed to fresh attaches like any other); it is
+        not started as a turn of its own. When nothing is running there is
+        nothing to steer, so it is refused rather than queued into the next
+        turn.
+
+        The append is lock-free on purpose: the socket reader calls this, and
+        taking self.lock here would deadlock against the turn that holds it.
+        _turn drains the queue, and it alone may move the history.
+        """
+        text = (text or "").strip()
+        if not text:
+            return False
+        if not self.busy:
+            self.emit(ev("notice", level="warn",
+                         text="no turn is running — just send a message"))
+            return False
+        self._steering.append(text)
+        logger.info("session %s: /steering queued (%d pending)", self.name,
+                    len(self._steering))
+        return True
+
     async def run_turn(self, text, origin=None):
         """One user turn: model rounds, tool rounds, then rollover or trim.
 
@@ -835,6 +936,13 @@ class Session:
                     await self.persist()
                 finally:
                     self.emit(ev("turn_end", turn_id=self.turn_id))
+                # A /steering that landed in the last instant — after _turn finished
+                # but before the turn was announced over: nothing is running any
+                # more, so say so rather than let it queue into the next turn.
+                if self._steering:
+                    self._steering = []
+                    self.emit(ev("notice", level="warn",
+                                 text="no turn is running — just send a message"))
                 # A reload that landed mid-turn. Applied here rather than made to
                 # wait for the lock, so a session that is never idle still picks
                 # it up. Still inside the lock, so nothing moves underneath it;
@@ -868,6 +976,11 @@ class Session:
         last_finish = None   # finish_reason of the last round that returned
         last_reasoning = ""  # that round's reasoning — the seed of a thinking pad
         reasoning_parts = []
+        # What the round currently streaming has emitted, so a /steering interrupt
+        # can keep exactly what the client already saw. Cleared at each round's
+        # start; read only when a round is interrupted.
+        emitted = []
+        reason_emitted = []
         # The live thinking-token figure the clients count up with. Produced here
         # rather than in the browser so it is the same tiktoken count the ⚡ line
         # ends the turn on — a chars/4 guess lands 10-20% away on Qwen, and two
@@ -960,6 +1073,15 @@ class Session:
             nonlocal last_ttft, last_finish, last_reasoning
             t0 = time.monotonic()
             ttft_box = {"v": None}
+            # A tool-loop round (tools offered, no pad) is interruptible: a /steering
+            # queued while it streams raises RoundInterrupted on the next chunk,
+            # so the model stops mid-thought and re-plans with the correction
+            # instead of finishing a long wrong path. Pad resumes and the
+            # no-tools closing round are not — a /steering there waits for the next
+            # boundary, and the turn's end says so rather than dropping it.
+            interruptible = pad is None and tools is not None
+            emitted.clear()
+            reason_emitted.clear()
 
             def on_text(chunk, box=ttft_box):
                 if box["v"] is None:
@@ -970,15 +1092,21 @@ class Session:
                 # short is the one they would close it on.
                 if reason_pending:
                     push_reasoning_stat(time.monotonic(), flush=True)
+                if interruptible and self._steering:
+                    raise RoundInterrupted()
+                emitted.append(chunk)
                 self.emit(ev("text", delta=chunk))
 
             def on_reasoning(chunk):
                 nonlocal reason_t0
+                if interruptible and self._steering:
+                    raise RoundInterrupted()
                 self.emit(ev("reasoning", delta=chunk))
                 now = time.monotonic()
                 if reason_t0 is None:
                     reason_t0 = now
                 reason_pending.append(chunk)
+                reason_emitted.append(chunk)
                 if now - reason_sent >= REASONING_STAT_INTERVAL:
                     push_reasoning_stat(now)
 
@@ -1081,9 +1209,54 @@ class Session:
                     and result.finish_reason == "length"
                     and self.engine.reasoning)
 
+        async def drain_steering():
+            """Move queued /steering's into the history as user messages.
+
+            Called only from here, where self.lock is held, so the history may
+            move. Each interjection is a real user message: replayed to fresh
+            attaches like any other, and shown live to every attached client
+            by the steering event that carries the same text.
+            """
+            queued, self._steering = self._steering, []
+            for text in queued:
+                self.history.append({"role": "user", "content": text})
+                self.emit(ev("steering", text=text, turn_id=self.turn_id))
+                await self.jot(f"turn {self.turn_id} steering", text)
+
+        async def record_partial():
+            """Keep what a /steering interrupted, so history matches the screen.
+
+            The partial answer is appended as a plain assistant message — the
+            same shape a finished round leaves — and the interrupted thinking
+            goes to the journal, the only place a round's reasoning is kept.
+            Nothing to keep if the round was still in reasoning and no answer
+            text had been emitted.
+            """
+            if reason_emitted:
+                await self.jot(f"turn {self.turn_id} interrupted reasoning",
+                               "".join(reason_emitted))
+            partial = "".join(emitted)
+            if partial.strip():
+                self.history.append({"role": "assistant", "content": partial})
+                await self.jot(f"turn {self.turn_id} partial (steering)", partial)
+
         try:
             for _ in range(self.max_tool_rounds):
-                result = await call_round(tools=self.schemas)
+                # A /steering that landed while the previous tool ran (or before any
+                # round) is drained here, before the model is asked again — the
+                # same boundary a mid-stream one reaches, without interrupting
+                # a round that is already between tools.
+                await drain_steering()
+                try:
+                    result = await call_round(tools=self.schemas)
+                except RoundInterrupted:
+                    # A /steering landed mid-round: keep what the model already said
+                    # (it is on the client's screen), hand it the correction,
+                    # and let the next round re-plan. Nothing is lost — the
+                    # partial answer and the interjection both reach history.
+                    await record_partial()
+                    await drain_steering()
+                    continue
                 if not result.wants_tool:
                     # A cut-off round is resumed rather than lost — see
                     # _think_pad. Its conclusion may be an answer or, if the
@@ -1095,6 +1268,17 @@ class Session:
                         if result.wants_tool:
                             await run_tools(result)
                             continue
+                    if self._steering:
+                        # The answer is complete, but a /steering arrived as it was
+                        # finishing — or during the pad resume above, which is
+                        # not interruptible. Record the answer, hand over the
+                        # correction, and let the next round answer it: a /steering
+                        # is never dropped just for arriving a moment late.
+                        if result.text:
+                            self.history.append(
+                                {"role": "assistant", "content": result.text})
+                        await drain_steering()
+                        continue
                     full_response = result.text
                     break
 
@@ -1125,6 +1309,15 @@ class Session:
                     self.emit(ev("error", msg=f"{type(e2).__name__}: {e2}", fatal=False))
                     self.history.pop()  # drop the user message that never landed
                     return
+
+        # The closing round is the one round a /steering cannot interrupt and has no
+        # next round to answer it: clear whatever is left rather than let it
+        # bleed into the next turn, and say so — resending is one line.
+        if self._steering:
+            left, self._steering = self._steering, []
+            self.emit(ev("notice", level="warn",
+                         text=f"{len(left)} /steering arrived as the turn was ending — "
+                              f"send it again"))
 
         # Deltas from a round that died before tally() could re-sync are still
         # uncounted here. Counting them now keeps the figure below — and the last
@@ -1607,10 +1800,13 @@ class Session:
         # used_now() report a full window to the next turn's headroom check,
         # which would roll over again at once — and again after that.
         self._last_used = None
+        # handoff is the file's path; handoff_text is the summary itself, so a
+        # client can show the user what the compaction kept without opening it.
         self.emit(ev("rollover_done",
                      transcript=str(transcript) if transcript else None,
                      record=str(record) if record else None,
                      handoff=str(handoff_path) if handoff_path else None,
+                     handoff_text=handoff or None,
                      used=self.estimate(), budget=self.budget,
                      count=self.rollover_count))
 
@@ -1684,7 +1880,13 @@ class Session:
                 # would append the next, unrelated conversation to the end of
                 # this one, with the turn numbers running straight on.
                 record = await self.close_journal()
+                # used/budget for the same reason rollover_done carries them: a
+                # rebuilt window is not an empty one — it holds the three
+                # behavior layers and the tool schemas. A client that assumed
+                # zero here drew a 0% gauge over a prompt with the MD in it,
+                # which looks exactly like the MD having been dropped.
                 self.emit(ev("session_state", what="cleared", messages=0,
+                             used=self.used_now(), budget=self.budget,
                              record=str(record) if record else None))
                 await self.persist()
                 return {"ok": True}
@@ -1710,6 +1912,7 @@ class Session:
                 files, freed = await store.purge_archives(self.session_id,
                                                           self.config)
                 self.emit(ev("session_state", what="wiped", messages=0,
+                             used=self.used_now(), budget=self.budget,
                              files=files, bytes=freed))
                 await self.persist()
                 logger.info("session %s wiped: %d archive file(s), %d bytes",
@@ -1737,6 +1940,13 @@ class Session:
         another session may be mid-stream on it.
         """
         engine, name, entry = await self.manager.engine_for(model_name)
+        # Logged before the assignment, so the line carries both ends of the
+        # move. Without it the only record of which model a session is on is the
+        # restore line at startup, which makes "why is this session on that
+        # model?" unanswerable for the whole of a long-running core.
+        if self.model_name and name != self.model_name:
+            logger.info("session %s switched model: %s -> %s",
+                        self.name, self.model_name, name)
         self.engine = engine
         self.model_name = name
         # The base is shared by every session, the model file is per model,
@@ -2159,7 +2369,7 @@ class SessionManager:
     def describe(self):
         return [{"name": s.name, "model": s.model_name,
                  "messages": len([m for m in s.history if m["role"] != "system"]),
-                 "clients": len(s.subscribers), "busy": s.lock.locked()}
+                 "clients": len(s.subscribers), "busy": s.busy}
                 for s in self.sessions.values()]
 
     async def rename(self, old, new):
@@ -2184,7 +2394,7 @@ class SessionManager:
             return {"ok": True, "name": new, "was": old}
         if new in self.sessions:
             return {"ok": False, "error": f"session {new!r} already exists"}
-        if s.lock.locked():
+        if s.busy:
             return {"ok": False, "error": "a turn is running in this session"}
         del self.sessions[old]
         s.name = new
@@ -2227,33 +2437,66 @@ class SessionManager:
         return {"ok": True, "name": new, "was": old}
 
     async def delete(self, name):
-        """Forget a session. The conversation is discarded, nothing is written.
+        """Forget a session, and everything it ever wrote.
 
         Refused while a turn is running: dropping the Session out of the registry
         would not stop the turn, it would just leave it emitting into an object
         nothing can reach, holding an engine slot until it finished.
 
-        Past rollover transcripts under state/sessions are archives of their own
-        and are deliberately left alone — this deletes a live conversation, not a
-        record. The live file under state/live is that conversation, so it goes:
-        without the unlink the session would simply reappear at the next restart.
+        Everything this conversation wrote goes: the live file under state/live
+        (without the unlink the session would simply reappear at the next
+        restart), and every `<id>_*` transcript and journal under state/sessions.
+        Those used to be kept, on the argument that an archive is a record of a
+        conversation that existed and deleting the conversation is not a claim
+        that it never did. The argument is fine and the behaviour was still
+        wrong — a delete that leaves megabytes of transcripts behind is not the
+        thing the button says it is, and there was no other way to reach them.
+
+        Scoped by id, never by name: a renamed session's older archives still
+        carry whatever it was called at the time, and the id is the only thing
+        joining them.
+
+        Two things are deliberately left, and should stay left. Nobody should
+        "complete" this later:
+
+          * models/sessions/<name>.md — authored input, not state. The name is
+            reusable the moment this returns, and the next session to claim it
+            is meant to inherit those instructions.
+          * the handoff blocks in the long-term memory file — one document every
+            session appends to, headed by the name each had at the time. No one
+            session owns enough of it to rewrite it.
         """
         s = self.sessions.get(name)
         if s is None:
             return {"ok": False, "error": f"no session {name!r}"}
-        if s.lock.locked():
+        if s.busy:
             return {"ok": False, "error": "a turn is running in this session"}
         messages = len([m for m in s.history if m["role"] != "system"])
-        # Tell the people looking at it before it stops existing; their sockets
-        # stay open, so the notice reaches them and the name is theirs to reuse.
-        s.emit(ev("session_state", what="deleted", messages=0))
+        # Out of the registry before anything that awaits, and synchronously, so
+        # there is no window to land in. The purge goes to a thread; a submit
+        # arriving while it ran would start a turn on a condemned session, and
+        # that turn's rollover would write a fresh archive *after* the sweep.
+        # ws_handler sees `dead` and re-homes the socket onto a new session.
         s.dead = True
         del self.sessions[name]
+        # Before the purge, not after: an open segment unlinked underneath
+        # Journal.write is silently recreated by the next append, and close()
+        # also writes that segment's index record, which belongs ahead of the
+        # tombstone rather than after it.
+        await s.close_journal()
+        try:
+            files, freed = await store.purge_archives(s.session_id, self.config)
+        except OSError as e:
+            files, freed = 0, 0
+            logger.warning("session %s: could not delete its archives: %s",
+                           name, e)
+        # Tell the people looking at it before it stops existing; their sockets
+        # stay open, so the notice reaches them and the name is theirs to reuse.
+        s.emit(ev("session_state", what="deleted", messages=0,
+                  files=files, bytes=freed))
         await store.delete_live(name, self.config)
-        # The id leaves the registry with the session. Its archives under
-        # state/sessions keep it in their filenames — they are records of a
-        # conversation that existed, and deleting a live session is not a claim
-        # that it never did.
+        # The id leaves the registry with the session. Nothing on disk carries
+        # it any more, so nothing is misidentified by letting it go.
         if self._ids is not None:
             self._ids.discard(s.session_id)
         try:
@@ -2261,9 +2504,23 @@ class SessionManager:
         except OSError as e:
             logger.warning("could not drop %s from the session id log: %s",
                            s.session_id, e)
-        logger.info("session %s deleted (id %s, %d messages discarded)",
-                    name, s.session_id, messages)
-        return {"ok": True, "name": name, "messages": messages}
+        # The index is append-only, so the archive and journal lines written
+        # over this session's life cannot be taken back. Without a tombstone it
+        # would go on listing files that no longer exist, with nothing to say
+        # why. Non-fatal, as rename's record is.
+        try:
+            await store.append_index(
+                {"t": "delete", "id": s.session_id, "name": name,
+                 "at": datetime.now().isoformat(timespec="seconds"),
+                 "messages": messages, "files": files, "bytes": freed},
+                self.config)
+        except OSError as e:
+            logger.warning("could not record the delete in the session index: %s", e)
+        logger.info("session %s deleted (id %s, %d messages discarded, "
+                    "%d archive file(s), %d bytes freed)",
+                    name, s.session_id, messages, files, freed)
+        return {"ok": True, "name": name, "messages": messages,
+                "files": files, "bytes": freed}
 
     async def close(self):
         for s in self.sessions.values():

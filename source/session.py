@@ -247,10 +247,12 @@ async def register_id(session_id, name, config=None):
 async def unregister_id(session_id, config=None):
     """Drop a session id from the registry. True if it was there.
 
-    Called when a session is deleted. The id returns to the pool — with 32 bits
-    the chance of it ever being drawn again is ~1 in 4.3 billion, so the
-    archives the deleted session left behind are in no practical danger of being
-    joined by an unrelated conversation's.
+    Called when a session is deleted. The id returns to the pool, which used to
+    rest on 32 bits making a second draw (~1 in 4.3 billion) too unlikely to
+    worry about. It no longer has to: delete purges the archives the id named,
+    so a redraw inherits nothing. The odds are still the argument for the one
+    case that can leave files behind — a purge that failed — and for archives
+    written before session ids existed, which carry no prefix at all.
     """
     path = id_log_path(config)
 
@@ -279,8 +281,9 @@ async def purge_archives(session_id, config=None):
     Every archive this session ever wrote is named `<session_id>_…`, so the id
     is what scopes the deletion: another session's files cannot match, and
     archives written before session ids existed have no id prefix and are left
-    alone. There is no undo, which is why only /new calls this and /clear
-    does not.
+    alone. There is no undo, which is why the two callers are the two commands
+    that say so: /new, which wipes a session without removing it, and delete,
+    which removes it. /clear ends the window and keeps the files.
 
     A session with no id deletes nothing rather than falling back to the
     `00000000` prefix that save_transcript uses for the same case — that prefix

@@ -6,6 +6,8 @@
 <title>letsClaw</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%90%B1%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css">
+<!-- Generated from config.yaml (webui.pin); /reload re-themes it. After style.css so its custom properties win. -->
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body>
 
@@ -20,6 +22,8 @@
     <input id="side-name" placeholder="name…" spellcheck="false" autocomplete="off">
   </form>
   <div id="side-list"></div>
+  <!-- Right edge of the sidebar: drag to resize, double-click to reset. -->
+  <div id="side-grip" title="drag to resize · double-click to reset" aria-hidden="true"></div>
 </aside>
 
 <div id="pane">

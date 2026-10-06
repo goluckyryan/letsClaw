@@ -134,6 +134,36 @@ async def index(request):
                             headers={"Cache-Control": "no-cache"})
 
 
+THEME_PIN_KEYS = ("background", "transparency", "font_size", "font_color")
+"""webui.pin: the style of the pinned prompt. background is a CSS color,
+transparency 0-1 (1 = fully opaque), font_size a CSS length, font_color a CSS
+color. Anything else is dropped so a typo cannot produce broken CSS."""
+
+
+def _theme_css(config):
+    """The pin's style as CSS custom properties, from config's webui.pin.
+
+    Generated rather than served from a file: config.yaml is the one place a
+    setting lives, and /reload picks an edit up without a restart.
+    """
+    pin = (config.get("webui", {}) or {}).get("pin", {}) or {}
+    lines = ["/* generated from config.yaml — webui.pin; /reload re-themes */", ":root {"]
+    for key in THEME_PIN_KEYS:
+        if key in pin:
+            # CSS custom properties are case-sensitive and do NOT treat _ as
+            # - — --pin-font_size is a different name from --pin-font-size.
+            lines.append(f"  --pin-{key.replace('_', '-')}: {pin[key]};")
+    lines.append("}")
+    return web.Response(text="\n".join(lines) + "\n", content_type="text/css",
+                        headers={"Cache-Control": "no-cache"})
+
+
+async def theme(request):
+    """The WebUI's configurable style. Unauthenticated like / — it holds no
+    secrets, and the page that loads it is the thing that holds the token."""
+    return _theme_css(request.app["config"])
+
+
 async def _no_cache_static(request, response):
     """Make the browser revalidate app.js and style.css on every load.
 
@@ -203,7 +233,6 @@ async def ws_handler(request):
     writer = asyncio.create_task(_writer(ws, sub))
     logger.info("client attached to %s (%d total)", name, len(session.subscribers))
 
-    turn = None
     try:
         async for msg in ws:
             if msg.type is not WSMsgType.TEXT:
@@ -233,7 +262,7 @@ async def ws_handler(request):
                 text = (data.get("text") or "").strip()
                 if not text:
                     continue
-                if turn and not turn.done():
+                if session.busy:
                     await ws.send_json(core.ev("busy", reason="a turn is already running"))
                     continue
                 # Who is speaking, when the client knows something the session
@@ -243,8 +272,11 @@ async def ws_handler(request):
                 # back to the session name, which is what it always used to be.
                 origin = str(data.get("origin") or name)[:64] or name
                 # A task, not an await: the reader must stay live to receive
-                # `stop` and `rollover_reply` while the turn is running.
-                turn = asyncio.create_task(session.run_turn(text, origin=origin))
+                # `stop` and `rollover_reply` while the turn is running. The
+                # session holds the handle, not this handler, so the turn
+                # outlives the socket that started it and any client attached
+                # to the session can stop it.
+                session.start_turn(text, origin=origin)
             elif kind == "command":
                 reply = await session.command(data.get("name", ""), data.get("args", ""))
                 reply.update({"t": "response", "request_id": data.get("request_id")})
@@ -254,8 +286,20 @@ async def ws_handler(request):
                 if not ok:
                     logger.debug("stale or duplicate rollover reply ignored")
             elif kind == "stop":
-                if turn and not turn.done():
-                    turn.cancel()
+                # Say so when there was nothing to stop. Silence here reads
+                # exactly like a stop that was ignored, which is the complaint
+                # this whole path existed to cause.
+                if not session.stop_turn():
+                    await ws.send_json(core.ev(
+                        "notice", level="warn",
+                        text="nothing to stop — no turn is running in this session"))
+            elif kind == "steering":
+                # A correction for the turn in flight. When nothing is running,
+                # add_steering's own notice reaches every attached client, so this
+                # socket needs no reply of its own.
+                text = (data.get("text") or "").strip()
+                if text:
+                    session.add_steering(text)
             elif kind == "ping":
                 await ws.send_json(core.ev("pong"))
     finally:
@@ -313,6 +357,7 @@ def build_app(config, config_path=None):
         web.delete("/sessions/{name}", delete_session),
         web.post("/sessions/{name}/rename", rename_session),
         web.post("/reload", reload_config),
+        web.get("/theme.css", theme),
         web.get("/ws", ws_handler),
     ])
     if (WEB_DIR / "index.html").exists():

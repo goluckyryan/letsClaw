@@ -370,12 +370,15 @@ Tab-separated, not whitespace-split, because session names contain spaces.
 both go through `to_thread`, because a 262144-token history can be megabytes
 and would otherwise stall every other session's stream.
 
-`state/sessions/index.jsonl` holds three record types — `archive`, `journal`,
-`rename`. **The index exists because a filename is not an identity**:
+`state/sessions/index.jsonl` holds four record types — `archive`, `journal`,
+`rename`, `delete`. **The index exists because a filename is not an identity**:
 transcripts written before a rename keep the old name forever, and the id is
-what joins them.
+what joins them. The index is append-only, so `delete` cannot retract the lines
+its session wrote; the `delete` record is the tombstone that explains why those
+files are no longer on disk.
 
-`purge_archives` (only `/new` calls it) **refuses an empty or all-zero id**,
+`purge_archives` (called by `/new` and by deleting a session) **refuses an empty
+or all-zero id**,
 because `"0"*8` is the shared prefix used by id-less writers and matching on it
 could take out someone else's archive. There is no undo.
 

@@ -41,6 +41,15 @@ THINK_OPEN = "<think>\n"
 THINK_CLOSE = "\n</think>\n\n"
 
 
+class RoundInterrupted(Exception):
+    """A /steering arrived while this round was streaming: stop the round now.
+
+    Not a failure — the turn keeps running, the partial answer is kept, and
+    the correction is handed to the next round — so chat_with_tools re-raises
+    it before its generic handler, which would log it as a failed model call.
+    """
+
+
 def _partial_suffix(text, marker):
     """How much of `text`'s tail could still be the start of `marker`.
 
@@ -408,6 +417,10 @@ class LLMEngine:
                               reasoning="".join(reason_parts),
                               prompt_tokens=getattr(usage, "prompt_tokens", None),
                               completion_tokens=getattr(usage, "completion_tokens", None))
+        except RoundInterrupted:
+            # A /steering stopped this round mid-stream. Not a model failure — the
+            # turn re-plans with the correction — so it is not logged as one.
+            raise
         except Exception as e:
             logger.error(f"LLM tools call failed: {e}")
             raise

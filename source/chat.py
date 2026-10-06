@@ -48,6 +48,7 @@ COMMANDS = {
     "/behavior": "print the loaded behavior files (base + model + session)",
     "/reasoning": "toggle live display of the model's thinking",
     "/stop": "interrupt the turn in progress",
+    "/steering": "send a correction to the turn in progress",
     "/reload": "re-read config.yaml into the running core",
 }
 
@@ -201,6 +202,12 @@ class Renderer:
             self._stop_spinner()
             self.line(f"   ↳ {e['size']} chars")
             self.spinner()
+        elif t == "steering":
+            # A correction landed mid-turn: the round was interrupted and the
+            # model re-plans. line() closes the open stream; the spinner goes
+            # back up until the next words or thinking arrive.
+            self.line(f"\n📌 {e['text']}")
+            self.spinner()
         elif t == "stats":
             self.stats(e)
         elif t == "turn_end":
@@ -214,17 +221,23 @@ class Renderer:
                 self.line(f"   💾 Transcript  {e['transcript']}")
             if e.get("handoff"):
                 self.line(f"   🧠 Handoff     {e['handoff']}")
+            if e.get("handoff_text"):
+                self.line("   What the new window carries:")
+                for ln in e["handoff_text"].splitlines() or [""]:
+                    self.line(f"     {ln}")
             self.line(f"   ✨ New session  {e['used']}/{e['budget']} tok")
         elif t == "session_state":
             if e["what"] == "cleared":
                 self.line("\n🧹 History cleared (/rollover archives it instead).")
                 if e.get("record"):
                     self.line(f"   📓 what was said is still in {e['record']}")
+                self.fresh_context(e)
             elif e["what"] == "wiped":
                 self.line("\n🔥 Everything wiped — conversation and archives.")
                 if e.get("files"):
                     self.line(f"   🗑️  {e['files']} archive file(s), "
                               f"{e['bytes']:,} bytes deleted")
+                self.fresh_context(e)
             elif e["what"] == "model":
                 self.line(f"\n🤖 Switched to {e['model']} — context budget {e['budget']} tok.")
             elif e["what"] == "reloaded":
@@ -239,6 +252,19 @@ class Renderer:
             self.line(f"   {mark}{e['text']}")
         elif t == "error":
             self.line(f"\n❌ {e['msg']}")
+
+    def fresh_context(self, e):
+        """What the rebuilt window costs before a word is said.
+
+        Worth a line because the number is not zero and people reasonably expect
+        it to be: an emptied conversation still carries the three behavior MDs
+        and the tool schemas. Saying so is also the only confirmation that the
+        files went back in — refresh_behavior only speaks up when one changed.
+        """
+        if not e.get("budget"):
+            return      # an older core, which sent no figure
+        self.line(f"   ✨ fresh context ~{e.get('used', 0)}/{e['budget']} tok "
+                  f"(behavior files + tool schemas)")
 
     def hello(self, e):
         if e.get("proto") != PROTOCOL_VERSION:
@@ -436,6 +462,13 @@ async def run_client(url, session_name, render):
                 continue
             if text == "/stop":
                 await ws.send_json({"t": "stop"})
+                continue
+            if text.startswith("/steering"):
+                args = text[4:].strip()
+                if not args:
+                    render.line("   /steering needs text — /steering the right IP is 10.0.0.5")
+                else:
+                    await ws.send_json({"t": "steering", "text": args})
                 continue
             if text.startswith("/"):
                 name, _, args = text[1:].partition(" ")

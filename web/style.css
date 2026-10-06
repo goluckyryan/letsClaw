@@ -26,6 +26,22 @@
   }
 }
 
+/* Forced theme (webui.theme in config.yaml). The value rides the hello and
+   reloaded events and app.js puts it on <html> — a stylesheet cannot be
+   re-fetched under a live tab, so /reload re-themes by event, not by CSS.
+   The attribute selectors outrank the media query above, so dark/light win;
+   auto leaves the attribute off and the OS preference decides. */
+:root[data-theme="dark"] {
+  --bg:#12141a; --bg2:#171a21; --bg3:#1e222b; --fg:#dfe3ea; --dim:#8b93a3;
+  --line:#272c37; --accent:#7aa2f7; --ok:#9ece6a; --warn:#e0af68; --err:#f7768e;
+  --think:#bb9af7;
+}
+:root[data-theme="light"] {
+  --bg:#ffffff; --bg2:#f4f6fa; --bg3:#eaeef5; --fg:#1c2027; --dim:#5f6875;
+  --line:#dde3ec; --accent:#2f6fd0; --ok:#3f8b2f; --warn:#a06800; --err:#c33c50;
+  --think:#7a4fc0;
+}
+
 * { box-sizing: border-box; }
 
 html, body {
@@ -51,13 +67,31 @@ body {
 /* ---------- session sidebar ---------- */
 
 #side {
-  flex: 0 0 210px;
+  flex: 0 0 auto;          /* width is set inline by the drag handle; auto basis follows it */
+  width: 210px;
+  position: relative;
   display: flex;
   flex-direction: column;
   background: var(--bg2);
   border-right: 1px solid var(--line);
   overflow: hidden;
 }
+/* Right-edge drag handle. Sits over the border so it survives the overflow clip. */
+#side-grip {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  background: transparent;
+  z-index: 6;
+}
+#side-grip:hover,
+#side-grip:active { background: var(--accent); opacity: .45; }
+/* While dragging: no text selection, and the resize cursor everywhere. */
+body.resizing { user-select: none; cursor: col-resize; }
+body.resizing #side-grip { background: var(--accent); opacity: .7; }
 /* Same trap as #gate: an explicit display: beats the hidden attribute. */
 #side[hidden] { display: none; }
 
@@ -108,6 +142,19 @@ body {
 }
 .srow .ct { font: 11px var(--mono); color: var(--dim); }
 .srow.on .ct { color: #fff; opacity: .8; }
+
+/* Two or more tabs on one session. Quiet, but present: it is the difference
+   between "the model switched on its own" and "the other tab is in here too". */
+.srow .eyes {
+  flex: 0 0 auto;
+  font: 10px var(--mono);
+  color: var(--dim);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+.srow.on .eyes { color: #fff; border-color: rgba(255, 255, 255, .5); }
+.srow .eyes[hidden] { display: none; }
 
 /* A live turn, so you can see which session is working while you read another. */
 .srow .dot {
@@ -287,6 +334,31 @@ main {
   overflow-wrap: anywhere;
 }
 
+/* The newest user message sticks to the top of the log while the turn runs,
+   so the streaming below it never buries what you asked. .msg is a direct
+   child of #log, the scroll container, so sticky works as-is; scrolling up
+   releases it, since sticky only holds while it would otherwise leave view. */
+.msg.user.pin {
+  position: sticky;
+  top: 0;
+  /* The wrapper is transparent by default: while pinned, the streaming below
+     would show through the side padding, the icon column, and the gap. The
+     band is --pin-background (from webui.pin in config.yaml, via /theme.css)
+     at --pin-transparency — opaque by default so nothing bleeds through.
+     color-mix thins only the band; the message text stays fully opaque. */
+  background: color-mix(in srgb, var(--pin-background, var(--bg))
+                        calc(var(--pin-transparency, 1) * 100%), transparent);
+  font-size: var(--pin-font-size, inherit);
+  color: var(--pin-font-color, inherit);
+}
+
+/* A /steering is a user message that landed mid-turn: the correction the model
+   re-plans around. Same shape as a question, marked so it reads as an
+   interruption rather than a new turn. */
+.msg.user.steering .body {
+  border-left: 3px solid var(--accent);
+}
+
 .msg.reasoning .body {
   color: var(--think);
   font-size: 13.5px;
@@ -420,6 +492,24 @@ main {
   color: var(--warn);
 }
 .roll .paths { color: var(--dim); }
+/* The compaction summary: what the fresh window carries. Open by default — the
+   user asked to see it — but collapsible, since it is the new prompt, not chat. */
+.roll .handoff { margin-top: 6px; }
+.roll .handoff summary {
+  cursor: pointer;
+  color: var(--fg);
+  font: 12px var(--sans);
+}
+.roll .handoff pre {
+  margin: 6px 0 0;
+  padding: 6px 10px;
+  background: var(--bg3);
+  border-radius: 5px;
+  font: 12px/1.5 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--fg);
+}
 .roll button {
   font: 12px var(--sans);
   margin: 6px 6px 0 0;

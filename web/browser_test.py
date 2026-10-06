@@ -34,6 +34,30 @@ CONFIG = ROOT / "config.yaml"
 results = []
 
 
+def scratch_config(cfg):
+    """Point a test core's state at temp directories. Takes and returns a dict.
+
+    These tests start real cores from a copy of the real config.yaml, and used
+    to override only the port — so every throwaway session they made registered
+    its id in the real logs/session_ID.log and never left. That file reached 52
+    rows for 8 live sessions, 44 of them fixtures from here (`gate`,
+    `never-spoken`, `reload-probe`, one set per run). Archives were aimed at the
+    real state/sessions too; nothing landed there only because these cores
+    never roll over. Deleting a session now purges by id, so leaving them
+    pointed at real state is a sharper edge than it was.
+    """
+    tmp = tempfile.mkdtemp(prefix="letsclaw-test-")
+    for sub in ("sessions", "live", "logs"):
+        Path(tmp, sub).mkdir()
+    cfg.setdefault("conversation", {})
+    cfg["conversation"]["sessions_dir"] = f"{tmp}/sessions"
+    cfg["conversation"]["live_dir"] = f"{tmp}/live"
+    cfg.setdefault("logging", {})
+    # log_dir() is the parent of logging.file, and session_ID.log sits beside it.
+    cfg["logging"]["file"] = f"{tmp}/logs/letclaw.log"
+    return cfg
+
+
 def check(name, ok, detail=""):
     results.append((name, ok, detail))
     print(f"{'ok   ' if ok else 'FAIL '} {name}" + (f"\n        {detail}" if detail and not ok else ""))
@@ -327,7 +351,9 @@ async def run(http):
       handle({t: 'notice', level: 'warn', text: 'past 90% of the window'});
       handle({t: 'rollover_start', reason: 'context at 91%'});
       handle({t: 'rollover_done', transcript: 'state/sessions/x.json',
-              handoff: 'state/memory_store/long_term.md', used: 300, budget: 1000});
+              handoff: 'state/memory_store/long_term.md',
+              handoff_text: 'OBJECTIVE ship it. OPEN write the tests',
+              used: 300, budget: 1000});
     })()""")
     check("busy rendered", "already running" in (await tab.js(
         "[...document.querySelectorAll('.slab.notice')].map(e=>e.textContent).join('|')")))
@@ -335,6 +361,14 @@ async def run(http):
     check("rollover_done shows both paths",
           "long_term.md" in (await tab.js(
               "[...document.querySelectorAll('.slab.roll')].map(e=>e.textContent).join('|')")))
+    # The compaction summary itself, not just where it was written: the user
+    # should be able to read what the fresh window carries.
+    check("rollover_done prints the handoff text",
+          "write the tests" in (await tab.js(
+              "[...document.querySelectorAll('.slab.roll .handoff pre')]"
+              ".map(e=>e.textContent).join('|')")))
+    check("handoff block is open by default",
+          (await tab.js("document.querySelector('.slab.roll .handoff').open")) is True)
     check("rollover_done draws a separator", await tab.js("!!document.querySelector('.sep')"))
     check("spinner not left spinning after rollover_done",
           not await tab.js("!!document.querySelector('.waiting')"))
@@ -592,11 +626,13 @@ async def run(http):
 
 async def run_token_gate(http):
     """Start a second, token-protected core and check the page asks for the token."""
-    cfg = re.sub(r"^(\s*)token:.*$", r'\1token: "s3cr3t"', CONFIG.read_text(),
-                 count=1, flags=re.M)
-    cfg = re.sub(r"^(\s*)port:.*$", r"\1port: 8771", cfg, count=1, flags=re.M)
+    # Via the dict, not a regex over the text: `token:` appears twice in
+    # config.yaml and the second one is the Discord bot's.
+    cfg = scratch_config(yaml.safe_load(CONFIG.read_text()))
+    cfg["core"]["token"] = "s3cr3t"
+    cfg["core"]["port"] = 8771
     tmp = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
-    tmp.write(cfg)
+    tmp.write(yaml.safe_dump(cfg))
     tmp.close()
     proc = subprocess.Popen([sys.executable, str(ROOT / "source" / "server.py"), "--config", tmp.name],
                             cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -658,12 +694,11 @@ async def run_persistence(http):
     the model actually answered proves it.
     """
     port, base = 8773, "http://127.0.0.1:8773"
-    live = tempfile.mkdtemp(prefix="letsclaw-live-")
-    cfg = re.sub(r"^(\s*)port:.*$", rf"\1port: {port}", CONFIG.read_text(),
-                 count=1, flags=re.M)
-    cfg = re.sub(r"^(\s*)live_dir:.*$", rf'\1live_dir: "{live}"', cfg, count=1, flags=re.M)
+    cfg = scratch_config(yaml.safe_load(CONFIG.read_text()))
+    cfg["core"]["port"] = port
+    live = cfg["conversation"]["live_dir"]
     tmp = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
-    tmp.write(cfg)
+    tmp.write(yaml.safe_dump(cfg))
     tmp.close()
 
     proc = None
@@ -803,10 +838,9 @@ async def run_reload(http):
     deliberately broken YAML, which must not be anywhere near the real one.
     """
     port, base = 8774, "http://127.0.0.1:8774"
-    live = tempfile.mkdtemp(prefix="letsclaw-reload-")
-    cfg = yaml.safe_load(CONFIG.read_text())
+    cfg = scratch_config(yaml.safe_load(CONFIG.read_text()))
     cfg.setdefault("core", {})["port"] = port
-    cfg.setdefault("conversation", {})["live_dir"] = live
+    live = cfg["conversation"]["live_dir"]
     cfg["conversation"]["rollover_at_percent"] = 90
     model = cfg["models"].get("default_model") or next(
         k for k in cfg["models"] if k != "default_model")
