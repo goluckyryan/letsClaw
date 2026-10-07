@@ -1,5 +1,23 @@
-openai>=1.30.0
-pyyaml>=6.0
-aiohttp>=3.9.0        # core service + WS clients
-tiktoken>=0.7.0
-discord.py>=2.4       # the Discord client only; the core never imports it
+# letsClaw — Python dependencies
+#
+# Install:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# The versions below are what the project runs on (Python 3.14). They are the
+# floor, not a hard cap — anything newer that keeps the same API works, but
+# these are the ones that are known to.
+
+# --- required for the core, the WebUI, and the terminal client ---------------
+aiohttp==3.14.3        # the WS/HTTP server (server.py) and every client
+openai==3.24.0         # llm_engine.py — the OpenAI-compatible chat API
+PyYAML==6.0.3          # config.yaml (imported as `yaml`)
+
+# --- optional ----------------------------------------------------------------
+# Token accounting. token_counter.py uses tiktoken (cl100k_base) when present
+# and falls back to a character estimate when it is not, so the core runs
+# without it — but the ⚡ token line is only as good as tiktoken makes it.
+tiktoken==0.14.0
+
+# The Discord bot (source/discord_client.py) only. The core never imports
+# discord.py and does not know the bot exists, so skip this if you do not run
+# a bot.
+discord.py==2.7.1

@@ -16,7 +16,8 @@ Behavior is plain MD files — everything visible, nothing hidden.
 ```bash
 cd ~/letsClaw
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt   # openai, pyyaml, aiohttp, tiktoken
+.venv/bin/pip install -r requirements.txt   # core: openai, PyYAML, aiohttp, tiktoken
+                                            # + optional discord.py (only for the bot)
 
 ./serve.sh                               # 1. the core — start this first, leave it running
 ./terminalUI.sh                          # 2. the terminal client, in another shell
