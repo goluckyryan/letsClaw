@@ -16,6 +16,7 @@ readable for `stop` and for the rollover answer while a turn is in flight.
 import argparse
 import asyncio
 import logging
+import socket
 import sys
 import weakref
 from pathlib import Path
@@ -401,6 +402,36 @@ def build_app(config, config_path=None):
     return app
 
 
+def _lan_ip():
+    """The LAN address of this machine, for telling a neighbour where the WebUI is.
+
+    The UDP trick: "connect" a UDP socket to a public address. No packet is
+    sent — the kernel just reports the source address it WOULD use, which is
+    the one on the default route. A machine with no route out (a lab core
+    with no internet) gets None and the banner falls back to the bind.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def _webui_host(bind):
+    """The host part of the WebUI banner line.
+
+    A bind on every interface (0.0.0.0 / ::) is not an address you can type
+    in, so it is printed as the LAN address instead. A bind on a specific IP
+    is already the address, and loopback stays as it is.
+    """
+    if bind in ("0.0.0.0", "::"):
+        return _lan_ip() or bind
+    return bind
+
+
 def main():
     ap = argparse.ArgumentParser(description="letsClaw core service")
     ap.add_argument("--bind"); ap.add_argument("--port", type=int)
@@ -419,7 +450,7 @@ def main():
     app = build_app(config, args.config)
     print(f"🧠 letsClaw core on ws://{bind}:{port}/ws  (proto {core.PROTOCOL_VERSION})")
     if (WEB_DIR / "index.html").exists():
-        print(f"   WebUI:  http://{bind}:{port}/")
+        print(f"   WebUI:  http://{_webui_host(bind)}:{port}/")
     print(f"   models: {', '.join(core.known_models(config)) or '(none)'}")
     if bind not in ("127.0.0.1", "localhost", "::1"):
         print("   ⚠️  not bound to loopback — tools are unconfined, so anyone who can "
