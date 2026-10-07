@@ -140,6 +140,8 @@ core:
 # Privileged Gateway Intents or every message arrives empty. Invite it with the
 # `bot` scope and the Send Messages + Read Message History permissions.
 # discord:
+#   enabled: true       # false = the bot stays off (serve.sh checks this before
+#                       # launching; run_discord.sh refuses to run while it is false)
 #   token: ""             # bot token — config.yaml is gitignored, so it stays put
 #   core: "ws://127.0.0.1:8770"   # default: built from core.bind/core.port above
 #   core_token: ""        # defaults to core.token; set only if the bot runs elsewhere

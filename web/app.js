@@ -1339,12 +1339,14 @@ $('#side-name').addEventListener('keydown', (e) => {
    what the core is actually running — no second copy of the schema to drift.
    Read-only except the webui section: a YAML round-trip of the whole file
    would delete every comment in it, and the restart-only keys (core.bind,
-   core.port, logging.file) would save fine and apply never, which is worse
-   than not offering them. */
+   core.port, logging.file, discord.enabled) would save fine and apply
+   never — the bot is a separate process, and only the next serve.sh
+   reads the flag — which is worse than not offering them. */
 
 const SET_ORDER = ['core', 'models', 'behavior', 'tools', 'conversation',
                    'memory', 'logging', 'webui', 'discord'];
-const SET_RESTART = new Set(['core.bind', 'core.port', 'logging.file']);
+const SET_RESTART = new Set(['core.bind', 'core.port', 'logging.file',
+                             'discord.enabled']);
 const SET_SECRETS = new Set(['token', 'api_key']);
 
 function deepEq(a, b) {

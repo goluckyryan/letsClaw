@@ -182,6 +182,11 @@ class Settings:
         blob = config.get("discord") or {}
         core_cfg = config.get("core") or {}
 
+        # Absent means enabled, so a config that never had the key is
+        # unaffected. serve.sh reads the same flag before launching; a bot
+        # started by hand (run_discord.sh) must refuse it too, or the flag
+        # would only half-work.
+        self.enabled = blob.get("enabled", True) is not False
         self.token = str(blob.get("token") or "").strip()
         self.core = self._core_url(blob.get("core"), core_cfg)
         # The bot loads the same config.yaml as the core, so the shared secret
@@ -287,6 +292,11 @@ class Settings:
 
     def check(self):
         """Fatal problems first, then the ones worth shouting about."""
+        if not self.enabled:
+            raise ValueError(
+                "discord.enabled is false — the bot is switched off in "
+                "config.yaml. Set it to true to run, or flip it back to "
+                "false when you are done so serve.sh leaves it off.")
         if not self.token:
             raise ValueError(
                 "discord.token is not set — create a bot at "

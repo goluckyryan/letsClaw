@@ -14,7 +14,7 @@ What it proves:
   1. GET/POST /config need the token; GET returns the live config dict.
   2. The panel renders every top-level section; webui is open and editable,
      the rest is read-only; secrets are masked behind a reveal; the
-     restart-only keys (core.bind, core.port) carry a badge.
+     restart-only keys (core.bind, core.port, discord.enabled) carry a badge.
   3. Saving webui rewrites only that block — every comment and every other
      section of the file survives — and re-themes the live tab without a
      page reload.
@@ -115,8 +115,12 @@ async def run(http):
 
         check("webui offers a theme select",
               await tab.until("!!document.querySelector('#set-body select')", 10))
+        r = await http.get(f"{CORE}/config", headers=auth)
+        live_theme = (await r.json())["config"]["webui"]["theme"]
+        check("the forced temp-copy theme is what the core serves",
+              live_theme == "auto", live_theme)
         check("theme select holds the live value",
-              await tab.js("document.querySelector('#set-body select').value") == "auto",
+              await tab.js("document.querySelector('#set-body select').value") == live_theme,
               await tab.js("document.querySelector('#set-body select').value"))
         check("webui offers the four pin inputs",
               await tab.js("document.querySelectorAll('#set-body .cfg-edit input').length") == 4,
@@ -140,14 +144,16 @@ async def run(http):
                               " })()", 10))
 
         # Restart-only keys are badged; the live ones are not.
-        await tab.js("(() => { const d = [...document.querySelectorAll('#set-body details')]"
-                     ".find(d => d.querySelector('summary').textContent.trim().startsWith('core'));"
-                     " d.open = true; })()")
-        check("core.bind and core.port carry the restart badge, core.token does not",
+        await tab.js("(() => { for (const name of ['core', 'discord']) {"
+                     " const d = [...document.querySelectorAll('#set-body details')]"
+                     "  .find(d => d.querySelector('summary').textContent.trim().startsWith(name));"
+                     "  d.open = true; } })()")
+        check("core.bind, core.port and discord.enabled carry the restart badge, core.token does not",
               await tab.until("(() => { const badged = [...document.querySelectorAll('#set-body .cfg-row')]"
                               ".filter(r => r.querySelector('.badge'))"
                               " .map(r => r.querySelector('.cfg-key').firstChild.textContent.trim());"
                               " return badged.includes('bind') && badged.includes('port')"
+                              " && badged.includes('enabled')"
                               " && !badged.includes('token');"
                               " })()", 10),
               await tab.js("[...document.querySelectorAll('#set-body .cfg-row')]"
@@ -250,6 +256,7 @@ async def main():
     text = _re.sub(r"(?m)^  sessions_dir: .*", f'  sessions_dir: "{tmp}/sessions"', text)
     text = _re.sub(r"(?m)^  live_dir: .*", f'  live_dir: "{tmp}/live"', text)
     text = _re.sub(r"(?m)^  file: .*", f'  file: "{tmp}/log"', text)
+    text = _re.sub(r"(?m)^  theme: \S+", "  theme: auto", text)
     cfg = yaml.safe_load(text)   # the patches must not have broken the file
     assert cfg["core"]["port"] == PORT and cfg["core"]["token"] == TOKEN
     assert len([l for l in text.splitlines() if "#" in l]) > 50

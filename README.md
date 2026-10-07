@@ -1090,9 +1090,12 @@ screenshot; both themes follow `prefers-color-scheme`.
 ## Discord Client
 
 A client like the other two, in its own process. `./serve.sh` starts it alongside
-the core whenever `discord.token` is set, so there is usually nothing separate to
-run; `./run_discord.sh` starts one on its own, for a bot on a different machine
-from its core, and `./serve.sh --no-discord` leaves it out.
+the core whenever `discord.enabled` is not false and `discord.token` is set, so
+there is usually nothing separate to run; `./run_discord.sh` starts one on its own,
+for a bot on a different machine from its core, and `./serve.sh --no-discord`
+leaves it out. `discord.enabled: false` is the off switch: the bot does not start
+and `./run_discord.sh` refuses to run while it is set — flip it back to `true`
+when you want the bot again.
 
 The core never imports `discord.py` and does not know it exists; the bot holds one
 WebSocket per active channel and translates between Discord messages and core
@@ -1203,6 +1206,6 @@ See `config.example.yaml` for full reference with comments.
 - `core` — The service itself: `bind` (loopback by default — see the security note above), `port` (the WebUI is on the same one), and `token`, an optional shared secret. `--bind` / `--port` / `--config` on `./serve.sh` override the first three.
 - `tools` — Agent tools: enable flag, allowlist, `max_iterations` (tool rounds per turn before a final answer is forced), `exec_timeout`, `max_output_chars`, and `workdir` — the base directory `exec` runs in and relative paths resolve against, defaulting to the letsClaw directory.
 - `conversation` — `max_history_messages`, a backstop that trims the oldest messages (never opening on an orphaned tool result) and only applies on turns where no rollover happened — rollover is the real mechanism, this just stops an unbounded session with rollover switched off. Then rollover policy: `rollover_at_percent` (0 disables), `rollover_mode` (`auto`/`ask`/`off`), `prompt_timeout` (seconds to wait for an answer in `ask` mode before keeping the session). Two directories: `live_dir` holds the running conversations and is reloaded at startup, `sessions_dir` holds archived transcripts and the journal segments beside them. Then the journal itself: `journal` (default true — the `.md` record of every round's reasoning and every untruncated tool result, which is what stops a rolled-over window repeating work; see [The journal](#the-journal)) and `journal_max_block_chars` (default 1,000,000, the cap on one recorded block). The context window itself is per model, under `models`.
-- `discord` — the Discord bot, and only ever read by it: `token` (the bot token), `core`/`core_token` (where the core is and its shared secret, both defaulting to the `core` section above), `users` — the **required** allowlist of snowflake IDs, empty meaning nobody — `mention_only` (`true`/`false`/`white`/`black`) with `mention_list`, `idle_detach_min`, `max_messages`/`max_lines` for how an answer is split, and `auto_names` (sessions named `<server>-<channel>`, renamed to follow Discord). Omit the whole section if you do not want a bot. See [Discord Client](#discord-client) for the security note that goes with it.
+- `discord` — the Discord bot, and only ever read by it: `enabled` (the off switch — `false` keeps the bot from starting and makes `./run_discord.sh` refuse to run; absent means enabled), `token` (the bot token), `core`/`core_token` (where the core is and its shared secret, both defaulting to the `core` section above), `users` — the **required** allowlist of snowflake IDs, empty meaning nobody — `mention_only` (`true`/`false`/`white`/`black`) with `mention_list`, `idle_detach_min`, `max_messages`/`max_lines` for how an answer is split, and `auto_names` (sessions named `<server>-<channel>`, renamed to follow Discord). Omit the whole section if you do not want a bot. See [Discord Client](#discord-client) for the security note that goes with it.
 - `memory` — `long_term_file`, where rollover handoffs accumulate
 - `logging` — `level` and `file`; the core logs there and to stderr, and every session event of consequence (restore, rename, delete, rollover, a dropped tool-call turn) is one line in it.

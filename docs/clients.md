@@ -43,7 +43,8 @@ immediately. **Vanilla JS, no build step, no dependencies** — edit and reload.
 A **Settings** panel (⚙️ at the bottom of the session sidebar, backed by
 `GET /config`) shows every parameter in `config.yaml`, grouped by section,
 with secrets masked behind a reveal toggle and the restart-only keys
-(`core.bind`, `core.port`, `logging.file`) badged. Only the `webui` section is
+(`core.bind`, `core.port`, `logging.file`, `discord.enabled`) badged.
+Only the `webui` section is
 editable — its Save button posts to `POST /config`, which rewrites just that
 block and reloads it live, so the rest of the file, comments included, is
 never touched by the browser.
