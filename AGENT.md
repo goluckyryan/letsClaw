@@ -58,7 +58,9 @@ To confirm a model, open a client and send a message.
 - Default `core.bind` is `127.0.0.1` (loopback) — reachable from this machine only.
 - The agent tools are **unconfined**: anyone who can reach the port gets a shell on
   this host. So if you change `bind` to anything non-loopback (e.g. `0.0.0.0` for a
-  LAN), you **must** set a `core.token` too. The core prints a warning on non-loopback.
+  LAN), you **must** set a `core.token` too. The core prints a warning on
+  non-loopback, and its banner line shows the LAN address to type into a browser
+  (e.g. `http://192.168.203.75:8770/`) instead of the untypeable `0.0.0.0`.
 - Across the internet, do not just open the port: put it behind a VPN or a TLS+auth
   reverse proxy.
 - `config.yaml` holds the bot token and is gitignored for exactly this reason.
