@@ -30,6 +30,9 @@ cp config.example.yaml config.yaml
 #                            (engines build lazily) but the first turn fails
 #      - models.default_model    which model a new session starts on
 #      - core.bind / core.port / core.token   see "Security" below
+#        (when a token is set: the WebUI asks for it in a gate, the terminal client
+#         takes --token / CLAW_TOKEN / the local config's own core.token, and the
+#         bot reads core.token from the config it loads)
 #      - discord.*               omit or set enabled:false if you have no bot
 
 # 3. Start the core. Leave it running.

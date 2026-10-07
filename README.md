@@ -904,7 +904,13 @@ It is clamped to 64 characters and falls back to the session name.
 When `core.token` is set every route above needs it — as `Authorization: Bearer <token>`
 or `?token=` — **except** `GET /health`, which stays open so a monitor can check
 liveness without holding the secret, and the WebUI itself, which holds no secrets and is
-the thing that asks for the token.
+the thing that asks for the token. Each client carries it its own way: the WebUI in the
+token gate (kept in the browser's `localStorage`), the Discord bot from `core.token` in
+the config it loads (or `discord.core_token` when it runs elsewhere), and the terminal
+client from `--token`, the `CLAW_TOKEN` env var, or — when it runs on the same machine
+as its core — the `core.token` in the local `config.yaml`, so a local attach needs no
+extra step. A terminal client pointed at a core whose token it cannot see is told exactly
+that, with the two ways to pass one.
 
 **Sessions** are created on demand by name — `terminal`, `discord-987654321098765432`,
 whatever a client asks for. Each has its own history, model and rollover state; `/model` in one
@@ -991,7 +997,9 @@ silent. Read-only commands (`/info`, `/behavior`, bare `/model` and `/models`) c
 `./terminalUI.sh` is a thin client: it renders events and sends `submit` / `command` /
 `rollover_reply` / `stop`, and holds no conversation state of its own. Two flags —
 `-s/--session` picks the session name (default `terminal`), `--url` points at a core
-somewhere other than the `core.bind`/`core.port` in the config.
+somewhere other than the `core.bind`/`core.port` in the config, and `--token` passes the
+shared secret when the core wants one (or set `CLAW_TOKEN`; a client on the same machine
+picks the token up from the local `config.yaml` on its own).
 
 | command | |
 |---|---|

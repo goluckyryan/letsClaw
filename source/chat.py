@@ -24,6 +24,7 @@ import asyncio
 import os
 import sys
 import threading
+from urllib.parse import quote
 
 try:
     import readline
@@ -365,13 +366,27 @@ def start_reader(loop, queue):
     threading.Thread(target=run, daemon=True, name="stdin").start()
 
 
-async def run_client(url, session_name, render):
+async def run_client(url, session_name, render, token=""):
     lines = asyncio.Queue()
     loop = asyncio.get_running_loop()
+    query = f"session={quote(session_name)}"
+    if token:
+        query += f"&token={quote(token)}"
 
     async with aiohttp.ClientSession() as http:
         try:
-            ws = await http.ws_connect(f"{url}/ws?session={session_name}", heartbeat=20)
+            ws = await http.ws_connect(f"{url}/ws?{query}", heartbeat=20)
+        except aiohttp.WSServerHandshakeError as e:
+            if e.status == 401:
+                print("❌ The core refused the connection: core.token is set and no\n"
+                      "   matching one was offered. Pass it with\n"
+                      "     ./terminalUI.sh --token <secret>\n"
+                      "   or  CLAW_TOKEN=<secret> ./terminalUI.sh\n"
+                      "   (a core on this machine: its token in config.yaml is\n"
+                      "   picked up automatically)")
+            else:
+                print(f"❌ The core refused the handshake ({e.status}).")
+            return 1
         except aiohttp.ClientError as e:
             print(f"❌ Cannot reach the core at {url} ({e}).")
             print("   Start it first:  ./serve.sh")
@@ -486,6 +501,8 @@ def main():
     ap = argparse.ArgumentParser(description="letsClaw terminal client")
     ap.add_argument("--session", "-s", default="terminal", help="session name to attach to")
     ap.add_argument("--url", help="core URL (default from config: core.bind/core.port)")
+    ap.add_argument("--token", "-t",
+                     help="the core.token shared secret (default: the CLAW_TOKEN env var, else core.token in the local config.yaml)")
     args = ap.parse_args()
 
     try:
@@ -496,6 +513,11 @@ def main():
     core_cfg = config.get("core", {})
     host = core_cfg.get("bind", "127.0.0.1")
     url = args.url or f"http://{host}:{int(core_cfg.get('port', 8770))}"
+    # Same precedence the Discord bot uses: an explicit secret wins, then
+    # the environment, then the core.token of the config this client just
+    # read — a client on the same machine as its core needs no extra step.
+    token = args.token or os.environ.get("CLAW_TOKEN") \
+        or str(core_cfg.get("token") or "").strip()
 
     install_completer(known_models(config))
     render = Renderer()
@@ -509,7 +531,7 @@ def main():
 
     code = 0
     try:
-        code = asyncio.run(run_client(url, args.session, render))
+        code = asyncio.run(run_client(url, args.session, render, token))
     except KeyboardInterrupt:
         pass
     finally:
