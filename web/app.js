@@ -284,14 +284,23 @@ function stampThinking() {
   }
 }
 
-function atBottom() {
-  return log.scrollHeight - log.scrollTop - log.clientHeight < 80;
-}
+/* Auto-scroll is an *intent*, not a measurement. `follow` is true while the
+   user wants to ride the bottom; it flips only when they actually scroll —
+   up past FOLLOWS to read (off), back to the bottom (on). Content growth never
+   touches it, so a single update that grows the log more than the old 80px
+   atBottom() allowance (a tall question, a round ending mid-batch) can no
+   longer read "not at bottom" and freeze the follow for the rest of the
+   session. The listener is the only writer besides turn_start and the
+   clear/switch sites. */
+let follow = true;
+const FOLLOWS = 80;
+log.addEventListener('scroll', () => {
+  follow = log.scrollHeight - log.scrollTop - log.clientHeight < FOLLOWS;
+});
 
 function append(el) {
-  const stick = atBottom();
   log.insertBefore(el, waitEl);          // the spinner stays last
-  if (stick) log.scrollTop = log.scrollHeight;
+  if (follow) log.scrollTop = log.scrollHeight;
   return el;
 }
 
@@ -367,12 +376,8 @@ function stream(el, delta) {
   el._pending = true;
   setTimeout(() => {
     el._pending = false;
-    // Before the repaint, not after: the rendered block can grow the log by
-    // more than the 80px atBottom allowance in a single frame, and a stick
-    // measured on the grown height would read false and never follow.
-    const stick = atBottom();
     el.innerHTML = renderMd(el._raw);
-    if (stick) log.scrollTop = log.scrollHeight;
+    if (follow) log.scrollTop = log.scrollHeight;
   }, 60);
 }
 
@@ -380,6 +385,10 @@ function flushStream(el) {
   if (!el) return;
   el._pending = false;
   el.innerHTML = renderMd(el._raw || '');
+  // A round can end mid-batch: the last chunk is still in the 60ms buffer, so
+  // this re-render grows the log with no stream tick to re-pin. Do it here, or
+  // the next turn_start reads the view as "scrolled up" and never follows.
+  if (follow) log.scrollTop = log.scrollHeight;
   // Models routinely emit a bare "\n\n" before calling a tool. Rendered, that is an
   // avatar next to nothing; drop the whole message rather than leave a stray 🐱.
   if (!(el._raw || '').trim()) el.closest('.msg').remove();
@@ -402,7 +411,7 @@ function setWaiting(label) {
   };
   tick();
   waitTimer = setInterval(tick, 100);
-  if (atBottom()) log.scrollTop = log.scrollHeight;
+  if (follow) log.scrollTop = log.scrollHeight;
 }
 
 function clearWaiting() {
@@ -585,6 +594,7 @@ function switchSession(name) {
   S.histIdx = -1;
   clearWaiting();
   log.innerHTML = '';
+  follow = true;               // a fresh session starts at the bottom, following
   history.replaceState(null, '', `?session=${encodeURIComponent(name)}`);
   refreshSessions();          // move the highlight now, don't wait for the poll
   connect();
@@ -619,11 +629,11 @@ function handle(e) {
     S.turn = { textEl: null, reasonEl: null, tools: new Map() };
     think = newThink();
     setBusy(true);
-    // The text goes in *before* append, not after: append reads scrollHeight to
-    // pin the view to the bottom, and a question that grows after that write
-    // leaves the log high above it. 227px > the 80px atBottom threshold, so
-    // every later event reads stick=false — the whole turn, and every round
-    // after it, streams with the view frozen until you scroll down by hand.
+    // Asking is the intent to follow, whatever the view was doing: re-assert it
+    // before the question lands. This is also what broke the old cascade — a
+    // view left mid-log by a previous round now resumes the moment the user
+    // asks again.
+    follow = true;
     pinUser(msg('user', '👤', esc(e.text)));
     setWaiting('thinking');
     return;
@@ -636,12 +646,8 @@ function handle(e) {
     if (!S.showReasoning) return;
     if (!S.turn) S.turn = { textEl: null, reasonEl: null, tools: new Map() };
     if (!S.turn.reasonEl) S.turn.reasonEl = msg('reasoning', '🧠').querySelector('.body');
-    // Read stickiness *before* the delta grows the block: measured after, a
-    // big chunk puts the gap past 80px and this line — and every one after —
-    // never scrolls, freezing the view for the rest of the turn.
-    const stick = atBottom();
     S.turn.reasonEl.textContent += e.delta;
-    if (stick) log.scrollTop = log.scrollHeight;
+    if (follow) log.scrollTop = log.scrollHeight;
     return;
 
   // The core's own count, pushed a few times a second while it thinks. It
@@ -768,12 +774,14 @@ function handle(e) {
     if (e.what === 'cleared') {
       clearWaiting();
       log.innerHTML = '';
+      follow = true;
       notice('🧹 History cleared (/rollover archives it instead).');
       if (e.record) notice(`📓 what was said is still in ${e.record}`);
       freshGauge(e);
     } else if (e.what === 'wiped') {
       clearWaiting();
       log.innerHTML = '';
+      follow = true;
       notice(`🔥 Everything wiped — conversation and ${e.files || 0} archive file(s).`);
       freshGauge(e);
     } else if (e.what === 'model') {
@@ -814,6 +822,7 @@ function handle(e) {
       // same name as soon as we say anything, so the name stays usable.
       clearWaiting();
       log.innerHTML = '';
+      follow = true;
       setGauge(0, S.budget, false);
       // Name the archives too. They are the half that used to survive a
       // delete, so saying nothing about them now reads as if they still do.
