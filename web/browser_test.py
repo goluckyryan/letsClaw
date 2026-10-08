@@ -624,6 +624,15 @@ async def run(http):
         f"document.querySelector('#side-list .srow.on')"
         f"  && document.querySelector('#side-list .srow.on').dataset.name === '{renamed}'", 30))
 
+    # --- auto-scroll: the round-end freeze -----------------------------------
+    # A round can end mid-batch: the last text chunk is still in the 60ms stream
+    # buffer when turn_end fires, and turn_end's flushStream re-renders it,
+    # growing the log with no stick-read. The old atBottom() then read "not at
+    # bottom" and the next turn_start never re-pinned — the follow stayed dead
+    # for the rest of the session. follow is an intent now, so a big growth can
+    # no longer break it; only a real scroll does.
+    t5 = await run_autoscroll(http, sess)
+
     # --- the token gate -------------------------------------------------------
     # Needs a core started with core.token set, so this section brings up its own
     # on a second port. Without it the whole auth branch is dead code in testing.
@@ -632,7 +641,8 @@ async def run(http):
     await run_reload(http)
 
     # --- console must be clean -----------------------------------------------
-    tabs = (("tab1", tab), ("tab2", tab2), ("tab3", tab3), ("gate tab", tab4))
+    tabs = (("tab1", tab), ("tab2", tab2), ("tab3", tab3), ("gate tab", tab4),
+             ("autoscroll", t5))
     for name, t in tabs:
         if not t:
             continue
@@ -1064,6 +1074,56 @@ async def gone(http, name, timeout=20):
         await asyncio.sleep(0.25)
     return False
 
+
+async def run_autoscroll(http, sess):
+    """Drive handle() through a round that ends mid-batch and check the follow
+    survives. A dedicated tab so the main flow's log is untouched; the events
+    are the same dicts core.py emits, no model in the loop. Steps are separate
+    evaluates with a settle between them: the scroll listener is a task, and
+    the 60ms stream batch is a timer, so one synchronous block would race both.
+    """
+    t = await open_tab(http, f"{CORE}/?session={sess}-autoscroll")
+    await t.until("document.querySelector('#status').textContent === 'connected'", 20)
+    R = "Here is a fairly long explanation so the rendered block has real height. " * 6
+    tall = "Please do the following in detail:\n" + "  step 1: a long instruction that wraps\n" * 8
+    await t.js(f"""(() => {{
+      const log = document.querySelector('#log');
+      log.innerHTML = '';
+      S.showReasoning = true;
+      window.__sent = [];
+      window.__realSend = S.ws.send.bind(S.ws);
+      S.ws.send = (m) => window.__sent.push(JSON.parse(m));
+      window.__gap = () => Math.max(0, log.scrollHeight - log.scrollTop - log.clientHeight);
+      const R = {json.dumps(R)};
+      handle({{t: 'turn_start', text: {json.dumps(tall)}}});
+      for (let i = 0; i < 8; i++) handle({{t: 'reasoning', delta: R}});
+      handle({{t: 'text', delta: R + R}});   // big chunk, 60ms batch still pending
+      handle({{t: 'turn_end'}});             // flushStream re-renders it, no stick-read
+      return true;
+    }})()""")
+    await asyncio.sleep(0.2)                # the pending 60ms batch repaints
+    check("a round ending mid-batch does not freeze the follow",
+          (await t.js("window.__gap()")) < 80, str(await t.js("window.__gap()")))
+    await t.js("handle({t: 'turn_start', text: 'next question'})")
+    await asyncio.sleep(0.1)
+    check("the next turn follows after a mid-batch round end",
+          (await t.js("window.__gap()")) < 80, str(await t.js("window.__gap()")))
+    await t.js("document.querySelector('#log').scrollTop = 0")
+    await asyncio.sleep(0.05)               # the scroll listener is a task
+    check("scrolling up stops the follow",
+          (await t.js("window.__gap()")) >= 80, str(await t.js("window.__gap()")))
+    await t.js(f"handle({{t: 'reasoning', delta: {json.dumps(R)}}})")
+    await asyncio.sleep(0.1)
+    check("streaming does not yank a scrolled-up user back",
+          (await t.js("window.__gap()")) >= 80, str(await t.js("window.__gap()")))
+    await t.js("document.querySelector('#log').scrollTop = document.querySelector('#log').scrollHeight")
+    await asyncio.sleep(0.05)
+    await t.js(f"handle({{t: 'reasoning', delta: {json.dumps(R)}}})")
+    await asyncio.sleep(0.1)
+    check("scrolling back down resumes the follow",
+          (await t.js("window.__gap()")) < 80, str(await t.js("window.__gap()")))
+    await t.js("S.ws.send = window.__realSend")
+    return t
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))
