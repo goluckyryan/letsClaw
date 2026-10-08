@@ -344,6 +344,9 @@ function stream(el, delta) {
   el._pending = true;
   setTimeout(() => {
     el._pending = false;
+    // Before the repaint, not after: the rendered block can grow the log by
+    // more than the 80px atBottom allowance in a single frame, and a stick
+    // measured on the grown height would read false and never follow.
     const stick = atBottom();
     el.innerHTML = renderMd(el._raw);
     if (stick) log.scrollTop = log.scrollHeight;
@@ -593,7 +596,12 @@ function handle(e) {
     S.turn = { textEl: null, reasonEl: null, tools: new Map() };
     think = newThink();
     setBusy(true);
-    msg('user', '👤').querySelector('.body').textContent = e.text;
+    // The text goes in *before* append, not after: append reads scrollHeight to
+    // pin the view to the bottom, and a question that grows after that write
+    // leaves the log high above it. 227px > the 80px atBottom threshold, so
+    // every later event reads stick=false — the whole turn, and every round
+    // after it, streams with the view frozen until you scroll down by hand.
+    msg('user', '👤', esc(e.text));
     setWaiting('thinking');
     return;
 
@@ -605,8 +613,12 @@ function handle(e) {
     if (!S.showReasoning) return;
     if (!S.turn) S.turn = { textEl: null, reasonEl: null, tools: new Map() };
     if (!S.turn.reasonEl) S.turn.reasonEl = msg('reasoning', '🧠').querySelector('.body');
+    // Read stickiness *before* the delta grows the block: measured after, a
+    // big chunk puts the gap past 80px and this line — and every one after —
+    // never scrolls, freezing the view for the rest of the turn.
+    const stick = atBottom();
     S.turn.reasonEl.textContent += e.delta;
-    if (atBottom()) log.scrollTop = log.scrollHeight;
+    if (stick) log.scrollTop = log.scrollHeight;
     return;
 
   // The core's own count, pushed a few times a second while it thinks. It
@@ -859,7 +871,7 @@ function replayHistory(messages) {
   const pending = new Map();
   for (const m of messages) {
     if (m.role === 'user') {
-      msg('user', '👤').querySelector('.body').textContent = m.content || '';
+      msg('user', '👤', esc(m.content || ''));
     // 'assistant' here is the wire role the server stores, not a display name:
     // the chat template switches on that exact string. The bubble is .msg.llm.
     } else if (m.role === 'assistant' && m.tool_calls) {
