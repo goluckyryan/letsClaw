@@ -130,6 +130,23 @@ def config_theme(config):
     return t if t in ("auto", "dark", "light") else "auto"
 
 
+PIN_KEYS = ("background", "transparency", "font_size", "font_color")
+
+
+def config_pin(config):
+    """webui.pin: the style of the pinned prompt, as {key: value}.
+
+    Only the known keys survive, so a typo in config.yaml cannot reach the
+    page as a broken custom property. It rides the hello and reloaded events
+    in addition to the /theme.css stylesheet: a browser will not re-fetch a
+    stylesheet that is already loaded, so the event is the only way a change
+    reaches a tab that is already open — the one you are watching while you
+    test the transparency.
+    """
+    pin = (config.get("webui", {}) or {}).get("pin", {}) or {}
+    return {k: pin[k] for k in PIN_KEYS if k in pin}
+
+
 def load_config(path=None):
     """Read config.yaml. Raises rather than exiting — a service must not sys.exit."""
     path = Path(path or CONFIG_PATH)
@@ -592,6 +609,7 @@ class Session:
                   budget=self.budget,
                   busy=self.busy,
                   theme=config_theme(self.config),
+                  pin=config_pin(self.config),
                   messages=[m for m in self.history if m.get("role") != "system"],
                   rollover={"mode": self.rollover_mode, "percent": self.rollover_pct,
                             "count": self.rollover_count},
@@ -768,7 +786,7 @@ class Session:
                               f"this session keeps using it, but /model cannot return to it"))
         self.emit(ev("session_state", what="reloaded", model=self.model_name,
                      budget=self.budget, theme=config_theme(self.config),
-                     changed=blob["changed"]))
+                     pin=config_pin(self.config), changed=blob["changed"]))
 
     # ---- the journal -----------------------------------------------------
 

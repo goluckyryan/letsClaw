@@ -444,6 +444,26 @@ function applyTheme(t) {
   else delete root.dataset.theme;
 }
 
+/* The pin's style from the core, as inline custom properties on <html>.
+   The /theme.css <link> loads once and the browser will not re-fetch it when
+   the server's copy changes, so a tab that is already open keeps styling the
+   pin from the stylesheet it loaded — stale after a save. Inline properties
+   beat the :root rules in that stylesheet, so the event is the live path.
+   hello() applies it on attach; the reloaded handler applies it after a
+   save, which is why a change reaches the tab you are watching mid-turn. */
+function applyPin(pin) {
+  const root = document.documentElement.style;
+  if (!pin) return;
+  // Clear first: a key dropped from config.yaml must fall back to the
+  // stylesheet default, not the value the previous event left here.
+  for (const k of ['background', 'transparency', 'font-size', 'font-color'])
+    root.removeProperty(`--pin-${k}`);
+  for (const [k, v] of Object.entries(pin)) {
+    if (v === null || v === undefined) continue;
+    root.setProperty(`--pin-${k.replace('_', '-')}`, String(v));
+  }
+}
+
 function setHint(extra) {
   const ro = (S.tripPct ? `rollover at ${S.tripPct}%` : 'rollover off')
            + rolloverCount({ count: S.rollovers });
@@ -733,6 +753,7 @@ function handle(e) {
       S.model = e.model;
       S.budget = e.budget;
       if (e.theme) applyTheme(e.theme);
+      applyPin(e.pin);
       notice(`♻️ Config reloaded — ${e.model}, context budget ${e.budget} tok.`);
       loadModels().then(() => showModel(e.model)).catch(() => {});
       rpc('info', '', true)
@@ -806,6 +827,7 @@ function hello(e) {
   S.rollovers = (e.rollover && e.rollover.count) || 0;
   S.session = e.session;
   applyTheme(e.theme || 'auto');
+  applyPin(e.pin);
   document.title = `${e.session} · letsClaw`;
   // Empty means boot()'s /models fetch never landed. The core is plainly up now, or
   // this event would not be here, so refill the list before selecting in it.

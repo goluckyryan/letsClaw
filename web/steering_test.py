@@ -211,6 +211,9 @@ async def main():
     scratch_config(cfg)
     cfg.setdefault("core", {})
     cfg["core"]["port"] = PORT
+    # The scratch core must not inherit the real core.token: the test page never
+    # passes a token gate, and a 401 would read as "the page never connected".
+    cfg["core"]["token"] = ""
     tmp = Path(tempfile.mkdtemp(prefix="letsclaw-steering-"))
     tmpcfg = tmp / "config.yaml"
     tmpcfg.write_text(yaml.safe_dump(cfg))

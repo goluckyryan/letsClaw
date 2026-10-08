@@ -164,21 +164,18 @@ async def index(request):
                             headers={"Cache-Control": "no-cache"})
 
 
-THEME_PIN_KEYS = ("background", "transparency", "font_size", "font_color")
-"""webui.pin: the style of the pinned prompt. background is a CSS color,
-transparency 0-1 (1 = fully opaque), font_size a CSS length, font_color a CSS
-color. Anything else is dropped so a typo cannot produce broken CSS."""
-
-
 def _theme_css(config):
     """The pin's style as CSS custom properties, from config's webui.pin.
 
     Generated rather than served from a file: config.yaml is the one place a
-    setting lives, and /reload picks an edit up without a restart.
+    setting lives, and /reload picks an edit up without a restart. A tab that
+    is already open gets the same values over the hello/reloaded events
+    (applyPin in app.js), because a browser will not re-fetch this stylesheet
+    on its own.
     """
-    pin = (config.get("webui", {}) or {}).get("pin", {}) or {}
+    pin = core.config_pin(config)
     lines = ["/* generated from config.yaml — webui.pin; /reload re-themes */", ":root {"]
-    for key in THEME_PIN_KEYS:
+    for key in core.PIN_KEYS:
         if key in pin:
             # CSS custom properties are case-sensitive and do NOT treat _ as
             # - — --pin-font_size is a different name from --pin-font-size.

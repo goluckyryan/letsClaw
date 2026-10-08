@@ -198,6 +198,17 @@ async def run(http):
         async with http.get(f"{CORE}/theme.css") as r:
             check("theme.css serves the new pin", "--pin-transparency: 0.5" in await r.text())
 
+        # The pin's style must reach the ALREADY-OPEN tab, not just a fresh load:
+        # a browser will not re-fetch the /theme.css <link> when the server's copy
+        # changes, so the reloaded event is the live path (applyPin in app.js).
+        # Without it, a save only took effect after an F5 — the pin "sometimes"
+        # ignored the transparency while a turn was running.
+        check("the live tab's pin follows the saved transparency without a reload",
+              await tab.until("getComputedStyle(document.documentElement)"
+                              ".getPropertyValue('--pin-transparency').trim() === '0.5'", 10),
+              await tab.js("getComputedStyle(document.documentElement)"
+                           ".getPropertyValue('--pin-transparency').trim() || '(unset)'"))
+
         # The page re-themed itself over the reloaded event — and no page
         # reload happened, because the gate's token survived it (a reload would
         # have shown the gate again until boot re-read localStorage).
@@ -251,8 +262,12 @@ async def main():
     text = (ROOT / "config.yaml").read_text()
     import re as _re
     text = _re.sub(r"(?m)^  port: \d+", f"  port: {PORT}", text)
-    assert _re.search(r'(?m)^  token: ""', text)
-    text = _re.sub(r'(?m)^  token: ""', f'  token: "{TOKEN}"', text, count=1)
+    # Whatever the real core.token is ("" on a fresh clone, a real secret on a
+    # running box), the scratch core gets its own: the auth checks below expect
+    # TOKEN, and the panel's reveal is tested against it. count=1 hits the core
+    # section; the discord token further down is untouched.
+    assert _re.search(r"(?m)^  token: ", text)
+    text = _re.sub(r'(?m)^  token: .*$', f'  token: "{TOKEN}"', text, count=1)
     text = _re.sub(r"(?m)^  sessions_dir: .*", f'  sessions_dir: "{tmp}/sessions"', text)
     text = _re.sub(r"(?m)^  live_dir: .*", f'  live_dir: "{tmp}/live"', text)
     text = _re.sub(r"(?m)^  file: .*", f'  file: "{tmp}/log"', text)

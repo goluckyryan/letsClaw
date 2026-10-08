@@ -189,6 +189,26 @@ async def run(http):
     tab = await open_tab(http, f"{CORE}/?session={sess}")
 
     # --- connect -------------------------------------------------------------
+    # The main flow runs against the real core. When it has a core.token the
+    # page shows a gate instead of connecting, so pass it with the token from
+    # the config the core just read. (A fresh clone's token is "" and there is
+    # no gate; the dedicated gate section below still covers the tokened path
+    # on its own scratch core.)
+    real_token = str((yaml.safe_load(CONFIG.read_text()).get("core") or {})
+                     .get("token") or "").strip()
+    if real_token:
+        # boot() shows the gate only after its /models fetch, so poll for it
+        # instead of filling once on the shot: a fill that lands before the
+        # gate exists is dropped, and the page sits on it for life.
+        for _ in range(80):
+            if await tab.js("(() => { const g = document.querySelector('#gate');"
+                            " if (g && !g.hidden) {"
+                            "  const i = document.querySelector('#gate-token');"
+                            f" i.value = {json.dumps(real_token)};"
+                            "  document.querySelector('#gate-form').requestSubmit();"
+                            "  return true; } return false; })()"):
+                break
+            await asyncio.sleep(0.25)
     check("page connects to the core",
           await tab.until("document.querySelector('#status').textContent === 'connected'", 20),
           await tab.js("document.querySelector('#status').textContent"))
@@ -200,7 +220,7 @@ async def run(http):
     # The gate is `hidden`, but an author `display:` beats that — assert what the page
     # actually paints, not the attribute. Driving the DOM over CDP happily clicks
     # straight through an overlay, so only computed style catches this.
-    check("no token gate on a tokenless core",
+    check("no token gate covering the page (passed or absent)",
           await tab.js("getComputedStyle(document.querySelector('#gate')).display") == "none")
     check("nothing else is covering the composer", await tab.js(
         "(() => { const r = document.querySelector('#input').getBoundingClientRect();"
@@ -696,6 +716,9 @@ async def run_persistence(http):
     port, base = 8773, "http://127.0.0.1:8773"
     cfg = scratch_config(yaml.safe_load(CONFIG.read_text()))
     cfg["core"]["port"] = port
+    # Tokenless: the raw WS/HTTP probes below cannot carry one, and a 401
+    # would read as "the core never came up".
+    cfg["core"]["token"] = ""
     live = cfg["conversation"]["live_dir"]
     tmp = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
     tmp.write(yaml.safe_dump(cfg))
@@ -840,6 +863,7 @@ async def run_reload(http):
     port, base = 8774, "http://127.0.0.1:8774"
     cfg = scratch_config(yaml.safe_load(CONFIG.read_text()))
     cfg.setdefault("core", {})["port"] = port
+    cfg["core"]["token"] = ""  # the raw WS probes below cannot carry one
     live = cfg["conversation"]["live_dir"]
     cfg["conversation"]["rollover_at_percent"] = 90
     model = cfg["models"].get("default_model") or next(
