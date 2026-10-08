@@ -357,6 +357,16 @@ main {
   font-size: var(--pin-font-size, inherit);
   color: var(--pin-font-color, var(--pin-fg));
 }
+/* The bubble adopts the pin's palette, not the page's: .msg.user .body paints
+   var(--bg3), so with an inverted pin it would read as a light bubble on a
+   dark band. Same variables as the band, so a custom literal in config.yaml
+   colors both; opaque, so the text stays readable at any transparency. */
+.msg.user.pin .body {
+  background: var(--pin-background, var(--pin-bg));
+  color: var(--pin-font-color, var(--pin-fg));
+  border-color: color-mix(in srgb, var(--pin-font-color, var(--pin-fg)) 30%,
+                          var(--pin-background, var(--pin-bg)));
+}
 
 /* A /steering is a user message that landed mid-turn: the correction the model
    re-plans around. Same shape as a question, marked so it reads as an
