@@ -9,7 +9,8 @@ browser_test.py does. The model must be reachable:
 What it proves:
   1. /steering with no turn running is refused with a notice, nothing queued.
   2. /steering mid-turn interrupts the streaming round: the partial answer stays
-     on screen, the interjection renders as a (pinned) user message, the
+     on screen, the interjection renders as a user message pinned *in
+     addition to* the question (stacked under it, not replacing it), the
      model re-plans, and the turn ends cleanly with no error.
   3. The interjection is a real user message: a fresh attach replays it from
      the history, in order, exactly once.
@@ -122,10 +123,29 @@ async def run(http):
                            "document.querySelector('.msg.user.steering').textContent"))
         check("exactly one steering message (no double render)",
               await tab.until("document.querySelectorAll('.msg.user.steering').length === 1", 10))
-        check("steering message is pinned (newest user message)",
+        check("steering message is pinned",
               await tab.until(
                   "document.querySelector('.msg.user.steering') && "
                   "document.querySelector('.msg.user.steering').classList.contains('pin')", 10))
+        # An *additional* pin, not a moved one: the question stays pinned too,
+        # and the correction stacks under it (its top offset == the question's
+        # measured height, so the two bands do not overlap).
+        check("the question stays pinned under the steering",
+              await tab.until(
+                  "(() => { const pins = [...document.querySelectorAll('.msg.user.pin')];"
+                  " return pins.length === 2 && pins.some(e => e.classList.contains('steering'))"
+                  "   && pins.some(e => !e.classList.contains('steering')); })()", 10),
+              await tab.js("[...document.querySelectorAll('.msg.user.pin')]"
+                           ".map(e => e.classList.contains('steering')).join(',')"))
+        check("the pins stack, not overlap",
+              await tab.until(
+                  "(() => { const pins = [...document.querySelectorAll('.msg.user.pin')];"
+                  " if (pins.length !== 2) return false;"
+                  " const [a, b] = pins.map(e => e.getBoundingClientRect());"
+                  " return b.top >= a.bottom - 1; })()", 10),
+              await tab.js("(() => { const p = [...document.querySelectorAll('.msg.user.pin')]"
+                           ".map(e => e.getBoundingClientRect());"
+                           " return p.length === 2 ? Math.round(p[1].top - p[0].bottom) : 'n/a'; })()"))
         check("partial answer kept on screen (text block before the steering)",
               await tab.until(
                   "(() => { const steering = document.querySelector('.msg.user.steering');"

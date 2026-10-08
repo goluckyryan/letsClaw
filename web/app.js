@@ -306,19 +306,42 @@ function msg(kind, who, html) {
   const el = node(`msg ${kind}`);
   el.innerHTML = `<div class="who">${who}</div><div class="body"></div>`;
   if (html !== undefined) el.querySelector('.body').innerHTML = html;
-  if (kind === 'user') pinUser(el);
   return append(el);
 }
 
 /* The newest user message pins to the top of the log for the whole turn —
    without it, the reasoning and tool output streaming below would scroll it
-   off the top and you'd hunt up the log to re-read what you asked. One pin
-   at a time: the class moves to the next message. */
+   off the top and you'd hunt up the log to re-read what you asked. A
+   /steering correction pins *in addition*, stacked under the question, so
+   what you asked and what you corrected are both in view while the model
+   re-plans. pinUser is the primary pin: it clears the group and pins just
+   this one, which is what a fresh question wants. addPin keeps the existing
+   pins and appends this one, which is what a steering wants. */
 function pinUser(el) {
-  const old = log.querySelector('.msg.user.pin');
-  if (old && old !== el) old.classList.remove('pin');
+  for (const old of log.querySelectorAll('.msg.user.pin'))
+    if (old !== el) old.classList.remove('pin');
   el.classList.add('pin');
+  layoutPins();
 }
+
+function addPin(el) {
+  el.classList.add('pin');
+  layoutPins();
+}
+
+/* Stack the pinned prompts: the first holds at the top, each of the rest is
+   offset by the *measured* height of every pin above it. Measured, not
+   assumed, because a pin's height changes with the pane width — the question
+   re-wraps as the log narrows — so a ResizeObserver re-runs this whenever the
+   log's box changes (window resize, sidebar drag, sidebar toggle). */
+function layoutPins() {
+  let top = 0;
+  for (const p of log.querySelectorAll('.msg.user.pin')) {
+    p.style.top = top + 'px';
+    top += p.offsetHeight;
+  }
+}
+if (typeof ResizeObserver !== 'undefined') new ResizeObserver(layoutPins).observe(log);
 
 /* Two elements, not one: the outer div does the positioning that lines a slab up
    under the message bodies, the inner one is the visible box. .tool and .roll set
@@ -601,7 +624,7 @@ function handle(e) {
     // leaves the log high above it. 227px > the 80px atBottom threshold, so
     // every later event reads stick=false — the whole turn, and every round
     // after it, streams with the view frozen until you scroll down by hand.
-    msg('user', '👤', esc(e.text));
+    pinUser(msg('user', '👤', esc(e.text)));
     setWaiting('thinking');
     return;
 
@@ -674,7 +697,9 @@ function handle(e) {
     stampThinking();
     clearWaiting();
     if (S.turn) { flushStream(S.turn.textEl); S.turn.textEl = null; S.turn.reasonEl = null; }
-    msg('user', '📌', esc(e.text)).classList.add('steering');
+    const st = msg('user', '📌', esc(e.text));
+    st.classList.add('steering');
+    addPin(st);
     setWaiting('thinking');
     return;
   }
@@ -871,7 +896,7 @@ function replayHistory(messages) {
   const pending = new Map();
   for (const m of messages) {
     if (m.role === 'user') {
-      msg('user', '👤', esc(m.content || ''));
+      pinUser(msg('user', '👤', esc(m.content || '')));
     // 'assistant' here is the wire role the server stores, not a display name:
     // the chat template switches on that exact string. The bubble is .msg.llm.
     } else if (m.role === 'assistant' && m.tool_calls) {
