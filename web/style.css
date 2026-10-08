@@ -347,25 +347,24 @@ main {
 .msg.user.pin {
   position: sticky;
   top: 0;
-  /* The wrapper is transparent by default: while pinned, the streaming below
-     would show through the side padding, the icon column, and the gap. The
-     band is --pin-background (from webui.pin in config.yaml, via /theme.css)
-     at --pin-transparency — opaque by default so nothing bleeds through.
-     color-mix thins only the band; the message text stays fully opaque. */
-  background: color-mix(in srgb, var(--pin-background, var(--pin-bg))
+  /* The band is the page's own background (--pin-background, from webui.pin in
+     config.yaml, via /theme.css — var(--bg) by default), at --pin-transparency:
+     opaque by default so the streaming below never bleeds through the side
+     padding, the icon column, or the gap. The band follows the page; it is the
+     bubble that wears the inverted palette. */
+  background: color-mix(in srgb, var(--pin-background, var(--bg))
                         calc(var(--pin-transparency, 1) * 100%), transparent);
   font-size: var(--pin-font-size, inherit);
-  color: var(--pin-font-color, var(--pin-fg));
+  color: var(--pin-font-color, var(--fg));
 }
-/* The bubble adopts the pin's palette, not the page's: .msg.user .body paints
-   var(--bg3), so with an inverted pin it would read as a light bubble on a
-   dark band. Same variables as the band, so a custom literal in config.yaml
-   colors both; opaque, so the text stays readable at any transparency. */
+/* The bubble wears the inverted palette, not the page's: a dark bubble on a
+   light page, a light bubble on a dark one. Fixed to the --pin-bg/--pin-fg
+   pair (the page theme's inverse), so it stands out against the band either
+   way; opaque, so the text stays readable at any band transparency. */
 .msg.user.pin .body {
-  background: var(--pin-background, var(--pin-bg));
-  color: var(--pin-font-color, var(--pin-fg));
-  border-color: color-mix(in srgb, var(--pin-font-color, var(--pin-fg)) 30%,
-                          var(--pin-background, var(--pin-bg)));
+  background: var(--pin-bg);
+  color: var(--pin-fg);
+  border-color: color-mix(in srgb, var(--pin-fg) 30%, var(--pin-bg));
 }
 
 /* A /steering is a user message that landed mid-turn: the correction the model
