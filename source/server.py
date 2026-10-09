@@ -76,6 +76,7 @@ async def models(request):
     return web.json_response({
         "default": cfg.get("models", {}).get("default_model"),
         "configured": core.known_models(cfg),
+        "forwards": request.app["mgr"].forwards.status(),
     })
 
 
@@ -347,11 +348,19 @@ async def _on_startup(app):
         n = await app["mgr"].restore()
     except Exception:
         logger.exception("could not restore saved sessions — starting empty")
-        return
+        n = 0
     if n:
         logger.info("restored %d session(s) from disk", n)
         print(f"   restored {n} session(s)")
-        sys.stdout.flush()
+    # The core's ssh port-forwards: the keepalive that notices a dropped path
+    # and brings the forward back. A running loop exists here, which is why
+    # this is on_startup rather than SessionManager.__init__.
+    app["mgr"].forwards.start(
+        app["mgr"]._engine_ports,
+        app["config"].get("core", {}).get("ssh_health_sec"))
+    for name, st in app["mgr"].forwards.status().items():
+        print(f"   forward: {name} {st['local']} -> {st['remote']} (via {st['target']})")
+    sys.stdout.flush()
 
 
 async def _on_shutdown(app):

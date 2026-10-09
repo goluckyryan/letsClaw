@@ -32,6 +32,7 @@ import yaml
 import paths
 import session as store
 from llm_engine import ChatResult, LLMEngine, RoundInterrupted
+from ssh_forward import SSHForwardManager
 from token_counter import count_messages, count_text, count_tools
 
 logger = logging.getLogger("letclaw.core")
@@ -210,8 +211,11 @@ def known_models(config):
     return [k for k in config.get("models", {}) if k != "default_model"]
 
 
-def build_engine(config, model_name=None):
+def build_engine(config, model_name=None, forward=None):
     """Construct an engine for one configured model entry.
+
+    forward: an ssh_forward.SSHForward for this model, when the entry names
+    one — the engine is pointed at the forward's local port. None otherwise.
 
     Synchronous: nothing here does real I/O. The behavior file is read separately
     so the engine can be cached per model while behavior stays per session.
@@ -226,6 +230,11 @@ def build_engine(config, model_name=None):
     if not base_url:
         raise ValueError(f"Model '{name}' has no base_url — every entry must name "
                          "the server that serves it.")
+    # An ssh_forward model is reached through a forward the core owns: the
+    # config's port is a placeholder and the real local port is the forward's.
+    # forward is None here (sync builder); the async call sites pass it in.
+    if forward is not None:
+        base_url = forward.local_url(base_url)
     engine = LLMEngine(
         base_url=base_url, api_key=entry.get("api_key", ""),
         default_model=entry.get("provider_name", name),
@@ -267,13 +276,18 @@ def build_engine(config, model_name=None):
     return engine, name, entry
 
 
-def build_all_engines(config):
+def build_all_engines(config, forwards=None):
     """One engine per configured model, or raise.
 
-    This is the config validator. build_engine is synchronous and opens no
-    sockets, so building the lot is cheap — and building them is a far better
-    check than inspecting keys, because it is the same code path that will run
-    for real. Raises ValueError naming the offending model.
+    This is the config validator. Building them is a far better check than
+    inspecting keys, because it is the same code path that will run for real.
+    Synchronous and network-free: a model with an ssh_forward is pointed at the
+    forward's local port (a string swap — the port is assigned when the forward
+    object is built), but the forward is NOT brought up here. Spawning the ssh
+    is lazy: engine_for() ensures it on first real use, and the keepalive
+    revives it if the path drops. That keeps a reload cheap and hermetic — a
+    reload that only touches another model never reaches for the ssh path.
+    Raises ValueError naming the offending model.
     """
     models_cfg = config.get("models") or {}
     if not isinstance(models_cfg, dict):
@@ -284,7 +298,11 @@ def build_all_engines(config):
     default = models_cfg.get("default_model")
     if default and default not in names:
         raise ValueError(f"default_model '{default}' is not one of: {', '.join(names)}")
-    return {name: build_engine(config, name) for name in names}
+    out = {}
+    for name in names:
+        fwd = forwards.forward(name) if forwards is not None else None
+        out[name] = build_engine(config, name, forward=fwd)
+    return out
 
 
 def diff_config(old, new, prefix="", out=None, limit=40):
@@ -2041,6 +2059,11 @@ class SessionManager:
         self.sessions = {}
         self._engines = {}
         self._behaviors = {}
+        # ssh port-forwards the core owns (models with an ssh_forward entry).
+        # configure() is synchronous and spawns nothing; the keepalive loop
+        # starts from the server's on_startup, where a running loop exists.
+        self.forwards = SSHForwardManager()
+        self.forwards.configure(self.config)
         # Session ids in use, from logs/session_ID.log. None until first needed:
         # __init__ is synchronous and this is a file read.
         self._ids = None
@@ -2067,8 +2090,36 @@ class SessionManager:
         # otherwise each build an AsyncOpenAI and orphan one of them.
         async with self._engine_lock:
             if name not in self._engines:
-                self._engines[name] = build_engine(self.config, name)
+                # ensure() raises RuntimeError when the ssh path does not come
+                # up. Convert it to ValueError at this seam: every caller of
+                # engine_for (ws attach, /model, restore) already turns a
+                # ValueError into a clean error event, and a dead helios path
+                # must read as "model unusable right now", not a 500. The
+                # keepalive keeps retrying in the background; a retry of the
+                # same command picks the model up when the path is back.
+                try:
+                    fwd = await self.forwards.forward_for(name)
+                except RuntimeError as e:
+                    raise ValueError(
+                        f"model '{name}' is unreachable — {e} — the ssh path "
+                        "is down (jump host or far side); the keepalive is "
+                        "retrying, try again in a moment") from e
+                self._engines[name] = build_engine(self.config, name, forward=fwd)
             return self._engines[name]
+
+    def _engine_ports(self):
+        """The netlocs (host:port) every live engine points at.
+
+        The ssh keepalive uses this to know which removed forwards may go: a
+        forward is retired only when no engine — cached or session-held —
+        references its local port any more.
+        """
+        from urllib.parse import urlsplit
+        ports = {urlsplit(e.base_url).netloc for e, _, _ in self._engines.values()}
+        for sess in self.sessions.values():
+            if sess.engine:
+                ports.add(urlsplit(sess.engine.base_url).netloc)
+        return ports
 
     async def _new_session_id(self):
         """A session id that is not already in logs/session_ID.log.
@@ -2277,10 +2328,27 @@ class SessionManager:
         avoided) and logging.file. Everything else is live.
         """
         path = path or self.config_path
+        # Dictionaries, matching plan()'s return: the except block must be able
+        # to iterate them even when plan() never ran (the file failed to parse).
+        added, removed = {}, {}
         try:
             fresh = await asyncio.to_thread(load_config, path)
-            engines = build_all_engines(fresh)
-        except (OSError, ValueError, yaml.YAMLError) as e:
+            # Plan the forward diff and make the additions visible BEFORE the
+            # engine validation, so a new ssh_forward model's engine is built
+            # pointing at its (already port-assigned) forward. The validator
+            # does not spawn the ssh — that is lazy (first use / keepalive) —
+            # so a refused reload unstages the additions and the forward set is
+            # never half-changed.
+            added, removed = self.forwards.plan(fresh)
+            self.forwards.stage(added)
+            engines = build_all_engines(fresh, self.forwards)
+        except (OSError, ValueError, yaml.YAMLError, RuntimeError) as e:
+            # The validator did not start the staged forwards, but the keepalive
+            # may have brought one up in the meantime — close them so a refused
+            # reload leaves nothing running.
+            for fwd in added.values():
+                await fwd.close()
+            self.forwards.unstage(added)
             logger.warning("config reload refused: %s", e)
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -2376,6 +2444,21 @@ class SessionManager:
             else:
                 sess.apply_config(blob)
                 updated += 1
+
+        # Now that the engines and session blobs are the new ones, the removals
+        # are real. A removed forward whose port a live engine still points at
+        # (a session mid-turn on the old engine, or one that lost its model)
+        # stays up as a zombie: the keepalive retires it when the last engine
+        # on that port is gone. The rest are closed now — nothing points at
+        # them any more, and leaving them would leak the ssh child.
+        ports = self._engine_ports()
+        zombies = {n: f for n, f in removed.items()
+                   if f.status()["local"] in ports}
+        self.forwards.commit(removed)
+        self.forwards.set_zombies(zombies)
+        for name, fwd in removed.items():
+            if name not in zombies:
+                await fwd.close()
 
         # Only the ones nothing points at any more. A session mid-stream on an old
         # engine must keep it: closing the client under it would abort the read.
@@ -2690,3 +2773,4 @@ class SessionManager:
             await s.persist()
         for engine, _, _ in self._engines.values():
             await engine.close()
+        await self.forwards.close()

@@ -34,6 +34,22 @@ CONFIG = ROOT / "config.yaml"
 results = []
 
 
+_REAL_TOKEN = None
+
+
+def real_token():
+    """The real core's core.token, read once. '' on a fresh clone (no gate)."""
+    global _REAL_TOKEN
+    if _REAL_TOKEN is None:
+        _REAL_TOKEN = str((yaml.safe_load(CONFIG.read_text()).get("core") or {})
+                          .get("token") or "").strip()
+    return _REAL_TOKEN
+
+
+def _auth():
+    return {"Authorization": f"Bearer {real_token()}"} if real_token() else {}
+
+
 def scratch_config(cfg):
     """Point a test core's state at temp directories. Takes and returns a dict.
 
@@ -547,7 +563,7 @@ async def run(http):
       document.querySelector('#send').click();
     })()""")
     await tab3.until("document.querySelector('#stop').hidden === false", 20)
-    async with http.delete(f"{CORE}/sessions/{born}") as r:
+    async with http.delete(f"{CORE}/sessions/{born}", headers=_auth()) as r:
         body = await r.json()
     check("delete is refused while a turn is running",
           r.status == 409 and not body["ok"], f"{r.status} {body}")
@@ -564,20 +580,20 @@ async def run(http):
       document.querySelector('#send').click();
     })()""")
     await tab3.until("document.querySelector('#stop').hidden === false", 20)
-    async with http.post(f"{CORE}/sessions/{born}/rename", json={"to": f"{born}-x"}) as r:
+    async with http.post(f"{CORE}/sessions/{born}/rename", json={"to": f"{born}-x"}, headers=_auth()) as r:
         body = await r.json()
     check("rename is refused while a turn is running",
           r.status == 409 and not body["ok"], f"{r.status} {body}")
     await tab3.js("document.querySelector('#stop').click()")
     await asyncio.sleep(1)
 
-    async with http.post(f"{CORE}/sessions/nope-{born}/rename", json={"to": "x"}) as r:
+    async with http.post(f"{CORE}/sessions/nope-{born}/rename", json={"to": "x"}, headers=_auth()) as r:
         check("renaming a session that does not exist is a 404", r.status == 404)
-    async with http.post(f"{CORE}/sessions/{born}/rename", json={"to": "  "}) as r:
+    async with http.post(f"{CORE}/sessions/{born}/rename", json={"to": "  "}, headers=_auth()) as r:
         check("a blank name is refused", r.status == 400, str(r.status))
-    async with http.post(f"{CORE}/sessions/{born}/rename", json={"to": "a/b"}) as r:
+    async with http.post(f"{CORE}/sessions/{born}/rename", json={"to": "a/b"}, headers=_auth()) as r:
         check("a name with a slash is refused", r.status == 400, str(r.status))
-    async with http.post(f"{CORE}/sessions/{born}/rename", json={"to": sess}) as r:
+    async with http.post(f"{CORE}/sessions/{born}/rename", json={"to": sess}, headers=_auth()) as r:
         check("renaming onto an existing name is refused", r.status == 409, str(r.status))
     check("a refused rename changed nothing",
           born in [s["name"] for s in (await http_json(http, f"{CORE}/sessions"))["sessions"]])
@@ -1057,7 +1073,7 @@ async def run_reload(http):
 
 
 async def http_json(http, url):
-    async with http.get(url) as r:
+    async with http.get(url, headers=_auth()) as r:
         d = await r.json()
     d["by"] = {s["name"]: s["clients"] for s in d["sessions"]}
     d["msgs"] = {s["name"]: s["messages"] for s in d["sessions"]}
