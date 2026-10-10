@@ -31,6 +31,18 @@ logger = logging.getLogger("letclaw.server")
 # The browser assets stay at the repo root, beside the code rather than inside it.
 WEB_DIR = paths.REPO_ROOT / "web"
 
+# Where the agent puts pictures it wants shown. Not under web/: that directory is
+# the app's own source, served unauthenticated to anyone who loads the page, and
+# generated output does not belong in it. state/ is already gitignored.
+DEFAULT_FILES_DIR = "state/files"
+# Served by extension, so a mistyped path cannot turn this into a general
+# arbitrary-file-read route for anyone holding the token.
+IMAGE_TYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+    ".bmp": "image/bmp", ".ico": "image/x-icon", ".avif": "image/avif",
+}
+
 
 def _configure_logging(config):
     """config.yaml's logging: section was never wired up; a daemon needs it."""
@@ -190,6 +202,51 @@ async def theme(request):
     """The WebUI's configurable style. Unauthenticated like / — it holds no
     secrets, and the page that loads it is the thing that holds the token."""
     return _theme_css(request.app["config"])
+
+
+def files_root(config):
+    """The directory /files serves, as an absolute path."""
+    configured = (config.get("webui", {}) or {}).get("files_dir") or DEFAULT_FILES_DIR
+    return paths.resolve(configured).resolve()
+
+
+async def files(request):
+    """An image the agent produced, for the WebUI to show inline.
+
+    Authorised like everything else, but by query token rather than header: this
+    is fetched by the browser's own <img> loader, which cannot be given an
+    Authorization header. app.js appends core.token the same way the websocket
+    does.
+
+    Two independent guards on the path, because this is the one route that turns
+    model output into a filesystem read: the name is resolved and then required
+    to sit under the root, which defeats both ../ and a symlink pointing out of
+    it, and the extension must be an image. A model that writes a path into its
+    own answer cannot make either of those pass for /etc/shadow.
+    """
+    if not _authorised(request):
+        raise web.HTTPUnauthorized()
+    root = files_root(request.app["config"])
+    try:
+        target = (root / request.match_info["name"]).resolve()
+    except (OSError, ValueError):
+        raise web.HTTPNotFound()
+    # is_relative_to: the resolved path must still be inside the root.
+    if not target.is_relative_to(root) or not target.is_file():
+        raise web.HTTPNotFound()
+    ctype = IMAGE_TYPES.get(target.suffix.lower())
+    if not ctype:
+        raise web.HTTPNotFound()
+    return web.FileResponse(target, headers={
+        "Content-Type": ctype,
+        # An SVG opened in its own tab is a document and could carry script; in
+        # an <img> it cannot. Both are covered: deny it every resource and stop
+        # the browser second-guessing the type we just declared.
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+        "X-Content-Type-Options": "nosniff",
+        # The agent overwrites a plot under the same name all the time.
+        "Cache-Control": "no-cache",
+    })
 
 
 async def _no_cache_static(request, response):
@@ -396,6 +453,7 @@ def build_app(config, config_path=None):
         web.get("/config", config_get),
         web.post("/config", config_save),
         web.get("/theme.css", theme),
+        web.get("/files/{name:.*}", files),
         web.get("/ws", ws_handler),
     ])
     if (WEB_DIR / "index.html").exists():

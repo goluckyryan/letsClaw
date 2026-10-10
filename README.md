@@ -1091,6 +1091,17 @@ If `core.token` is set the page asks for it before connecting. The page itself i
 served unauthenticated on purpose: it holds no secrets, and it is the thing that
 asks for the token.
 
+**Pictures.** The agent can show you an image it made. Anything written into
+`state/files/` (or `webui.files_dir`) is served at `/files/<name>`, and an answer
+containing `![a plot](run42.png)` renders it inline — click to see it full size.
+Only a flat filename with an image extension is accepted: a remote URL, a `data:`
+URL, a subdirectory, a traversal and a symlink pointing out of the root are all
+refused, by the renderer and again by the route, because this is the one path that
+turns model output into a filesystem read. A src that is refused is shown as its
+own literal text rather than quietly dropped, and a file that is not there becomes
+a visible note instead of a broken-image icon. There is no upload: pictures go
+agent → you, not the other way.
+
 **Maths.** `$…$` and `\(…\)` render inline, `$$…$$` and `\[…\]` as a centred block,
 via KaTeX. Formulas are lifted out before the markdown pass, so `*` and `_` in an
 exponent stay maths instead of turning into emphasis, and `$` inside a code span or a
@@ -1100,9 +1111,13 @@ rather than taking the message down, and if KaTeX fails to load the page falls b
 showing the TeX source in a code span.
 
 **Tests.** `node web/test_md.mjs` exercises the markdown renderer headlessly;
-`node web/test_math.mjs` does the same against the real vendored KaTeX, and
+`node web/test_math.mjs` does the same against the real vendored KaTeX,
 `.venv/bin/python web/math_test.py` checks the rendered maths in a real browser
-(fonts, metrics, colour, overflow) without sending a turn.
+(fonts, metrics, colour, overflow) without sending a turn,
+`.venv/bin/python web/files_test.py` covers the `/files` route's confinement with
+no core or browser at all, and `.venv/bin/python web/image_test.py` checks that an
+image actually decodes, paints, stays inside its column and does not break the
+auto-scroll.
 `.venv/bin/python web/browser_test.py` drives real headless Chrome over the DevTools
 Protocol against a running core — no Selenium, no Playwright, nothing to install —
 and asserts against the live DOM, so a JS error that stops the render fails a check

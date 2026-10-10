@@ -92,7 +92,17 @@ Chrome on the box.
 node web/test_md.mjs                        # renderer as a pure function (no KaTeX)
 node web/test_math.mjs                      # same, with the real vendored KaTeX
 .venv/bin/python web/math_test.py           # maths in a real browser; sends no turn
+.venv/bin/python web/files_test.py          # the /files route; no core, no browser
+.venv/bin/python web/image_test.py          # images in a real browser; sends no turn
 ```
+
+## Showing the user a picture
+
+Write the file into `state/files/` (or whatever `webui.files_dir` says), then put
+`![a short caption](thatfile.png)` in the answer — the WebUI fetches it from
+`/files/` and renders it inline. Only a **flat filename with an image extension**
+works: no subdirectory, no URL, no `data:`. The terminal and Discord clients show
+the Markdown as text, so say where the file is in words too if it matters.
 
 `web/*_test.py` are tracked in git; `tests/` is gitignored (a local suite).
 

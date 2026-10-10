@@ -93,11 +93,56 @@ function esc(s) {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+/* ![alt](src) -> <img>, but only for an image this core is serving.
+ *
+ * The src is model output, so it is not a URL we trust: a remote one would let
+ * an answer beacon to a third party (and leak the fact, and the timing, of what
+ * is on screen) just by being rendered. So nothing is accepted but a path under
+ * this core's own /files route -- `![plot](/files/run42.png)`, or the bare
+ * `![plot](run42.png)` the model will write half the time anyway.
+ *
+ * The name is then restricted to a flat filename: no slashes, no `..`, no
+ * scheme, no `//host`. The server checks all of this again and more; this is
+ * the half that stops a bad src ever reaching the DOM.
+ */
+const IMG_OK = /^[\w.-]+\.(?:png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
+
+function imgTag(alt, src) {
+  // inlineMd runs on text esc() has already been over, so '&' here is already
+  // '&amp;'. Escaping again would show '&amp;amp;' in the alt -- the entities
+  // are decoded back out for the src, and left as they are for the attributes,
+  // which are HTML and want the escaped form.
+  const raw = String(src).trim()
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/^\/files\//, '');
+  if (!IMG_OK.test(raw)) return null;
+  // The token rides in the query because an <img> cannot carry a header.
+  const url = `/files/${encodeURIComponent(raw)}` +
+              (S.token ? `?token=${encodeURIComponent(S.token)}` : '');
+  // loading=lazy: a long transcript of plots should not fetch them all on
+  // attach. The alt doubles as the caption when the file is missing.
+  return `<img class="md-img" src="${url.replace(/"/g, '&quot;')}" alt="${alt}" ` +
+         `loading="lazy" title="${alt || raw.replace(/"/g, '&quot;')}">`;
+}
+
 function inlineMd(s) {
   // Code spans come out first so emphasis can't reach inside them.
   const spans = [];
   s = s.replace(/`([^`]+)`/g, (_, c) => `\u0001${spans.push(c) - 1}\u0001`);
   s = s
+    // Images before links: the syntax differs by one leading '!', and the link
+    // rule would otherwise match the bracket half and leave a stray '!'.
+    // A src we refuse falls through to its own literal text rather than
+    // silently vanishing -- the path is usually the useful part of the message.
+    // A src we refuse is parked in the code-span array as plain text, not left
+    // in the stream: the link rule below would otherwise match what remains of
+    // it and turn `![x](http://evil/a.png)` into a live outbound link, which is
+    // the exact thing imgTag just declined to make.
+    .replace(/!\[([^\]]*)\]\(([^\s)]+)\)/g, (m, alt, src) => {
+      const tag = imgTag(alt, src);
+      return tag !== null ? tag : `\u0001${spans.push(m) - 1}\u0001`;
+    })
     .replace(/\[([^\]]+)\]\(((?:https?:\/\/|mailto:)[^\s)]+)\)/g,
              '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
@@ -362,6 +407,25 @@ log.addEventListener('scroll', () => {
   follow = log.scrollHeight - log.scrollTop - log.clientHeight < FOLLOWS;
 });
 
+/* An image settles its height only once it has decoded, which is always after
+   the append that placed it scrolled the log. Without this the bottom of the
+   view lands mid-plot and stays there. Capture phase, because `load` from an
+   <img> does not bubble. A broken one is swapped for its alt text so a missing
+   file reads as a missing file rather than a silent gap. */
+log.addEventListener('load', (e) => {
+  if (e.target.tagName === 'IMG' && follow) log.scrollTop = log.scrollHeight;
+}, true);
+log.addEventListener('error', (e) => {
+  const img = e.target;
+  if (img.tagName !== 'IMG' || img.dataset.failed) return;
+  img.dataset.failed = '1';
+  const miss = document.createElement('span');
+  miss.className = 'md-img-missing';
+  miss.textContent = `🖼 ${img.getAttribute('alt') || 'image'} — not found`;
+  miss.title = img.getAttribute('src') || '';
+  img.replaceWith(miss);
+}, true);
+
 function append(el) {
   log.insertBefore(el, waitEl);          // the spinner stays last
   if (follow) log.scrollTop = log.scrollHeight;
@@ -485,11 +549,35 @@ function clearWaiting() {
 
 log.addEventListener('click', (e) => {
   const btn = e.target.closest('.copy');
-  if (!btn) return;
-  navigator.clipboard.writeText(btn.parentElement.querySelector('code').textContent);
-  btn.textContent = '✓';
-  setTimeout(() => { btn.textContent = '⧉'; }, 1200);
+  if (btn) {
+    navigator.clipboard.writeText(btn.parentElement.querySelector('code').textContent);
+    btn.textContent = '✓';
+    setTimeout(() => { btn.textContent = '⧉'; }, 1200);
+    return;
+  }
+  // A plot in a chat column is small. Clicking it opens it full size over the
+  // page -- cheaper than a new tab, which would have to carry the token in a
+  // URL the user can see and paste somewhere it does not belong.
+  const img = e.target.closest('img.md-img');
+  if (img) showLightbox(img.getAttribute('src'), img.getAttribute('alt'));
 });
+
+/* Full-size view of one image. Built on demand and thrown away on close: it
+   holds a token-bearing URL, and nothing in the DOM should keep that around
+   after it has been looked at. */
+function showLightbox(src, alt) {
+  const box = document.createElement('div');
+  box.className = 'lightbox';
+  const big = document.createElement('img');
+  big.src = src;
+  big.alt = alt || '';
+  box.appendChild(big);
+  const close = () => { box.remove(); document.removeEventListener('keydown', onKey); };
+  const onKey = (ev) => { if (ev.key === 'Escape') close(); };
+  box.addEventListener('click', close);
+  document.addEventListener('keydown', onKey);
+  document.body.appendChild(box);
+}
 
 /* ---------------------------------------------------------------- the header */
 

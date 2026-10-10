@@ -10,7 +10,8 @@ const src = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
 const start = src.indexOf('function esc(s)');
 const end = src.indexOf('/* ------------------------------------------------------------------- the log */');
 if (start < 0 || end < 0) throw new Error('could not find the markdown section');
-const { esc, renderMd } = new Function(src.slice(start, end) + '\nreturn {esc, renderMd};')();
+const S = { token: '' };   // app.js's state object; imgTag reads S.token
+const { esc, renderMd } = new Function('S', src.slice(start, end) + '\nreturn {esc, renderMd};')(S);
 
 let failed = 0;
 const check = (name, got, want) => {
@@ -78,6 +79,55 @@ for (let i = 0; i <= answer.length; i++) {
   catch (e) { failed++; console.log(`FAIL  prefix ${i} threw: ${e}`); break; }
 }
 console.log(`ok    all ${answer.length + 1} streaming prefixes render`);
+
+// --- images -----------------------------------------------------------------
+// ![alt](name.png) becomes an <img> pointed at this core's own /files route,
+// and nothing else is allowed to become one at all.
+check('local image renders', renderMd('![plot](run42.png)'), '<img class="md-img"');
+check('image src goes to /files', renderMd('![plot](run42.png)'), 'src="/files/run42.png"');
+check('alt preserved', renderMd('![the plot](a.png)'), 'alt="the plot"');
+check('/files prefix accepted', renderMd('![p](/files/a.png)'), 'src="/files/a.png"');
+check('image is lazy', renderMd('![p](a.png)'), 'loading="lazy"');
+check('jpg ok', renderMd('![p](a.jpg)'), '<img');
+check('svg ok', renderMd('![p](a.svg)'), '<img');
+
+// Everything below must NOT become an image, and must not become a link either.
+reject('remote http image refused', renderMd('![x](http://evil.com/a.png)'), /<img/);
+reject('remote image is not a link either', renderMd('![x](http://evil.com/a.png)'), /<a /);
+reject('protocol-relative refused', renderMd('![x](//evil.com/a.png)'), /<img/);
+reject('https remote refused', renderMd('![x](https://evil.com/a.png)'), /<img/);
+reject('path traversal refused', renderMd('![x](../../etc/passwd)'), /<img/);
+reject('subdirectory refused', renderMd('![x](sub/a.png)'), /<img/);
+reject('data url refused', renderMd('![x](data:image/png;base64,AAAA)'), /<img/);
+reject('javascript url refused', renderMd('![x](javascript:alert(1))'), /<img/);
+reject('non-image extension refused', renderMd('![x](passwd.txt)'), /<img/);
+reject('no extension refused', renderMd('![x](passwd)'), /<img/);
+check('a refused image keeps its text', renderMd('![x](http://evil.com/a.png)'),
+      '![x](http://evil.com/a.png)');
+
+// Attribute injection through the src or the alt.
+reject('quote in src cannot escape the attribute',
+       renderMd('![p](a.png" onerror="alert(1))'), /onerror="alert/);
+reject('quote in alt cannot escape the attribute',
+       renderMd('![" onerror="alert(1)](a.png)'), /onerror="alert/);
+check('ampersand in alt escaped once', renderMd('![a & b](p.png)'), 'alt="a &amp; b"');
+reject('alt is not double-escaped', renderMd('![a & b](p.png)'), /&amp;amp;/);
+
+// An image is still markdown: the surrounding syntax must survive, and the
+// image syntax must not fire where it is not meant to.
+check('image beside bold', renderMd('**hot** ![p](a.png)'), '<strong>hot</strong>');
+reject('image syntax in a code span is inert', renderMd('use `![p](a.png)` here'), /<img/);
+reject('image syntax in a fence is inert',
+       renderMd('```md\n![p](a.png)\n```'), /<img/);
+check('plain link still works beside images',
+      renderMd('[docs](https://example.com) and ![p](a.png)'), '<a href="https://example.com"');
+reject('a bare link is not an image', renderMd('[p](a.png)'), /<img/);
+
+// The token rides in the query, because an <img> cannot carry a header.
+S.token = 'sekrit';
+check('token appended to the src', renderMd('![p](a.png)'), 'src="/files/a.png?token=sekrit"');
+S.token = '';
+reject('no token, no query', renderMd('![p](a.png)'), /\?token=/);
 
 // --- math -------------------------------------------------------------------
 // No KaTeX in this harness (no window, no script tag), so renderMath takes its

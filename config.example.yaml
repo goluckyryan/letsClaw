@@ -230,6 +230,13 @@ logging:
 # of the log while a turn runs). Served to the page as /theme.css; /reload
 # re-themes it with no restart. Omit any key to keep the built-in default.
 webui:
+  # Where the agent's pictures come from. An answer that writes
+  # ![a plot](run42.png) makes the WebUI fetch /files/run42.png, which is served
+  # from here and from nowhere else: the path is confined to this directory
+  # (a traversal or a symlink out of it is refused) and must name an image
+  # extension, because this is the one route that turns model output into a
+  # filesystem read. Repo-relative unless absolute. Default: state/files
+  files_dir: "state/files"
   # Page theme: auto = follow the OS (default), dark, or light. A typo falls
   # back to auto. /reload re-themes every open tab immediately (it rides the
   # reloaded event — a stylesheet cannot be re-fetched under a live tab).
