@@ -87,6 +87,11 @@ Chrome on the box.
 .venv/bin/python web/steering_test.py       # own scratch core — safe anytime
 .venv/bin/python web/settings_test.py       # own scratch core — safe anytime
 .venv/bin/python web/browser_test.py        # main flow hits the REAL core: ./serve.sh first
+
+# The markdown/maths renderer:
+node web/test_md.mjs                        # renderer as a pure function (no KaTeX)
+node web/test_math.mjs                      # same, with the real vendored KaTeX
+.venv/bin/python web/math_test.py           # maths in a real browser; sends no turn
 ```
 
 `web/*_test.py` are tracked in git; `tests/` is gitignored (a local suite).

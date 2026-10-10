@@ -79,10 +79,65 @@ for (let i = 0; i <= answer.length; i++) {
 }
 console.log(`ok    all ${answer.length + 1} streaming prefixes render`);
 
+// --- math -------------------------------------------------------------------
+// No KaTeX in this harness (no window, no script tag), so renderMath takes its
+// documented fallback: the source in a .math-raw code span. That is exactly
+// what we assert -- it proves the extraction found the formula and that the
+// page degrades instead of throwing when KaTeX fails to load.
+const raw = (s) => `<code class="math-raw">${s}</code>`;
+
+check('inline $..$ extracted', renderMd('the mass $E = mc^2$ here'), raw('E = mc^2'));
+check('display $$..$$ extracted', renderMd('$$\\int_0^1 x\\,dx$$'), raw('\\int_0^1 x\\,dx'));
+check('\\( .. \\) extracted', renderMd('so \\(a+b\\) then'), raw('a+b'));
+check('\\[ .. \\] extracted', renderMd('\\[a+b\\]'), raw('a+b'));
+
+// The bug this whole change fixes: * and _ inside maths were eaten as emphasis.
+reject('no emphasis inside maths', renderMd('$a^*b^*$'), /<em>/);
+check('stars survive in maths', renderMd('$a^*b^*$'), raw('a^*b^*'));
+reject('no emphasis across two formulas', renderMd('$x^*$ and $y^*$'), /<em>/);
+check('underscores survive', renderMd('$x_1 + x_2$'), raw('x_1 + x_2'));
+
+// Display maths alone on a line must be its own block: KaTeX emits a <div>,
+// and a <div> inside a <p> is torn out by the HTML parser.
+reject('display block is not wrapped in a p',
+       renderMd('before\n\n$$x=1$$\n\nafter'), /<p>[^<]*<code class="math-raw">x=1/);
+
+// --- maths that is not maths -------------------------------------------------
+// $ is money, a shell prompt and a variable far more often than it is TeX.
+reject('shell variables are not maths', renderMd('echo $HOME and $PATH now'), /math-raw/);
+reject('prices are not maths', renderMd('it cost $5 and $10 total'), /math-raw/);
+reject('lone dollar is not maths', renderMd('costs $ 40 per unit'), /math-raw/);
+reject('$ in a code span is not maths', renderMd('run `echo $A and $B` here'), /math-raw/);
+reject('$ in a fenced block is not maths',
+       renderMd('```bash\nfor f in $a $b; do echo $f; done\n```'), /math-raw/);
+check('fenced $ stays literal',
+      renderMd('```bash\nfor f in $a $b; do echo $f; done\n```'), 'for f in $a $b');
+reject('escaped dollars are not maths', renderMd('a \\$x\\$ b'), /math-raw/);
+
+// --- maths is still escaped --------------------------------------------------
+// The fallback path must not become an HTML injection hole.
+reject('no live tag from maths', renderMd('$<script>alert(1)</script>$'), /<script>/);
+check('maths angle brackets escaped', renderMd('$a < b$'), '&lt;');
+
+// --- streaming maths ---------------------------------------------------------
+// Every prefix of an answer containing maths must render without throwing --
+// including the half-typed '$$' and the unclosed '$'.
+const mathAnswer = 'The result is $E = mc^2$, and in full:\n\n'
+                 + '$$\\frac{\\partial u}{\\partial t} = \\alpha \\nabla^2 u$$\n\n'
+                 + 'with $\\alpha > 0$ and a rate of **412.5 A**.\n';
+for (let i = 0; i <= mathAnswer.length; i++) {
+  try { renderMd(mathAnswer.slice(0, i)); }
+  catch (e) { failed++; console.log(`FAIL  math prefix ${i} threw: ${e}`); break; }
+}
+console.log(`ok    all ${mathAnswer.length + 1} streaming maths prefixes render`);
+
 // --- pathological input ------------------------------------------------------
 check('lone backtick', renderMd('a ` b'), 'a ` b');
 check('empty', renderMd(''), '');
 check('only a fence', renderMd('```'), '<pre');
+check('lone dollar sign', renderMd('a $ b'), 'a $ b');
+check('empty maths is left alone', renderMd('$$'), '$');
+check('unclosed display maths does not throw', renderMd('$$x = '), '<code');
 
 console.log(failed ? `\n${failed} FAILED` : '\nall passed');
 process.exit(failed ? 1 : 0);

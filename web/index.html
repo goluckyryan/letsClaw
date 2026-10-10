@@ -5,6 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>letsClaw</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%90%B1%3C/text%3E%3C/svg%3E">
+<!-- KaTeX, vendored in web/vendor: this core binds to loopback on a lab box and
+     must render maths with no internet. Before style.css so the theme can
+     override it. NOT deferred: app.js is a classic script at the end of <body>,
+     so it runs before any deferred script would, and the history it replays on
+     attach would render as raw TeX. It is a local file on loopback. -->
+<link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
+<script src="/static/vendor/katex/katex.min.js"></script>
 <link rel="stylesheet" href="/static/style.css">
 <!-- Generated from config.yaml (webui.pin); /reload re-themes it. After style.css so its custom properties win. -->
 <link rel="stylesheet" href="/theme.css">

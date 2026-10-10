@@ -1037,12 +1037,14 @@ loop through a queue: the prompt stays editable while an answer streams in above
 
 ## WebUI
 
-<http://127.0.0.1:8770/> — three static files (`index.html`, `app.js`, `style.css`),
-served by the core. No framework, no build step, no CDN: the core often sits on an
-isolated lab network, so everything the page needs comes from the core itself. Note the
-`/static/` route serves the whole `web/` directory, so the test helpers (`test_md.mjs`,
-`browser_test.py`, `shot.py`) are also reachable under it — harmless while the core is
-loopback-bound, but something to keep in mind before exposing the port.
+<http://127.0.0.1:8770/> — three static files (`index.html`, `app.js`, `style.css`)
+plus the vendored KaTeX in `web/vendor/`, served by the core. No framework, no build
+step, no CDN: the core often sits on an isolated lab network, so everything the page
+needs comes from the core itself — which is why KaTeX is a checked-in copy rather than
+a CDN link. Note the `/static/` route serves the whole `web/` directory, so the test
+helpers (`test_md.mjs`, `browser_test.py`, `shot.py`) are also reachable under it —
+harmless while the core is loopback-bound, but something to keep in mind before
+exposing the port.
 
 **The sidebar** on the left is the session list, rebuilt from `GET /sessions` rather
 than tracked locally, so a session someone started in another window shows up here
@@ -1089,7 +1091,18 @@ If `core.token` is set the page asks for it before connecting. The page itself i
 served unauthenticated on purpose: it holds no secrets, and it is the thing that
 asks for the token.
 
-**Tests.** `node web/test_md.mjs` exercises the markdown renderer headlessly.
+**Maths.** `$…$` and `\(…\)` render inline, `$$…$$` and `\[…\]` as a centred block,
+via KaTeX. Formulas are lifted out before the markdown pass, so `*` and `_` in an
+exponent stay maths instead of turning into emphasis, and `$` inside a code span or a
+fenced block is never treated as maths — `echo $HOME` and `it cost $5` stay literal.
+A formula KaTeX rejects is shown in the theme's error colour with its source intact
+rather than taking the message down, and if KaTeX fails to load the page falls back to
+showing the TeX source in a code span.
+
+**Tests.** `node web/test_md.mjs` exercises the markdown renderer headlessly;
+`node web/test_math.mjs` does the same against the real vendored KaTeX, and
+`.venv/bin/python web/math_test.py` checks the rendered maths in a real browser
+(fonts, metrics, colour, overflow) without sending a turn.
 `.venv/bin/python web/browser_test.py` drives real headless Chrome over the DevTools
 Protocol against a running core — no Selenium, no Playwright, nothing to install —
 and asserts against the live DOM, so a JS error that stops the render fails a check

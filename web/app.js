@@ -105,11 +105,37 @@ function inlineMd(s) {
   return s.replace(/\u0001(\d+)\u0001/g, (_, i) => `<code>${spans[i]}</code>`);
 }
 
+/* TeX -> HTML, via the KaTeX vendored in web/vendor/katex. Never throws: a bad
+   formula shows as its own source in a code span rather than taking the whole
+   message down with it, and a page served without KaTeX (or the headless
+   renderer test, which evaluates this section with no window) degrades to the
+   same literal source. */
+function renderMath(m) {
+  const K = (typeof katex !== 'undefined' && katex)
+         || (typeof window !== 'undefined' && window.katex);
+  if (!K) return `<code class="math-raw">${esc(m.src)}</code>`;
+  try {
+    return K.renderToString(m.src, {
+      displayMode: m.display,
+      throwOnError: false,      // renders the offending bit in red, keeps going
+      strict: false,            // a lab answer is not a LaTeX lint target
+      // KaTeX paints a rejected fragment with an inline colour and no class, so
+      // a stylesheet cannot reach it. Hand it the theme's own variable instead,
+      // or the error is #cc0000 on both themes and near-invisible on the dark one.
+      errorColor: 'var(--err)',
+      trust: false,             // no \href / \url injecting links from model output
+      maxExpand: 1000,          // a macro bomb must not hang the tab
+    });
+  } catch (e) {
+    return `<code class="math-err" title="${esc(String((e && e.message) || e))}">${esc(m.src)}</code>`;
+  }
+}
+
 function renderMd(src) {
-  // Strip control characters first: the block sentinels below are \u0000
-  // and \u0001, and a tool echoing raw bytes back through the model must not
-  // be able to forge one. Done before extraction, so it cannot eat the
-  // sentinels we insert immediately afterwards.
+  // Strip control characters first: the block sentinels below are \u0000,
+  // \u0001, \u0002 and \u0003, and a tool echoing raw bytes back through the
+  // model must not be able to forge one. Done before extraction, so it cannot
+  // eat the sentinels we insert immediately afterwards.
   src = String(src).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '');
 
   // An unbalanced fence means we're mid-stream inside a code block; close it so
@@ -119,6 +145,36 @@ function renderMd(src) {
   const blocks = [];
   src = src.replace(/```([\w+#.-]*)[ \t]*\n?([\s\S]*?)```/g, (_, lang, code) =>
     `\u0000${blocks.push({ lang, code }) - 1}\u0000`);
+
+  // --- math -----------------------------------------------------------------
+  // After the fences (so $ inside a code block is never a formula) and before
+  // esc() and inlineMd (so * and _ in an exponent are not eaten as emphasis --
+  // the bug where $a^*b^*$ silently became italics).
+  //
+  // Inline code is parked first for the same reason a fence is: `echo $PATH and
+  // $HOME` is a shell line, not a formula. It is handed straight back before
+  // inlineMd runs, so code spans still belong to inlineMd exactly as before.
+  const spans = [];
+  src = src.replace(/`[^`\n]+`/g, (m) => `\u0003${spans.push(m) - 1}\u0003`);
+
+  const maths = [];
+  const stash = (body, display) => `\u0002${maths.push({ src: body, display }) - 1}\u0002`;
+
+  // Mid-stream: an odd number of $$ means the closing pair has not arrived yet.
+  if (((src.match(/\$\$/g) || []).length) % 2) src += '$$';
+
+  src = src
+    .replace(/\$\$([\s\S]+?)\$\$/g, (_, b) => stash(b.trim(), true))      // $$ ... $$
+    .replace(/\\\[([\s\S]+?)\\\]/g, (_, b) => stash(b.trim(), true))      // \[ ... \]
+    .replace(/\\\(([\s\S]+?)\\\)/g, (_, b) => stash(b.trim(), false))     // \( ... \)
+    // $ ... $ is the risky one: a lone $ is money, a prompt, a shell variable.
+    // So the open must not be followed by a space or a digit, the close must not
+    // be preceded by a space, neither may be escaped, and the body may not span
+    // a blank line. Anything that fails those stays literal text.
+    .replace(/(?<![\\$\w])\$(?![\s$\d])((?:[^$\\\n]|\\[\s\S])+?)(?<![\s\\])\$(?!\$|\w)/g,
+             (m, b) => (/^[\d\s.,]*$/.test(b) ? m : stash(b, false)));
+
+  src = src.replace(/\u0003(\d+)\u0003/g, (_, i) => spans[i]);
 
   const lines = esc(src).split('\n');
   const out = [];
@@ -136,6 +192,12 @@ function renderMd(src) {
     if (!t) { flush(); endList(); continue; }
 
     if (/^\u0000\d+\u0000$/.test(t)) { flush(); endList(); out.push(t); continue; }
+
+    // Display math alone on a line is a block: KaTeX emits a <div> for it, and a
+    // <div> inside the <p> this would otherwise join gets torn out by the parser.
+    if ((m = t.match(/^\u0002(\d+)\u0002$/)) && maths[+m[1]].display) {
+      flush(); endList(); out.push(t); continue;
+    }
 
     // table: a header row followed by a |---|---| rule
     if (t.includes('|') && /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(lines[i + 1] || '')
@@ -182,11 +244,13 @@ function renderMd(src) {
   }
   flush(); endList();
 
-  return out.join('\n').replace(/\u0000(\d+)\u0000/g, (_, i) => {
-    const b = blocks[i];
-    return `<pre data-lang="${esc(b.lang || '')}"><button class="copy" title="copy">⧉</button>` +
-           `<code>${esc(b.code.replace(/\n$/, ''))}</code></pre>`;
-  });
+  return out.join('\n')
+    .replace(/\u0000(\d+)\u0000/g, (_, i) => {
+      const b = blocks[i];
+      return `<pre data-lang="${esc(b.lang || '')}"><button class="copy" title="copy">⧉</button>` +
+             `<code>${esc(b.code.replace(/\n$/, ''))}</code></pre>`;
+    })
+    .replace(/\u0002(\d+)\u0002/g, (_, i) => renderMath(maths[i]));
 }
 
 /* ------------------------------------------------------------------- the log */

@@ -443,6 +443,41 @@ main {
 }
 .body pre:hover .copy { opacity: 1; }
 
+/* ---------------------------------------------------------------- math (KaTeX)
+   KaTeX ships its own sizing and fonts; all that is wanted here is that it take
+   the bubble's colour instead of its own, that a wide equation scroll rather
+   than stretch the page (the same rule <pre> and <table> already follow), and
+   that a formula KaTeX refused be legible instead of invisible. */
+.body .katex { color: inherit; font-size: 1.05em; }
+
+/* Display math: its own band, scrollable on a narrow pane. */
+.body .katex-display {
+  margin: .7em 0;
+  padding: 2px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.body .katex-display > .katex { text-align: center; }
+
+/* A fragment KaTeX rejected is coloured inline by KaTeX itself, via the
+   errorColor we pass it (the theme's --err) -- there is no class to hook, which
+   is why there is no rule for it here. */
+
+/* Our own two fallbacks: no KaTeX on the page, or it threw outright. */
+.body code.math-raw,
+.body code.math-err {
+  font-family: var(--mono);
+  font-size: .92em;
+  background: var(--bg3);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.body code.math-err {
+  color: var(--err);
+  border-bottom: 1px dotted var(--err);
+  cursor: help;
+}
+
 .body table {
   border-collapse: collapse;
   margin: .6em 0;
