@@ -168,6 +168,10 @@ core:
 #   idle_detach_min: 60
 #   # How many messages one answer may become before the whole thing goes up as
 #   # an answer.md attachment instead of flooding the channel.
+#   #   0 = unlimited — always post in full, never file it. Safe: an answer is
+#   #       capped by the model's max_output_tokens (~65 messages at 32k, ~16 at
+#   #       8k), and discord.py throttles itself on 429. A busy shared channel is
+#   #       the reason to keep a limit; a private one is the reason not to.
 #   max_messages: 8
 #   max_lines: 17         # soft cap per message; Discord collapses tall ones
 #   # Name sessions after the server and channel — "dudus-den-solaris" — rather

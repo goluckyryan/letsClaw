@@ -1207,7 +1207,13 @@ API so a slow Discord can never stall a turn. A typing indicator runs meanwhile.
 The answer is then split by `chunker.py` — 2000 characters, a soft 17-line cap,
 and fences closed and reopened so a code block never leaks into the next
 message. Past `max_messages` (default 8) the opening chunks go out and the whole
-answer follows as an `answer.md` attachment rather than forty messages.
+answer follows as an `answer.md` attachment rather than forty messages. Set it
+to **0 for unlimited** — every chunk posted, never filed. That is bounded in
+practice whatever the number says: an answer cannot exceed the model's
+`max_output_tokens`, which is about 65 messages on a 32k model and 16 on an 8k
+one, and discord.py throttles itself on a 429. A send Discord refuses no longer
+drops the rest of the answer in silence either — the remainder goes up as a
+file, saying which message failed.
 
 **The rollover question** is posted like any other, and `yes`/`no` answers it —
 addressed the normal way, so replying to the question works. Not answering
@@ -1243,6 +1249,6 @@ See `config.example.yaml` for full reference with comments.
 - `core` — The service itself: `bind` (loopback by default — see the security note above), `port` (the WebUI is on the same one), and `token`, an optional shared secret. `--bind` / `--port` / `--config` on `./serve.sh` override the first three.
 - `tools` — Agent tools: enable flag, allowlist, `max_iterations` (tool rounds per turn before a final answer is forced), `exec_timeout`, `max_output_chars`, and `workdir` — the base directory `exec` runs in and relative paths resolve against, defaulting to the letsClaw directory.
 - `conversation` — `max_history_messages`, a backstop that trims the oldest messages (never opening on an orphaned tool result) and only applies on turns where no rollover happened — rollover is the real mechanism, this just stops an unbounded session with rollover switched off. Then rollover policy: `rollover_at_percent` (0 disables), `rollover_mode` (`auto`/`ask`/`off`), `prompt_timeout` (seconds to wait for an answer in `ask` mode before keeping the session). Two directories: `live_dir` holds the running conversations and is reloaded at startup, `sessions_dir` holds archived transcripts and the journal segments beside them. Then the journal itself: `journal` (default true — the `.md` record of every round's reasoning and every untruncated tool result, which is what stops a rolled-over window repeating work; see [The journal](#the-journal)) and `journal_max_block_chars` (default 1,000,000, the cap on one recorded block). The context window itself is per model, under `models`.
-- `discord` — the Discord bot, and only ever read by it: `enabled` (the off switch — `false` keeps the bot from starting and makes `./run_discord.sh` refuse to run; absent means enabled), `token` (the bot token), `core`/`core_token` (where the core is and its shared secret, both defaulting to the `core` section above), `users` — the **required** allowlist of snowflake IDs, empty meaning nobody — `mention_only` (`true`/`false`/`white`/`black`) with `mention_list`, `idle_detach_min`, `max_messages`/`max_lines` for how an answer is split, and `auto_names` (sessions named `<server>-<channel>`, renamed to follow Discord). Omit the whole section if you do not want a bot. See [Discord Client](#discord-client) for the security note that goes with it.
+- `discord` — the Discord bot, and only ever read by it: `enabled` (the off switch — `false` keeps the bot from starting and makes `./run_discord.sh` refuse to run; absent means enabled), `token` (the bot token), `core`/`core_token` (where the core is and its shared secret, both defaulting to the `core` section above), `users` — the **required** allowlist of snowflake IDs, empty meaning nobody — `mention_only` (`true`/`false`/`white`/`black`) with `mention_list`, `idle_detach_min`, `max_messages`/`max_lines` for how an answer is split (`max_messages: 0` = unlimited), and `auto_names` (sessions named `<server>-<channel>`, renamed to follow Discord). Omit the whole section if you do not want a bot. See [Discord Client](#discord-client) for the security note that goes with it.
 - `memory` — `long_term_file`, where rollover handoffs accumulate
 - `logging` — `level` and `file`; the core logs there and to stderr, and every session event of consequence (restore, rename, delete, rollover, a dropped tool-call turn) is one line in it.

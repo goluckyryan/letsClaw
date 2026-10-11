@@ -76,6 +76,7 @@ logger = logging.getLogger("letclaw.discord")
 DISCORD_LIMIT = 2000            # per message, in UTF-16 code units
 DEFAULT_IDLE_DETACH_MIN = 60
 DEFAULT_MAX_MESSAGES = 8        # before the answer goes up as a file instead
+MAX_MESSAGES_UNLIMITED = 0      # max_messages: 0 — never file it, always post in full
 DEFAULT_MAX_LINES = 17
 TYPING_REFRESH_S = 8            # Discord expires a typing indicator after 10
 RECONNECT_MIN_S = 1
@@ -204,8 +205,22 @@ class Settings:
         self.auto_names = bool(blob.get("auto_names", True))
         self.idle_detach_min = int(blob.get("idle_detach_min")
                                    or DEFAULT_IDLE_DETACH_MIN)
-        self.max_messages = max(1, int(blob.get("max_messages")
-                                       or DEFAULT_MAX_MESSAGES))
+        # 0 means unlimited: post every chunk, never fall back to answer.md.
+        # Read with an explicit None check rather than `or`, which would see a
+        # literal 0 as absent and hand back the default -- the exact bug that
+        # makes "off" impossible to say. A negative is a typo, not a second way
+        # to say unlimited, so it clamps to 1.
+        raw_max = blob.get("max_messages")
+        if raw_max is None or raw_max == "":
+            self.max_messages = DEFAULT_MAX_MESSAGES
+        else:
+            try:
+                n = int(raw_max)
+            except (TypeError, ValueError):
+                logger.warning("discord.max_messages %r is not a number; using %d",
+                               raw_max, DEFAULT_MAX_MESSAGES)
+                n = DEFAULT_MAX_MESSAGES
+            self.max_messages = MAX_MESSAGES_UNLIMITED if n == 0 else max(1, n)
         self.max_lines = max(1, int(blob.get("max_lines") or DEFAULT_MAX_LINES))
 
     @staticmethod
@@ -595,13 +610,20 @@ class ChannelBridge:
     # -- outbound --
 
     async def say(self, text):
+        """Post one chunk. False if Discord refused it.
+
+        The return value matters on a long answer: without it a send that fails
+        at message 40 of 65 drops the remaining 25 in silence, and the reader
+        sees an answer that simply stops mid-sentence.
+        """
         for piece in _hard_split(text):
             try:
                 await self.channel.send(piece)
             except discord.HTTPException as e:
                 logger.warning("session %s: Discord refused a message (%s)",
                                self.link.session, e)
-                return
+                return False
+        return True
 
     async def _post_answer(self):
         text = "".join(self.answer).strip()
@@ -613,22 +635,37 @@ class ChannelBridge:
 
         chunks = chunk_discord_text(text, max_chars=DISCORD_LIMIT,
                                     max_lines=self.settings.max_lines)
-        if len(chunks) <= self.settings.max_messages:
-            for chunk in chunks:
-                await self.say(chunk)
+        unlimited = self.settings.max_messages == MAX_MESSAGES_UNLIMITED
+        if unlimited or len(chunks) <= self.settings.max_messages:
+            # Every chunk, however many. The model cannot run away with this:
+            # max_output_tokens caps an answer long before the count gets
+            # interesting, and discord.py throttles itself on 429.
+            for i, chunk in enumerate(chunks):
+                if not await self.say(chunk):
+                    # The rest would be lost in silence otherwise. Say how much,
+                    # and put the whole answer up so nothing is actually gone.
+                    await self._attach_answer(
+                        text, f"_…Discord refused message {i + 1} of "
+                              f"{len(chunks)}; the full answer is attached._")
+                    return
             return
 
         # Long enough that posting it all would flood the channel. Send the
         # opening of the answer so the thread still reads, and attach the whole
         # thing — unchunked, so the Markdown is intact — rather than truncate.
         for chunk in chunks[:self.settings.max_messages - 1]:
-            await self.say(chunk)
+            if not await self.say(chunk):
+                break
+        await self._attach_answer(
+            text, f"_…{len(chunks) - self.settings.max_messages + 1} more messages "
+                  f"worth — the full answer is attached._")
+
+    async def _attach_answer(self, text, note):
+        """Put the whole answer up as answer.md, unchunked so the Markdown is
+        intact. The one path that cannot lose part of a long answer."""
         try:
             data = io.BytesIO(text.encode("utf-8"))
-            await self.channel.send(
-                f"_…{len(chunks) - self.settings.max_messages + 1} more messages "
-                f"worth — the full answer is attached._",
-                file=discord.File(data, filename="answer.md"))
+            await self.channel.send(note, file=discord.File(data, filename="answer.md"))
         except discord.HTTPException as e:
             logger.warning("session %s: could not attach the answer (%s)",
                            self.link.session, e)
