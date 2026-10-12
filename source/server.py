@@ -16,6 +16,7 @@ readable for `stop` and for the rollover answer while a turn is in flight.
 import argparse
 import asyncio
 import logging
+import shutil
 import socket
 import sys
 import weakref
@@ -416,7 +417,12 @@ async def _on_startup(app):
         app["mgr"]._engine_ports,
         app["config"].get("core", {}).get("ssh_health_sec"))
     for name, st in app["mgr"].forwards.status().items():
-        print(f"   forward: {name} {st['local']} -> {st['remote']} (via {st['target']})")
+        via = st["target"] + (f" via {st['jump']}" if st["jump"] else "")
+        print(f"   forward: {name} {st['local']} -> {st['remote']} "
+              f"(via {via})")
+    if app["mgr"].forwards.status() and shutil.which("ssh") is None:
+        print("   WARNING: no 'ssh' binary found — the ssh_forward models "
+              "will not work on this machine")
     sys.stdout.flush()
 
 

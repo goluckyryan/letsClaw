@@ -6,17 +6,18 @@ A model entry may name an `ssh_forward` beside its `base_url`:
       base_url: "http://127.0.0.1:18888/v1"   # the port is IGNORED when
       ssh_forward: "heliosspark@192.168.1.101"  # ssh_forward is set — the core
       ssh_jump: "helios@192.168.203.52"         # assigns its own local port
-      ssh_remote: "127.0.0.1:8888"
+      ssh_remote_port: 8888                     # the port on the destination
 
 The entry is self-contained: `ssh_forward` is the destination as ssh takes it
 (user@ip, bare ip, or — if the machine has an alias — an alias), and
-`ssh_jump` is an optional jump host (user@ip or ip). Nothing is read from
-~/.ssh/config, so the model works on a fresh machine that has only the ssh
-keys. `ssh_jump` is spelled out as a ProxyCommand rather than -J because a
+`ssh_jump` is an optional jump host (user@ip or ip). `ssh_remote_port` is
+the port the service listens on at the destination — always its own loopback,
+so the port alone is all there is to name. Nothing is read from ~/.ssh/config,
+so the model works on a fresh machine that has only the ssh keys. `ssh_jump` is spelled out as a ProxyCommand rather than -J because a
 -J drops command-line options on the inner hop — and some jump hosts run old
 sshd that only offers ssh-rsa, which the inner hop must be told to accept.
 
-The core spawns `ssh -N -L 127.0.0.1:<port>:<remote> <target>` itself and
+The core spawns `ssh -N -L 127.0.0.1:<port>:127.0.0.1:<remote_port> <target>` itself and
 points the engine at the local end. The port is picked by the core at startup
 (a random free one), so the model is reachable only from this core process:
 no fixed port for another local process to find, no separate service to
@@ -59,10 +60,12 @@ class SSHForward:
     0), so local_url() is valid before the process has even started.
     """
 
-    def __init__(self, name, target, remote, local_port=0, jump=None):
+    def __init__(self, name, target, remote_port, local_port=0, jump=None):
         self.name = name
         self.target = target
-        self.remote = remote
+        # The port the service listens on at the destination, on its own
+        # loopback. The forward is 127.0.0.1:<local> -> 127.0.0.1:<this>.
+        self.remote_port = int(remote_port)
         # Optional jump host, "user@ip" or "ip". None = direct connection.
         self.jump = jump
         self.local_port = int(local_port) or pick_free_port()
@@ -99,11 +102,12 @@ class SSHForward:
                 jcmd += ["-l", juser]
             jcmd += ["-W", "%h:%p", jhost]
             cmd += ["-o", "ProxyCommand=" + " ".join(jcmd)]
-        cmd += ["-N", "-L", f"127.0.0.1:{self.local_port}:{self.remote}",
+        remote = f"127.0.0.1:{self.remote_port}"
+        cmd += ["-N", "-L", f"127.0.0.1:{self.local_port}:{remote}",
                 self.target]
         via = f" (via {self.jump})" if self.jump else ""
         logger.info("ssh forward %s: %s -> %s (via %s)%s", self.name,
-                    f"127.0.0.1:{self.local_port}", self.remote,
+                    f"127.0.0.1:{self.local_port}", remote,
                     self.target, via)
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL,
@@ -158,12 +162,13 @@ class SSHForward:
                 await asyncio.sleep(STARTUP_DELAY)
             logger.error("ssh forward %s did not come up "
                          "(127.0.0.1:%s -> %s via %s)", self.name,
-                         self.local_port, self.remote, self.target)
+                         self.local_port, f"127.0.0.1:{self.remote_port}",
+                         self.target)
             raise RuntimeError(
                 f"ssh forward {self.name} did not come up "
-                f"(127.0.0.1:{self.local_port} -> {self.remote} via {self.target}) — "
-                "check the ssh key for the target is installed and the path "
-                "(jump host, network) is reachable")
+                f"(127.0.0.1:{self.local_port} -> 127.0.0.1:{self.remote_port} via {self.target}) — "
+                "check the ssh binary is installed, the key for the target is "
+                "authorized there, and the path (jump host, network) is reachable")
 
     async def maintain(self):
         """Keepalive pass: make sure the forward is up.
@@ -213,7 +218,7 @@ class SSHForward:
         return {
             "target": self.target,
             "jump": self.jump,
-            "remote": self.remote,
+            "remote": f"127.0.0.1:{self.remote_port}",
             "local": f"127.0.0.1:{self.local_port}",
             "pid": self._proc.pid if self._proc and self._proc.poll() is None else None,
         }
@@ -245,8 +250,13 @@ class SSHForwardManager:
             if not isinstance(entry, dict) or "ssh_forward" not in entry:
                 continue
             jump = str(entry.get("ssh_jump") or "").strip() or None
+            # ssh_remote_port is the port on the destination. The legacy
+            # ssh_remote "host:port" spelling is still read (host ignored).
+            rp = entry.get("ssh_remote_port")
+            if rp is None:
+                rp = str(entry.get("ssh_remote") or "").rsplit(":", 1)[-1]
             want[name] = (str(entry.get("ssh_forward")),
-                          str(entry.get("ssh_remote") or "127.0.0.1:8888"),
+                          int(rp or 8888),
                           int(entry.get("ssh_local_port") or 0),
                           jump)
         return want
@@ -255,17 +265,17 @@ class SSHForwardManager:
         """Startup: create the forwards the config wants. Synchronous, spawns
         nothing — the ssh processes start lazily (first use) or via the
         keepalive."""
-        for name, (target, remote, local, jump) in self._wanted(config).items():
+        for name, (target, rport, local, jump) in self._wanted(config).items():
             if name not in self._forwards:
-                self._forwards[name] = SSHForward(name, target, remote, local,
+                self._forwards[name] = SSHForward(name, target, rport, local,
                                                   jump=jump)
 
     def plan(self, config):
         """Diff the config against the current set, without applying it.
 
         Returns (added, removed): added are new SSHForward objects (or a
-        replacement, when a forward's target or remote changed — the old one
-        comes back in removed), removed are forwards the config no longer
+        replacement, when a forward's target or remote port changed — the old
+        one comes back in removed), removed are forwards the config no longer
         wants or that are being replaced.
         """
         want = self._wanted(config)
@@ -274,7 +284,7 @@ class SSHForwardManager:
             cur = self._forwards.get(name)
             if cur is None:
                 added[name] = SSHForward(name, *spec)
-            elif (cur.target, cur.remote, cur.jump) != (spec[0], spec[1], spec[3]):
+            elif (cur.target, cur.remote_port, cur.jump) != (spec[0], spec[1], spec[3]):
                 removed[name] = cur
                 added[name] = SSHForward(name, *spec)
         for name, fwd in self._forwards.items():
