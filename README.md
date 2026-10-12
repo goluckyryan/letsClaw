@@ -130,6 +130,7 @@ graph TD
 ```
 letsClaw/
   serve.sh                 the core          — start this first; also starts the bot
+  install.sh               install serve.sh as a systemd service (user or system)
   terminalUI.sh            the terminal client
   run_discord.sh           the Discord bot on its own (serve.sh usually starts it for you)
   config.yaml              your settings (gitignored — it holds API keys and the bot token)
@@ -1235,10 +1236,23 @@ within `prompt_timeout` keeps the session, exactly as in the other clients. With
 `mention_only: false` a bare "yes" in the channel can also answer it, which is
 one more reason to leave it on.
 
-**Idle channels are detached** after `idle_detach_min` (default 60) and
-re-attached on the next message; the conversation is on the core, not here. The
-link reconnects on its own with backoff and resumes by `last_seq`, so a core
-restart mid-answer loses nothing.
+**The channel stays attached** for the life of the bot by default
+(`idle_detach_min: 0` = never). That is what keeps Discord and the WebUI in
+lockstep: a turn you run from the WebUI still posts to the channel, because the
+bridge never detaches and misses it. Set `idle_detach_min` to a number of
+minutes to get the old behavior back — the channel's socket is dropped when it
+goes idle that long and re-attached on the next message; the conversation is on
+the core, not here, so nothing is lost. The link reconnects on its own with
+backoff and resumes by `last_seq`, so a core restart mid-answer loses nothing.
+
+**A rename is followed, so a reconnect lands on the right session.** The core
+*creates* a session on an unknown name, so a reconnect that still dials an old
+name would open an empty twin while the real conversation sits under the new
+name. The bridge therefore tracks renames: a rename it drove itself (a Discord
+channel rename) is already in its name map, and a rename from elsewhere (the
+WebUI) is adopted and the channel is bound to the new name — a WebUI rename is
+user intent, exactly like `/session <name>`. Either way the next reconnect dials
+the conversation, not a twin.
 
 **Tests.** `.venv/bin/python tests/test_chunk.py` covers the chunker (fences,
 long lines, CJK, the 2000 boundary, italics), `tests/test_discord.py` drives the
@@ -1246,6 +1260,42 @@ gate, the routing and the rendering against fake Discord objects and a fake
 link, and `tests/test_discord_live.py` spawns a real core on a temp config and
 checks the protocol end to end — handshake, token, `?model=`, `origin`, and
 reconnect-by-seq. None of the three needs a bot token or a network.
+
+## Installing as a service
+
+`./install.sh` runs `serve.sh` under systemd, so the core (and the bot) start at
+boot and come back if they die. It sets up the venv and dependencies if they are
+missing, and writes the unit; re-run it after a `git pull` to refresh the unit
+(it is generated, not hand-edited).
+
+```bash
+./install.sh              # a --user unit, no root: ~/.config/systemd/user/
+./install.sh --system     # a system unit, needs sudo: /etc/systemd/system/
+./install.sh --no-start   # install and enable, but leave it stopped
+./install.sh --uninstall  # stop, disable, remove (both flavours, if both)
+```
+
+Both units run `./serve.sh` **as you**, not as root. The **user** unit is the
+default: it needs no sudo at all, and starts at login. It survives reboot only
+if *linger* is on — the script checks and tells you; if it is off,
+
+```bash
+sudo loginctl enable-linger <you>
+```
+
+The **system** unit (`--system`) starts at boot regardless of login. Only the
+`core.bind`/`core.port` and `logging.file` settings need a restart to change
+(see [Reloading config](#reloading-config)); everything else is picked up by
+`/reload`.
+
+```bash
+systemctl [--user] status letsClaw          # is it running
+systemctl [--user] restart letsClaw         # restart it
+journalctl [--user] -u letsClaw -f          # the log (the core also writes logs/letclaw.log)
+```
+
+A `--user` and a `--system` unit would fight over the core's port, so the script
+refuses to install one flavour while the other is present — uninstall first.
 
 ## Future Features
 
@@ -1256,13 +1306,16 @@ reconnect-by-seq. None of the three needs a bot token or a network.
 
 ## Config
 
-See `config.example.yaml` for full reference with comments.
+See [`docs/config.html`](docs/config.html) for the full reference — every
+setting, its type, its default, and whether a change is picked up by `/reload`
+or needs a restart. `config.example.yaml` carries the same reference inline as
+comments, for people who would rather read the template.
 
 **Key sections:**
 - `models` — Registry of named models. Each entry is self-contained: its own `base_url` (required), `api_key`, exact server model ID (`provider_name`), behavior file, `context_length` and sampling parameters — so two models can live on two different servers with different window sizes, and reading one entry tells you everything about that model. `default_model` picks the model a new session starts on; `/model <name>` switches one session at runtime without disturbing the others.
 - `core` — The service itself: `bind` (loopback by default — see the security note above), `port` (the WebUI is on the same one), and `token`, an optional shared secret. `--bind` / `--port` / `--config` on `./serve.sh` override the first three.
 - `tools` — Agent tools: enable flag, allowlist, `max_iterations` (tool rounds per turn before a final answer is forced), `exec_timeout`, `max_output_chars`, and `workdir` — the base directory `exec` runs in and relative paths resolve against, defaulting to the letsClaw directory.
 - `conversation` — `max_history_messages`, a backstop that trims the oldest messages (never opening on an orphaned tool result) and only applies on turns where no rollover happened — rollover is the real mechanism, this just stops an unbounded session with rollover switched off. Then rollover policy: `rollover_at_percent` (0 disables), `rollover_mode` (`auto`/`ask`/`off`), `prompt_timeout` (seconds to wait for an answer in `ask` mode before keeping the session). Two directories: `live_dir` holds the running conversations and is reloaded at startup, `sessions_dir` holds archived transcripts and the journal segments beside them. Then the journal itself: `journal` (default true — the `.md` record of every round's reasoning and every untruncated tool result, which is what stops a rolled-over window repeating work; see [The journal](#the-journal)) and `journal_max_block_chars` (default 1,000,000, the cap on one recorded block). The context window itself is per model, under `models`.
-- `discord` — the Discord bot, and only ever read by it: `enabled` (the off switch — `false` keeps the bot from starting and makes `./run_discord.sh` refuse to run; absent means enabled), `token` (the bot token), `core`/`core_token` (where the core is and its shared secret, both defaulting to the `core` section above), `users` — the **required** allowlist of snowflake IDs, empty meaning nobody — `mention_only` (`true`/`false`/`white`/`black`) with `mention_list`, `idle_detach_min`, `max_messages`/`max_lines` for how an answer is split (`max_messages: 0` = unlimited), and `auto_names` (sessions named `<server>-<channel>`, renamed to follow Discord). Omit the whole section if you do not want a bot. See [Discord Client](#discord-client) for the security note that goes with it.
+- `discord` — the Discord bot, and only ever read by it: `enabled` (the off switch — `false` keeps the bot from starting and makes `./run_discord.sh` refuse to run; absent means enabled), `token` (the bot token), `core`/`core_token` (where the core is and its shared secret, both defaulting to the `core` section above), `users` — the **required** allowlist of snowflake IDs, empty meaning nobody — `mention_only` (`true`/`false`/`white`/`black`) with `mention_list`, `idle_detach_min` (`0` = never, the default — the channel stays attached so a WebUI turn still posts to Discord), `max_messages`/`max_lines` for how an answer is split (`max_messages: 0` = unlimited), and `auto_names` (sessions named `<server>-<channel>`, renamed to follow Discord). Omit the whole section if you do not want a bot. See [Discord Client](#discord-client) for the security note that goes with it.
 - `memory` — `long_term_file`, where rollover handoffs accumulate
 - `logging` — `level` and `file`; the core logs there and to stderr, and every session event of consequence (restore, rename, delete, rollover, a dropped tool-call turn) is one line in it.
