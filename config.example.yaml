@@ -165,7 +165,8 @@ core:
 #   mention_list: [general, novel]
 #   # Close an idle channel's socket after this long. The conversation is NOT
 #   # lost — the core keeps the session, and the next message re-attaches to it.
-#   idle_detach_min: 60
+#   idle_detach_min: 60   # close an idle channel's socket after this long; 0 = never
+#                        # (always connected, so a turn run from the WebUI still posts to Discord)
 #   # How many messages one answer may become before the whole thing goes up as
 #   # an answer.md attachment instead of flooding the channel.
 #   #   0 = unlimited — always post in full, never file it. Safe: an answer is

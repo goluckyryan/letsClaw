@@ -208,8 +208,13 @@ class Settings:
         # See _resolve_session for what happens when a channel is renamed under
         # a session that already exists.
         self.auto_names = bool(blob.get("auto_names", True))
-        self.idle_detach_min = int(blob.get("idle_detach_min")
-                                   or DEFAULT_IDLE_DETACH_MIN)
+        # 0 means never: the channel stays attached for the life of the bot, so
+        # a turn run from the WebUI still reaches Discord and there is no idle
+        # re-attach to get a session's name wrong. An explicit None/"" (key
+        # absent) is the default, not 0.
+        raw_idle = blob.get("idle_detach_min")
+        self.idle_detach_min = (DEFAULT_IDLE_DETACH_MIN if raw_idle in (None, "")
+                                else int(raw_idle))
         # 0 means unlimited: post every chunk, never fall back to answer.md.
         # Read with an explicit None check rather than `or`, which would see a
         # literal 0 as absent and hand back the default -- the exact bug that
@@ -786,6 +791,51 @@ class ChannelBridge:
         elif what == "reloaded":
             await self.say(f"_♻️ config reloaded — {event.get('model')}, budget "
                            f"{event.get('budget')} tok_")
+        elif what == "renamed":
+            self._renamed(event)
+
+    def _renamed(self, event):
+        """A session rename arriving over the socket.
+
+        The live socket follows the session, so nothing breaks right now — but
+        the link's name is what a reconnect dials, and the core creates a
+        session on an unknown name. A stale name would therefore reconnect to a
+        fresh empty twin while the real conversation sits under the new name.
+        Adopt the new name so a reconnect lands on this conversation.
+
+        A rename the bot itself drove (a Discord channel rename) already moved
+        _names, so it only consumes this channel's marker here. Any other
+        rename is a WebUI one — user intent, like /session <name> — so the
+        channel is bound to the new name in the /session map and keeps pointing
+        at the same conversation under its new name.
+        """
+        new = event.get("session")
+        if not new:
+            return
+        key = str(self.channel.id) if self.channel is not None else None
+        # A bot-driven rename (a Discord channel rename) already moved _names.
+        # Consume this channel's marker only when it names this rename, so a
+        # WebUI rename interleaved with a pending bot rename does not eat the
+        # marker meant for the bot's event.
+        bot_drove = False
+        if self.owner is not None and key is not None:
+            if self.owner._bot_renames.get(key) == new:
+                bot_drove = True
+                del self.owner._bot_renames[key]
+        if new == self.link.session:
+            return                       # _bridge already adopted it
+        logger.info("session %s renamed to %s — following",
+                    event.get("was"), new)
+        self.link.session = new
+        if self.owner is not None and key is not None and not bot_drove \
+                and self.owner._maps.get(key) != new:
+            # A WebUI rename is user intent, exactly like /session <name>: bind
+            # the channel to the new name so auto-naming and a restart do not
+            # move it off the conversation (dialing the old name would create an
+            # empty twin). Writing _names instead would make auto-naming rename
+            # it straight back to the auto name on the next message.
+            self.owner._maps[key] = new
+            self.owner._save_maps()
 
     def render_response(self, event):
         """A command reply as text, or "" when a broadcast says it instead.
@@ -1008,6 +1058,11 @@ class LetsClawBot(discord.Client):
         self._synced = False
         self._names = {}
         self._maps = {}                   # channel id → explicit session (/session)
+        # Channel id -> new name of a rename the bot itself drove (a Discord
+        # channel rename), so that channel's renamed event is not mistaken for
+        # a WebUI rename when it comes back around the socket. Per-channel, so
+        # two channels renaming at once do not clobber each other's marker.
+        self._bot_renames = {}
         self._models = ([], 0.0)          # (names, when) for /model autocomplete
         self._sessions = ([], 0.0)        # (names, when) for /session autocomplete
         self.tree = app_commands.CommandTree(self)
@@ -1122,6 +1177,8 @@ class LetsClawBot(discord.Client):
         The conversation is not lost: the core keeps the session and its live
         file, so the next message re-attaches and picks it straight back up.
         """
+        if self.settings.idle_detach_min == 0:
+            return                 # always connected: nothing to sweep
         while True:
             await asyncio.sleep(SWEEP_INTERVAL_S)
             cutoff = time.monotonic() - self.settings.idle_detach_min * 60
@@ -1268,9 +1325,11 @@ class LetsClawBot(discord.Client):
         # name to migrate from is the one it would have used: the snowflake.
         previous = self._names.get(key) or f"discord-{channel.id}"
         if previous != desired:
+            self._bot_renames[key] = desired    # consumed by the renamed event
             if not await self._rename_core_session(previous, desired):
                 # Busy, or the new name is taken. Keep talking to the session
                 # that holds the conversation and try again next time.
+                self._bot_renames.pop(key, None)
                 return previous
         if self._names.get(key) != desired:
             self._names[key] = desired
@@ -1294,6 +1353,15 @@ class LetsClawBot(discord.Client):
             self.bridges[key] = bridge
             link.start()
             logger.info("channel %s → session %s", key, name)
+        else:
+            # Already attached (the channel is no longer idle-detached), so this
+            # is where a Discord channel rename is followed: keep the session
+            # name in step with the channel. Cheap when nothing changed — only
+            # an actual rename costs a core call.
+            name = await self._resolve_session(channel, guild, user_id)
+            if name != bridge.link.session:
+                bridge.link.session = name
+                logger.info("channel %s → session %s (renamed)", key, name)
         bridge.link.touch()
         return bridge
 
@@ -1724,7 +1792,7 @@ def main():
     print("\nletsClaw Discord client")
     print(f"Core: {settings.core}   "
           f"{_mention_summary(settings)}   "
-          f"idle detach {settings.idle_detach_min} min")
+          f"idle detach {'never' if settings.idle_detach_min == 0 else settings.idle_detach_min} min")
     sys.stdout.flush()
     # After the banner, so the console reads in the order things happened.
     # check() logs rather than prints: the warning belongs in the log file too.
