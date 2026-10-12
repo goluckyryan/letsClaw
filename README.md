@@ -83,7 +83,7 @@ graph TD
     end
 
     subgraph Modules
-        Cmds[Commands\n/clear /new /info /model /models\n/behavior /reasoning /stop /reload]
+        Cmds[Commands\n/clear /new /info /model /models\n/behavior /reasoning /stop /reload\n/session]
         TokenCounter[Token Counter\ntoken_counter.py\nper-message stats]
         ThinkingUI[Thinking indicator\nui.py\nlive spinner + TTFT]
         Tools[Tool executor\ntools.py\nexec / read / write / list]
@@ -1173,6 +1173,19 @@ The server prefix is not decoration: two servers each having a `#general` is the
 normal case, and without it their conversations would silently merge into one
 session. `auto_names: false` goes back to bare `discord-<channel_id>`.
 
+**Pointing a channel at another session.** One-to-one is the default, not a
+wall: `/session <name>` (or `!session <name>`) repoints the channel at any
+session the core already has — or creates it if it does not. The old
+conversation is untouched and stays reachable from wherever else it is bound;
+the channel simply stops talking to it and starts talking to the other one,
+and the last three lines of the session it joined are posted so you can see
+where it landed. `/session` with no name shows the current binding, and
+`/session auto` brings the channel back to its default name. The mapping is
+persisted in `state/discord_session_map.json`, so it survives a bot restart —
+and a mapped channel is left alone by the rename-following logic, which is
+user intent, not a name the bot chose. Several channels can share one
+session; `/info` in any of them says which channel it is bound from.
+
 **Talking to it.** In a guild the bot answers when @mentioned or replied to —
 hygiene, so it stays quiet in a busy channel, not a security control. DMs never
 need a mention. `mention_only` takes four values:
@@ -1197,7 +1210,8 @@ answers freely in: #solaris, #caen, #esps, #ptolemy-translation, #analysis_11c
 
 An unreadable value warns and falls back to `true`, so a typo never opens the bot up. Every slash command the
 terminal has works as a plain message: `/info`, `/model [name]`, `/models`,
-`/rollover`, `/new`, `/clear`, `/behavior`, `/stop`, `/reload`, plus a local `/help`.
+`/rollover`, `/new`, `/clear`, `/behavior`, `/stop`, `/reload`, `/session
+[name]`, plus a local `/help`.
 `/reasoning` is answered but does nothing — this client asks the core not to
 send the thinking at all (`reasoning=0`), so none of it crosses the wire.
 

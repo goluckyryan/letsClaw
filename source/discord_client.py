@@ -90,6 +90,10 @@ READY_TIMEOUT_S = 10
 # Which session name each channel was last given, so a channel renamed
 # while the bot was down is still recognised as the same channel.
 NAMES_FILE = paths.resolve("state/discord_names.json")
+# An explicit channel → session map, set by /session. Unlike NAMES_FILE it is
+# user intent: a channel pointed at another session stays pointed there until
+# told otherwise, and the auto-naming rename logic must not touch it.
+MAPS_FILE = paths.resolve("state/discord_session_map.json")
 
 YES = {"y", "yes"}
 NO = {"n", "no"}
@@ -99,7 +103,7 @@ NO = {"n", "no"}
 # alternative prefix — see ALT_PREFIX.
 COMMAND_WORDS = {
     "info", "model", "models", "new", "rollover", "clear", "behavior", "stop",
-    "reload", "help", "commands", "quit", "exit", "reasoning",
+    "reload", "session", "help", "commands", "quit", "exit", "reasoning",
 }
 # Discord's own client captures a leading "/" into its slash-command picker, and
 # with no application commands registered the message can end up never being
@@ -119,6 +123,7 @@ HELP = (
     "`!new` **wipe everything**, archives included · `!behavior` the loaded "
     "behavior files\n"
     "`!stop` interrupt the turn in progress · `!reload` re-read config.yaml · "
+    "`!session [name]` this channel's session — set, show, or `auto`\n"
     "`!help` this\n"
     "_`/` works too, but Discord's own command picker often eats it before it "
     "is sent — `!` or `@me /command` always gets through._"
@@ -595,10 +600,11 @@ class ChannelBridge:
     is replayed on attach.
     """
 
-    def __init__(self, channel, link, settings):
+    def __init__(self, channel, link, settings, owner=None):
         self.channel = channel
         self.link = link
         self.settings = settings
+        self.owner = owner              # the bot, for /info's "where" line
         self.answer = []
         self.pending_ask = None
         self.busy = False
@@ -794,7 +800,15 @@ class ChannelBridge:
         if not event.get("ok", True):
             return f"⚠️ {_one_line(event.get('error'))}"
         if "info" in event:
-            return _format_info(event["info"])
+            info = event["info"]
+            if self.owner is not None:
+                # Which channel is bound to this session — so a session shared
+                # by two channels reads as one on purpose.
+                bound = [c for c, n in self.owner._maps.items()
+                         if n == info.get("session")]
+                info["where"] = (f"bound from channel {bound[0]}"
+                                 if bound else "this channel's default")
+            return _format_info(info, info.get("where"))
         if "behavior" in event:
             base = event.get("base") or ""
             behavior = event.get("behavior") or ""
@@ -863,7 +877,7 @@ class ChannelBridge:
         await self.link.close()
 
 
-def _format_info(info):
+def _format_info(info, where=None):
     used, budget = info.get("used") or 0, info.get("budget") or 0
     pct = (used * 100) // budget if budget else 0
     approx = "~" if info.get("estimated", True) else ""
@@ -872,9 +886,11 @@ def _format_info(info):
         f"🤖 **{info.get('model')}** @ {info.get('base_url')}",
         f"🆔 session `{info.get('session')}` (id `{info.get('session_id')}`)",
         f"💬 {info.get('messages')} messages",
-        f"⚡ context {approx}{used}/{budget} tok ({pct}%) · "
-        f"{info.get('tools_tokens')} tok of tool schemas",
     ]
+    if where:
+        lines.append(f"📍 {where}")
+    lines.append(f"⚡ context {approx}{used}/{budget} tok ({pct}%) · "
+                 f"{info.get('tools_tokens')} tok of tool schemas")
     if info.get("output_total") is not None:
         lines.append(f"📤 {info['output_total']} tok generated in this session")
     if roll.get("percent"):
@@ -991,13 +1007,16 @@ class LetsClawBot(discord.Client):
         self._sweeper = None
         self._synced = False
         self._names = {}
+        self._maps = {}                   # channel id → explicit session (/session)
         self._models = ([], 0.0)          # (names, when) for /model autocomplete
+        self._sessions = ([], 0.0)        # (names, when) for /session autocomplete
         self.tree = app_commands.CommandTree(self)
         self._register_commands()
 
     async def setup_hook(self):
         self._core_http = aiohttp.ClientSession()
         self._load_names()
+        self._load_maps()
         self._sweeper = asyncio.create_task(self._sweep(), name="idle-sweep")
 
     async def close(self):
@@ -1148,6 +1167,20 @@ class LetsClawBot(discord.Client):
             # Losing this costs a rename being missed, never a conversation.
             logger.warning("could not save the channel-name map: %s", e)
 
+    def _load_maps(self):
+        """The explicit channel → session map, as /session last left it."""
+        try:
+            self._maps = json.loads(MAPS_FILE.read_text())
+        except (OSError, ValueError):
+            self._maps = {}
+
+    def _save_maps(self):
+        try:
+            MAPS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            MAPS_FILE.write_text(json.dumps(self._maps, indent=1))
+        except OSError as e:
+            logger.warning("could not save the session map: %s", e)
+
     async def _rename_core_session(self, old, new):
         """Move a session to a new name. True if it is now called `new`."""
         try:
@@ -1193,6 +1226,8 @@ class LetsClawBot(discord.Client):
         for guild in self.guilds:
             for channel in getattr(guild, "text_channels", []):
                 key = str(channel.id)
+                if key in self._maps:
+                    continue        # /session put it there; auto-naming stays out
                 desired = auto_session_name(channel, guild)
                 previous = self._names.get(key) or f"discord-{channel.id}"
                 if previous == desired or previous not in existing:
@@ -1224,6 +1259,10 @@ class LetsClawBot(discord.Client):
             return session_for(channel, guild, user_id)
 
         key = str(channel.id)
+        # /session put this channel somewhere specific: that is user intent,
+        # and nothing — not a Discord rename, not auto-naming — moves it.
+        if key in self._maps:
+            return self._maps[key]
         desired = auto_session_name(channel, guild)
         # No record yet means this bot has not named the channel before, so the
         # name to migrate from is the one it would have used: the snowflake.
@@ -1250,13 +1289,123 @@ class LetsClawBot(discord.Client):
             name = await self._resolve_session(channel, guild, user_id)
             link = CoreLink(self.settings.core, name, self._core_http,
                             token=self.settings.core_token)
-            bridge = ChannelBridge(channel, link, self.settings)
+            bridge = ChannelBridge(channel, link, self.settings, owner=self)
             link.on_event = bridge.handle
             self.bridges[key] = bridge
             link.start()
             logger.info("channel %s → session %s", key, name)
         bridge.link.touch()
         return bridge
+
+    async def _switch_session(self, channel, guild, user_id, name):
+        """Repoint this channel at a different session.
+
+        The old conversation is untouched — its session stays in the core —
+        and the channel simply stops talking to it and starts talking to the
+        other one. The switch is persisted, so it survives a bot restart.
+        """
+        if not name:
+            return "give it a name — or `auto` to come back to the default."
+        # The core's own rule, checked here so a bad name is refused before the
+        # channel is unhooked from the session it was on.
+        if len(name) > 64 or "/" in name:
+            return ("session names are 1–64 characters with no `/` — "
+                    "the same rule the WebUI uses.")
+        key = channel.id                 # the bridge's key, exactly as _bridge uses it
+        old = self.bridges.get(key)
+        if old is not None:
+            if old.link.session == name:
+                return f"this channel is already on `{name}`."
+            await old.close()
+            self.bridges.pop(key, None)
+        skey = str(key)                  # the map's key: JSON has no int keys
+        if name == "auto":
+            self._maps.pop(skey, None)
+        else:
+            self._maps[skey] = name
+        self._save_maps()
+        bridge = await self._bridge(channel, guild, user_id)
+        if not await bridge.link.wait_ready():
+            return None
+        if name == "auto":
+            resolved = await self._resolve_session(channel, guild, user_id)
+            await bridge.say(f"↩️ back to the default session `{resolved}` — "
+                             f"the map no longer points this channel anywhere.")
+        else:
+            await bridge.say(f"↪️ this channel now talks to `{name}`.")
+            await self._post_history(bridge)
+        logger.info("channel %s → session %s (explicit)", key, name)
+        return None
+
+    async def _post_history(self, bridge):
+        """The tail of the session just joined, so the channel can see where
+        it landed. One message, capped — a switch should not replay a novel."""
+        try:
+            async with self._core_http.get(
+                    f"{self._core_url()}/sessions/{quote(bridge.link.session, safe='')}/history",
+                    headers=self._auth(),
+                    timeout=aiohttp.ClientTimeout(total=5)) as r:
+                body = await r.json()
+        except Exception as e:
+            logger.debug("could not fetch the switch digest: %s", e)
+            return
+        lines = []
+        for m in body.get("messages", [])[-3:]:
+            who = {"user": "you", "assistant": "letsClaw"}.get(m.get("role"),
+                                                              m.get("role") or "?")
+            lines.append(f"**{who}:** {str(m.get('content') or '')[:200]}")
+        if lines:
+            await bridge.say("_just joined — the last of it:_\n" + "\n".join(lines))
+
+    async def session_names(self):
+        """Session names, for /session's autocomplete. Cached briefly."""
+        names, when = self._sessions
+        if names and time.monotonic() - when < 60:
+            return names
+        try:
+            async with self._core_http.get(
+                    f"{self._core_url()}/sessions", headers=self._auth(),
+                    timeout=aiohttp.ClientTimeout(total=5)) as r:
+                body = await r.json()
+            names = [s["name"] for s in body.get("sessions", []) if s.get("name")]
+            self._sessions = (names, time.monotonic())
+        except Exception as e:
+            logger.debug("could not fetch session names: %s", e)
+        return names
+
+    async def handle_session(self, interaction, args=""):
+        """/session [name] — show, set, or unset this channel's session."""
+        bridge = await self._open_bridge(interaction)
+        if bridge is None:
+            return
+        user = interaction.user
+        # Session names are case-sensitive (the WebUI accepts any of them),
+        # so only `auto` is matched loosely.
+        name = (args or "").strip().strip("`")
+        if name.lower() == "auto":
+            note = await self._switch_session(interaction.channel, interaction.guild,
+                                              user.id, "auto")
+            # The switch message is in the channel; this only closes the
+            # deferred interaction, which would otherwise sit in "thinking".
+            await interaction.followup.send(
+                f"_⚠️ {_one_line(note)}_" if note else "_done_")
+            return
+        if not name:
+            event = await bridge.run_command("info")
+            cur = (event or {}).get("info", {}).get("session") or bridge.link.session
+            mapped = str(interaction.channel.id) in self._maps
+            how = "set by /session" if mapped else "the default for this channel"
+            await interaction.followup.send(
+                f"🆔 this channel talks to **`{cur}`** — {how}.\n"
+                f"_`/session <name>` points it somewhere else; "
+                f"`/session auto` brings it back._")
+            return
+        note = await self._switch_session(interaction.channel, interaction.guild,
+                                          user.id, name)
+        # The switch message is in the channel; this only closes the deferred
+        # interaction, which would otherwise sit in "thinking".
+        await interaction.followup.send(
+            f"_⚠️ {_one_line(note)}_" if note else "_done_")
 
     async def bridge_for(self, message):
         return await self._bridge(message.channel, message.guild, message.author.id)
@@ -1311,7 +1460,7 @@ class LetsClawBot(discord.Client):
 
         body = _command_body(text)
         if body is not None:
-            await self._command(bridge, body)
+            await self._command(bridge, body, message)
             return
         await bridge.link.submit(text, origin=f"discord:{message.author.name}")
 
@@ -1359,6 +1508,28 @@ class LetsClawBot(discord.Client):
             return [app_commands.Choice(name=n, value=n)
                     for n in await self.model_names()
                     if current in n.lower()][:25]
+
+        @tree.command(name="session",
+                      description="this channel's session — set, show, or auto")
+        @app_commands.describe(name="leave blank to see the current one; "
+                                    "'auto' for the default")
+        async def _session(interaction: discord.Interaction, name: str = ""):
+            await self.handle_session(interaction, name)
+
+        @_session.autocomplete("name")
+        async def _session_autocomplete(interaction: discord.Interaction,
+                                        current: str):
+            current = (current or "").lower()
+            names = await self.session_names()
+            if not current:
+                choices = [app_commands.Choice(name="auto (the default)", value="auto")]
+            else:
+                choices = []
+            return ([c for c in choices
+                     if c.name.lower().startswith(current)
+                     or c.value.lower().startswith(current)]
+                    + [app_commands.Choice(name=n, value=n) for n in names
+                       if current in n.lower()][:25])
 
         @tree.command(name="ask",
                       description="ask letsClaw something (same as just typing)")
@@ -1457,7 +1628,7 @@ class LetsClawBot(discord.Client):
 
     # -- text commands --
 
-    async def _command(self, bridge, body):
+    async def _command(self, bridge, body, message=None):
         name, _, args = body.partition(" ")
         name = name.strip().lower()
         if name in ("help", "commands", ""):
@@ -1476,7 +1647,33 @@ class LetsClawBot(discord.Client):
         if name == "stop":
             await bridge.link.stop()
             return
+        if name == "session":
+            await self._session_text(bridge, args.strip(), message)
+            return
         await bridge.link.command(name, args.strip())
+
+    async def _session_text(self, bridge, args, message):
+        """!session [name] — the text form of the slash command.
+
+        No interaction to answer into, so the reply goes to the channel: the
+        switch messages already do, and only the "already on it" case needs a
+        line of its own.
+        """
+        note = await self._switch_session(message.channel, message.guild,
+                                          message.author.id, args)
+        if note is None:
+            return                      # the switch messages are in the channel
+        if "give it a name" in note:
+            # !session with no argument: show where this channel is, like /session.
+            event = await bridge.run_command("info")
+            cur = (event or {}).get("info", {}).get("session") or bridge.link.session
+            mapped = str(message.channel.id) in self._maps
+            how = "set by /session" if mapped else "the default for this channel"
+            await bridge.say(f"🆔 this channel talks to **`{cur}`** — {how}.\n"
+                             f"_`!session <name>` points it somewhere else; "
+                             f"`!session auto` brings it back._")
+            return
+        await bridge.say(f"_⚠️ {_one_line(note)}_")
 
 
 # ---- entry point -----------------------------------------------------------

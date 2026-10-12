@@ -7,6 +7,7 @@ Start this first; the terminal, a WebUI and a Discord bot are all just clients:
     ./terminalUI.sh       (terminal client, in another shell)
 
 HTTP:  GET /health  GET /models  GET /sessions  DELETE /sessions/<name>
+       GET /sessions/<name>/history  POST /sessions/<name>/rename
 WS:    /ws?session=<name>&last_seq=<n>
 
 The reader never runs a turn inline — turns are tasks, so the socket stays
@@ -97,6 +98,31 @@ async def sessions(request):
     if not _authorised(request):
         raise web.HTTPUnauthorized()
     return web.json_response({"sessions": request.app["mgr"].describe()})
+
+
+async def session_history(request):
+    """The session's messages, newest last — the tail a client wants to show.
+
+    Read-only and capped: a switch digest needs the last few lines, not the
+    whole conversation, and an unbounded copy of a long session would be a
+    slow JSON for no one."""
+    if not _authorised(request):
+        raise web.HTTPUnauthorized()
+    name = request.match_info["name"]
+    try:
+        limit = int(request.query.get("limit", 10))
+    except ValueError:
+        limit = 10
+    session = request.app["mgr"].sessions.get(name)
+    if session is None:
+        return web.json_response({"ok": False, "error": f"no session {name!r}"},
+                                 status=404)
+    msgs = [m for m in session.history if m.get("role") != "system"]
+    return web.json_response({
+        "ok": True, "session": session.name,
+        "messages": [{"role": m["role"], "content": m.get("content")}
+                     for m in msgs[-max(limit, 1):]],
+    })
 
 
 async def delete_session(request):
@@ -455,6 +481,7 @@ def build_app(config, config_path=None):
         web.get("/sessions", sessions),
         web.delete("/sessions/{name}", delete_session),
         web.post("/sessions/{name}/rename", rename_session),
+        web.get("/sessions/{name}/history", session_history),
         web.post("/reload", reload_config),
         web.get("/config", config_get),
         web.post("/config", config_save),
