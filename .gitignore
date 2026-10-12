@@ -26,3 +26,6 @@ models/sessions/*.md
 .vscode/
 .idea/
 .DS_Store
+
+# systemd unit staged when install.sh cannot write it without root
+letsClaw.service.generated
