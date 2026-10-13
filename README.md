@@ -1,10 +1,10 @@
-# letsClaw — Low Energy Agent Engine
+# letsClaw — Low Energy Technical Support Agent Engine
 
 A stripped-down agent: a long-lived **core service** holding the conversations, and
 thin clients — a terminal REPL and a browser UI — that attach to it over a WebSocket.
 Behavior is plain MD files — everything visible, nothing hidden.
 
-## Philosophy Haha
+## Philosophy / features
 - Simple: one config file, MD files for behavior
 - Modular: base modules always-on, feature toggles in config
 - Transparent: full source access, no black boxes
