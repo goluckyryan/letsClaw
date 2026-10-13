@@ -270,6 +270,28 @@ async def run(http):
     html = await tab.js("document.querySelector('.msg.llm .body').innerHTML")
     check("markdown became real elements",
           "<pre" in html and re.search(r"<h[2-6]", html) and "<ul>" in html, html[:200])
+
+    # --- the left-gutter clock ------------------------------------------------
+    # The core stamps the turn_start, the first text delta, and the tool
+    # call/result; the WebUI draws each in the .ts column, date over time,
+    # with the full local time in the title.
+    check("user message carries a gutter stamp",
+          await tab.until(
+              "(document.querySelector('.msg.user .ts')||{}).textContent"
+              ".match(/^\d{4}-\d{2}-\d{2}\\n\d{2}:\d{2}:\d{2}$/)", 10))
+    user_ts = await tab.js("document.querySelector('.msg.user .ts').title")
+    check("llm answer carries a gutter stamp",
+          await tab.until(
+              "(document.querySelector('.msg.llm .ts')||{}).textContent"
+              ".match(/^\d{4}-\d{2}-\d{2}\\n\d{2}:\d{2}:\d{2}$/)", 10))
+    # The stamp is the first child — the column sits left of the avatar.
+    check("stamp sits in the left column",
+          await tab.js("document.querySelector('.msg.user').firstElementChild.classList.contains('ts')"))
+    # Every .ts column shares one left edge: messages and slab boxes align.
+    check("msg and slab stamps share the gutter", await tab.js(
+        "(() => { const a = document.querySelector('.msg .ts').getBoundingClientRect();"
+        "  const b = document.querySelector('.slab .ts').getBoundingClientRect();"
+        "  return Math.abs(a.left - b.left) < 1; })()"))
     check("code block got a copy button", 'class="copy"' in html)
     check("code block content survived", "ls -la" in html)
     stats_txt = await tab.js("document.querySelector('.slab.stats').textContent")
@@ -344,6 +366,15 @@ async def run(http):
           "exec" in (await tab.js("document.querySelector('.slab.tool').textContent")))
     check("tool result size reported",
           await tab.until("!!document.querySelector('.slab.tool .done')", 180))
+    # The call's stamp (the core's reservation moment) and the result's time
+    # (the core's result moment) are different events, both drawn.
+    check("tool call slab carries its gutter stamp",
+          await tab.until(
+              "(document.querySelector('.slab.tool .ts')||{}).textContent"
+              ".match(/^\d{4}-\d{2}-\d{2}\\n\d{2}:\d{2}:\d{2}$/)", 10))
+    check("the tool result tag carries its own time",
+          await tab.until(
+              "/\d{2}:\d{2}:\d{2}/.test(document.querySelector('.slab.tool .done')?.textContent||'')", 10))
     check("tool turn finishes",
           await tab.until("document.querySelectorAll('.slab.stats').length === 2", 180))
     check("tool arguments are inspectable",
@@ -418,6 +449,16 @@ async def run(http):
           (await tab2.js("document.querySelectorAll('.msg.user').length")) == 2)
     check("replayed answer is rendered markdown",
           "<pre" in (await tab2.js("document.querySelector('.msg.llm .body').innerHTML") or ""))
+    # Replay builds the log from history: the stamps are the core's, not the
+    # browser's, so the same message reads the same time in both tabs.
+    check("replay carries the same stamp as the live turn",
+          (await tab2.js(
+              "(() => { const u = [...document.querySelectorAll('.msg.user .ts')]"
+              f"  .find(t => t.title === {user_ts!r});"
+              "  return u && u.textContent; })()"))
+          == (await tab.js("document.querySelector('.msg.user .ts').textContent")))
+    check("replayed tool result keeps its time",
+          "/\d{2}:\d{2}:\d{2}/.test(document.querySelector('.slab.tool .done')?.textContent||'')")
     check("replayed tool call is paired with its result",
           "chars" in (await tab2.js("document.querySelector('.slab.tool').textContent") or ""))
     # Replay builds the log from history, not from events, so it needs its own check.

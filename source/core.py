@@ -121,6 +121,26 @@ def ev(t, **kw):
     return {"t": t, **kw}
 
 
+def now_stamp():
+    """Local wall-clock time, seconds: when a message happened.
+
+    Display metadata for the clients' timestamps — a history message and the
+    events that draw it carry the same stamp, so a live turn and its replay
+    read identically. Never sent to the model: api_messages() drops it.
+    """
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def api_messages(history):
+    """History as the model sees it, display-only keys stripped.
+
+    The `at` stamp is for the clients' clocks, not the prompt: it would ride
+    in every request as invisible overhead, and a server that echoes unknown
+    keys could surface it in the answer.
+    """
+    return [{k: v for k, v in m.items() if k != "at"} for m in history]
+
+
 def config_theme(config):
     """webui.theme: auto (follow the OS), dark, or light.
 
@@ -985,7 +1005,13 @@ class Session:
         async with self.lock:
             self.turn_id += 1
             self.turn_events.clear()
-            self.emit(ev("turn_start", turn_id=self.turn_id, text=text, origin=origin))
+            # One stamp for the turn: the event and the history message that
+            # draw the same question must agree, or a replay across a second
+            # boundary would read a different time than the live turn.
+            turn_at = now_stamp()
+            self._turn_at = turn_at
+            self.emit(ev("turn_start", turn_id=self.turn_id, text=text, origin=origin,
+                         at=turn_at))
             try:
                 if self.engine and self.engine.turn_timeout:
                     # The turn's hard wall (models.<name>.turn_timeout). A wall
@@ -1046,7 +1072,8 @@ class Session:
         # Before the user message lands, so a roll starts the fresh session with
         # this turn's question in it rather than one turn late.
         await self._headroom_check()
-        self.history.append({"role": "user", "content": text})
+        self.history.append({"role": "user", "content": text,
+                             "at": getattr(self, "_turn_at", None) or now_stamp()})
         user_tok = count_text(text)
         # After the headroom check, so the question opens the segment it is
         # actually answered in rather than the one that just rolled away.
@@ -1179,14 +1206,20 @@ class Session:
                     push_reasoning_stat(time.monotonic(), flush=True)
                 if interruptible and self._steering:
                     raise RoundInterrupted()
+                first = not emitted
                 emitted.append(chunk)
-                self.emit(ev("text", delta=chunk))
+                # First words of the block: the client opens its message there,
+                # so that delta carries the timestamp and the rest do not.
+                self.emit(ev("text", delta=chunk,
+                             **({"at": now_stamp()} if first else {})))
 
             def on_reasoning(chunk):
                 nonlocal reason_t0
                 if interruptible and self._steering:
                     raise RoundInterrupted()
-                self.emit(ev("reasoning", delta=chunk))
+                first = not reason_emitted
+                self.emit(ev("reasoning", delta=chunk,
+                             **({"at": now_stamp()} if first else {})))
                 now = time.monotonic()
                 if reason_t0 is None:
                     reason_t0 = now
@@ -1198,7 +1231,9 @@ class Session:
             # extra_messages ride along for this one round without entering the
             # conversation: the closing round needs the "do not call tools"
             # directive, but a turn's history must not collect scaffolding.
-            msgs = self.history + list(extra_messages or [])
+            # Display-only keys stripped at the boundary: the model sees
+            # role/content/tool_calls, never the timestamps.
+            msgs = api_messages(self.history) + list(extra_messages or [])
             if pad is None:
                 result = await self.engine.chat_with_tools(
                     msgs, tools=tools, on_text=on_text,
@@ -1241,6 +1276,7 @@ class Session:
             self.history.append({
                 "role": "assistant",
                 "content": result.text or "",
+                "at": now_stamp(),
                 "tool_calls": [
                     {"id": tc["id"], "type": "function",
                      "function": {"name": tc["name"],
@@ -1252,15 +1288,17 @@ class Session:
             # torn off mid-loop still leaves a well-formed history.
             slots = {}
             for tc in result.tool_calls:
+                # Reserved before running: the stamp is the reservation moment,
+                # rewritten when the result lands (run_tools below).
                 msg = {"role": "tool", "tool_call_id": tc["id"],
-                       "content": "error: cancelled"}
+                       "content": "error: cancelled", "at": now_stamp()}
                 slots[tc["id"]] = msg
                 self.history.append(msg)
 
             for tc in result.tool_calls:
                 # Emitted BEFORE the call: a 120-second exec used to be silent.
                 self.emit(ev("tool_call", id=tc["id"], name=tc["name"],
-                             arguments=tc["arguments"]))
+                             arguments=tc["arguments"], at=now_stamp()))
                 tag = f"turn {self.turn_id} round {rounds}"
                 # Recorded before the call runs, so a command that hangs until
                 # the turn wall still leaves behind what was attempted.
@@ -1284,9 +1322,11 @@ class Session:
                     full, out = await tool.run_full(tc["arguments"])
                 tools_used += 1
                 slots[tc["id"]]["content"] = out
+                slots[tc["id"]]["at"] = now_stamp()
                 await self.jot(
                     f"{tag} tool_result {tc['name']} {tc['id']} {len(full)} chars", full)
-                self.emit(ev("tool_result", id=tc["id"], name=tc["name"], size=len(out)))
+                self.emit(ev("tool_result", id=tc["id"], name=tc["name"],
+                             size=len(out), at=slots[tc["id"]]["at"]))
 
         def was_cut_off(result):
             """Reasoning ate the whole budget: thought hard, said nothing."""
@@ -1304,8 +1344,9 @@ class Session:
             """
             queued, self._steering = self._steering, []
             for text in queued:
-                self.history.append({"role": "user", "content": text})
-                self.emit(ev("steering", text=text, turn_id=self.turn_id))
+                at = now_stamp()
+                self.history.append({"role": "user", "content": text, "at": at})
+                self.emit(ev("steering", text=text, turn_id=self.turn_id, at=at))
                 await self.jot(f"turn {self.turn_id} steering", text)
 
         async def record_partial():
@@ -1322,7 +1363,8 @@ class Session:
                                "".join(reason_emitted))
             partial = "".join(emitted)
             if partial.strip():
-                self.history.append({"role": "assistant", "content": partial})
+                self.history.append({"role": "assistant", "content": partial,
+                                     "at": now_stamp()})
                 await self.jot(f"turn {self.turn_id} partial (steering)", partial)
 
         try:
@@ -1361,7 +1403,8 @@ class Session:
                         # is never dropped just for arriving a moment late.
                         if result.text:
                             self.history.append(
-                                {"role": "assistant", "content": result.text})
+                                {"role": "assistant", "content": result.text,
+                                 "at": now_stamp()})
                         await drain_steering()
                         continue
                     full_response = result.text
@@ -1385,8 +1428,8 @@ class Session:
             self.emit(ev("error", msg=f"{type(e).__name__}: {e}", fatal=False))
             if tools_used == 0:
                 try:
-                    full_response = await self.engine.chat(self.history)
-                    self.emit(ev("text", delta=full_response))
+                    full_response = await self.engine.chat(api_messages(self.history))
+                    self.emit(ev("text", delta=full_response, at=now_stamp()))
                     # The one answer that never goes through call_round.
                     await self.jot(f"turn {self.turn_id} fallback text", full_response)
                     had_error = False
@@ -1420,7 +1463,8 @@ class Session:
         self.total_output += out_tok
 
         if not had_error and full_response:
-            self.history.append({"role": "assistant", "content": full_response})
+            self.history.append({"role": "assistant", "content": full_response,
+                                 "at": now_stamp()})
             # How full the window is = what the NEXT prompt will cost: the prompt
             # just sent, plus the answer we appended. Deliberately not
             # prompt+completion — completion includes reasoning, which is thrown
@@ -1731,7 +1775,8 @@ class Session:
             self.emit(ev("notice", level="warn",
                          text=f"reasoning was cut off and this server cannot resume it "
                               f"— forcing a conclusion under {cap or 'the model default'} tok"))
-            self.history.append({"role": "user", "content": directive})
+            self.history.append({"role": "user", "content": directive,
+                                  "at": now_stamp()})
             try:
                 result = await call_round(overrides={"max_tokens": cap} if cap else None)
             except BaseException:

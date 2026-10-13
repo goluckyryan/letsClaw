@@ -439,9 +439,27 @@ function node(cls, html) {
   return el;
 }
 
-function msg(kind, who, html) {
+/* The left-gutter clock: the core's stamp as date over time —
+   2026-10-13 / 13:49:02, right-aligned so both lines march straight down the
+   left edge. The full local time rides in `title` on hover. Every block the
+   user can refer to — prompt, answer, thinking, tool call, tool result —
+   carries one, stamped by the core at the moment it happened, so a live turn
+   and its replay read identically. Old sessions without stamps show an
+   empty gutter instead of a guess. */
+function tsEl(iso) {
+  const el = document.createElement('div');
+  el.className = 'ts';
+  if (iso) {
+    el.title = iso;
+    el.textContent = iso.slice(0, 10) + '\n' + iso.slice(11, 19);
+  }
+  return el;
+}
+
+function msg(kind, who, html, ts) {
   const el = node(`msg ${kind}`);
   el.innerHTML = `<div class="who">${who}</div><div class="body"></div>`;
+  el.insertBefore(tsEl(ts), el.firstChild);
   if (html !== undefined) el.querySelector('.body').innerHTML = html;
   return append(el);
 }
@@ -485,10 +503,15 @@ if (typeof ResizeObserver !== 'undefined') new ResizeObserver(layoutPins).observ
    their own padding, and on a single element that shorthand would wipe out the
    50px gutter offset. Callers get the inner box, so `.slab.roll button` and the
    like still match as descendants. */
-function slab(cls, html) {
-  const box = node('slab-box', html);
-  append(node(`slab ${cls}`)).appendChild(box);
-  return box;
+function slab(cls, html, ts) {
+  const outer = node(`slab ${cls}`);
+  outer.appendChild(tsEl(ts));
+  const sp = document.createElement('div');
+  sp.className = 'ts-spacer';
+  outer.appendChild(sp);
+  outer.appendChild(node('slab-box', html));
+  append(outer);
+  return outer.querySelector('.slab-box');
 }
 
 function notice(text, level) {
@@ -754,8 +777,8 @@ function switchSession(name) {
 
 /* ---------------------------------------------------------------- rendering */
 
-function toolSlab(name, args) {
-  const el = slab('tool');
+function toolSlab(name, args, ts) {
+  const el = slab('tool', null, ts);
   const d = document.createElement('details');
   d.innerHTML = `<summary>⚙️ <b>${esc(name)}</b> <span class="arg"></span></summary>`;
   d.querySelector('.arg').textContent = (args || '').slice(0, 160);
@@ -786,7 +809,7 @@ function handle(e) {
     // view left mid-log by a previous round now resumes the moment the user
     // asks again.
     follow = true;
-    pinUser(msg('user', '👤', esc(e.text)));
+    pinUser(msg('user', '👤', esc(e.text), e.at));
     setWaiting('thinking');
     return;
 
@@ -797,7 +820,7 @@ function handle(e) {
     thinkGrew();
     if (!S.showReasoning) return;
     if (!S.turn) S.turn = { textEl: null, reasonEl: null, tools: new Map() };
-    if (!S.turn.reasonEl) S.turn.reasonEl = msg('reasoning', '🧠').querySelector('.body');
+    if (!S.turn.reasonEl) S.turn.reasonEl = msg('reasoning', '🧠', null, e.at).querySelector('.body');
     S.turn.reasonEl.textContent += e.delta;
     if (follow) log.scrollTop = log.scrollHeight;
     return;
@@ -818,7 +841,7 @@ function handle(e) {
     clearWaiting();
     if (!S.turn) S.turn = { textEl: null, reasonEl: null, tools: new Map() };
     else S.turn.reasonEl = null;   // any further thinking opens its own block
-    if (!S.turn.textEl) S.turn.textEl = msg('llm', '🐱').querySelector('.body');
+    if (!S.turn.textEl) S.turn.textEl = msg('llm', '🐱', null, e.at).querySelector('.body');
     stream(S.turn.textEl, e.delta);
     return;
 
@@ -826,7 +849,7 @@ function handle(e) {
     stampThinking();
     clearWaiting();
     if (S.turn) { flushStream(S.turn.textEl); S.turn.textEl = null; S.turn.reasonEl = null; }
-    const el = toolSlab(e.name, e.arguments);
+    const el = toolSlab(e.name, e.arguments, e.at);
     if (S.turn) S.turn.tools.set(e.id, el);
     setWaiting(e.name);
     return;
@@ -838,11 +861,12 @@ function handle(e) {
     if (el) {
       const tag = document.createElement('span');
       tag.className = 'done';
-      tag.textContent = ` ↳ ${e.size} chars`;
+      tag.textContent = ` ↳ ${e.size} chars` + (e.at ? ` · ${e.at.slice(11, 19)}` : '');
       el.querySelector('summary').appendChild(tag);
     } else {
       // Attached mid-turn: we never saw the tool_call this answers.
-      slab('tool', `⚙️ <b>${esc(e.name)}</b> <span class="done">↳ ${e.size} chars</span>`);
+      slab('tool', `⚙️ <b>${esc(e.name)}</b> <span class="done">↳ ${e.size} chars`
+        + (e.at ? ` · ${e.at.slice(11, 19)}` : '') + `</span>`, null, e.at);
     }
     setWaiting('thinking');
     return;
@@ -855,7 +879,7 @@ function handle(e) {
     stampThinking();
     clearWaiting();
     if (S.turn) { flushStream(S.turn.textEl); S.turn.textEl = null; S.turn.reasonEl = null; }
-    const st = msg('user', '📌', esc(e.text));
+    const st = msg('user', '📌', esc(e.text), e.at);
     st.classList.add('steering');
     addPin(st);
     setWaiting('thinking');
@@ -1057,26 +1081,26 @@ function replayHistory(messages) {
   const pending = new Map();
   for (const m of messages) {
     if (m.role === 'user') {
-      pinUser(msg('user', '👤', esc(m.content || '')));
+      pinUser(msg('user', '👤', esc(m.content || ''), m.at));
     // 'assistant' here is the wire role the server stores, not a display name:
     // the chat template switches on that exact string. The bubble is .msg.llm.
     } else if (m.role === 'assistant' && m.tool_calls) {
       // .trim(): a model heading straight for a tool usually still emits "\n\n",
       // which is truthy and would replay as an avatar beside an empty bubble.
-      if ((m.content || '').trim()) msg('llm', '🐱', renderMd(m.content));
+      if ((m.content || '').trim()) msg('llm', '🐱', renderMd(m.content), m.at);
       for (const tc of m.tool_calls) {
-        pending.set(tc.id, toolSlab(tc.function.name, tc.function.arguments));
+        pending.set(tc.id, toolSlab(tc.function.name, tc.function.arguments, m.at));
       }
     } else if (m.role === 'assistant') {
       if (!(m.content || '').trim()) continue;
-      msg('llm', '🐱', renderMd(m.content));
+      msg('llm', '🐱', renderMd(m.content), m.at);
     } else if (m.role === 'tool') {
       const el = pending.get(m.tool_call_id);
       if (!el) continue;
       const out = m.content || '';
       const tag = document.createElement('span');
       tag.className = out.startsWith('error:') ? 'fail' : 'done';
-      tag.textContent = ` ↳ ${out.length} chars`;
+      tag.textContent = ` ↳ ${out.length} chars` + (m.at ? ` · ${m.at.slice(11, 19)}` : '');
       el.querySelector('summary').appendChild(tag);
       const pre = document.createElement('pre');
       pre.textContent = out.slice(0, 4000);

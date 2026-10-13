@@ -328,6 +328,19 @@ main {
   gap: 10px;
   align-items: flex-start;
 }
+/* The clock column: the core's stamp, date over time, right-aligned so both
+   lines march in a straight line down the left edge — the timeline. The full
+   local time is in the title on hover. Empty for sessions stamped before
+   stamps existed; the column stays, so nothing reflows. */
+.ts {
+  flex: 0 0 72px;
+  font: 11px/1.5 var(--mono);
+  color: var(--dim);
+  text-align: right;
+  white-space: pre;      /* the date and the time are two lines, held apart by \n */
+  user-select: none;
+  padding-top: 3px;
+}
 .who { flex: 0 0 22px; font-size: 15px; user-select: none; padding-top: 2px; }
 .body { flex: 1; min-width: 0; }        /* min-width:0 lets <pre> scroll instead of stretching the page */
 
@@ -545,9 +558,17 @@ main {
 .slab {
   max-width: 900px;
   margin: 0 auto 10px;
-  padding: 0 18px 0 50px;      /* line up with .body, past the .who gutter */
+  padding: 0 18px;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
   font: 12.5px var(--mono);
 }
+/* The box lands where .body does: ts(72) + gap + spacer(22, standing in for
+   .who) + gap — the same flex rhythm .msg uses, so message text and slab
+   boxes share one left edge. */
+.slab .ts-spacer { flex: 0 0 22px; }
+.slab .slab-box { flex: 1; min-width: 0; }
 
 .tool .slab-box {
   background: var(--bg2);
@@ -638,6 +659,10 @@ main {
 }
 
 .waiting { color: var(--dim); font: 12.5px var(--mono); }
+/* The spinner is block, not flex: its spans are one flowing line, and it
+   starts where the slab boxes do: 18 padding + 72 clock + 10 gap + 22 spacer
+   + 10 gap. */
+.slab.waiting { display: block; padding-left: 132px; }
 .waiting .spin { display: inline-block; width: 1em; color: var(--accent); }
 /* Fixed width on the clock so the token figure beside it does not jog left and
    right as the seconds roll over from 9.9 to 10.0. */
