@@ -1087,6 +1087,14 @@ class LetsClawBot(discord.Client):
             await self._core_http.close()
         await super().close()
 
+    async def on_error(self, event_method, *args, **kwargs):
+        # Any unhandled event/callback failure lands here. Without this the
+        # bot dies silently on a bad slash interaction.
+        logger.exception("discord event %s raised", event_method)
+
+    async def on_command_error(self, command, error):
+        logger.exception("command %s raised", command, exc_info=error)
+
     async def on_ready(self):
         logger.info("connected to Discord as %s (%d allowed user(s))",
                     self.user, len(self.settings.users))
@@ -1691,8 +1699,25 @@ class LetsClawBot(discord.Client):
         text = bridge.render_response(event) or "_done_"
         chunks = chunk_discord_text(text, max_chars=DISCORD_LIMIT,
                                     max_lines=self.settings.max_lines)
+        unlimited = self.settings.max_messages == MAX_MESSAGES_UNLIMITED
+        if unlimited or len(chunks) <= self.settings.max_messages:
+            for chunk in chunks:
+                await interaction.followup.send(chunk)
+            return
+        # Capped: send as much as fits, and attach the rest rather than drop it.
         for chunk in chunks[:self.settings.max_messages]:
             await interaction.followup.send(chunk)
+        rest = text  # the whole thing, unchunked, so the Markdown is intact
+        data = io.BytesIO(rest.encode("utf-8"))
+        try:
+            await interaction.followup.send(
+                f"_…{len(chunks) - self.settings.max_messages} more messages "
+                f"worth — the full answer is attached._",
+                file=discord.File(data, filename="answer.md"))
+        except discord.HTTPException as e:
+            logger.warning("session %s: could not attach the command answer (%s)",
+                           bridge.link.session, e)
+            await interaction.followup.send("_…the rest of the answer would not upload._")
 
     # -- text commands --
 
