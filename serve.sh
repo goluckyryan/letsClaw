@@ -44,26 +44,39 @@ if [ "$want_discord" = 1 ]; then
   for ((i = 0; i < ${#args[@]}; i++)); do
     [ "${args[i]}" = "--config" ] && cfg_arg="${args[i+1]}"
   done
-  # The exit code is the verdict: 0 = start it, 1 = no token, 2 = disabled.
+  # The exit code is the verdict: 0 = start it, 2 = disabled, 3 = no token.
   # Absent `enabled` means enabled, so a config that never had the key is
   # unaffected; a token that is set but disabled is a token that does nothing.
-  if "$PY" -c "
+  #
+  # Deliberately not 1 for "no token": 1 is what Python exits with on an
+  # uncaught exception, so the two were indistinguishable — and this probe
+  # imports from the source tree, so a rename there is exactly the kind of
+  # thing that raises here. It did: `from core import load_config` outlived
+  # the move to config.py, and with stderr discarded the bot simply stopped
+  # starting, under a message saying the token was missing. An unknown status
+  # now says so and shows what Python printed.
+  probe_err=$("$PY" -c "
 import sys
 sys.path.insert(0, 'source')
-from core import load_config
+from config import load_config
 cfg = load_config(sys.argv[1] or None)
 d = cfg.get('discord') or {}
 sys.exit(2 if d.get('enabled', True) is False else
-         0 if str(d.get('token') or '').strip() else 1)
-" "$cfg_arg" 2>/dev/null; then
-    :
-  elif [ $? -eq 2 ]; then
-    echo "   (discord.enabled is false — Discord bot not started)"
-    want_discord=0
-  elif [ $? -eq 1 ]; then
-    echo "   (no discord.token — Discord bot not started)"
-    want_discord=0
-  fi
+         0 if str(d.get('token') or '').strip() else 3)
+" "$cfg_arg" 2>&1 >/dev/null)
+  # Captured once: `[ $? -eq 2 ]` in an elif chain overwrites $? with its own
+  # result, so every later test read the comparison, not the command.
+  probe_status=$?
+  case "$probe_status" in
+    0) ;;
+    2) echo "   (discord.enabled is false — Discord bot not started)"
+       want_discord=0 ;;
+    3) echo "   (no discord.token — Discord bot not started)"
+       want_discord=0 ;;
+    *) echo "   ⚠️  could not read the discord config — bot not started"
+       [ -n "$probe_err" ] && printf '%s\n' "$probe_err" | sed 's/^/      /'
+       want_discord=0 ;;
+  esac
   if [ "$want_discord" = 1 ]; then
     # A moment for the core to bind, purely so the first log lines read in
     # order — the bot reconnects with backoff regardless, so this is cosmetic.

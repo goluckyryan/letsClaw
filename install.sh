@@ -60,7 +60,7 @@ setup_env() {
   if .venv/bin/python -c "
 import sys
 sys.path.insert(0, 'source')
-from core import load_config
+from config import load_config
 cfg = load_config(None)
 d = cfg.get('discord') or {}
 sys.exit(0 if d.get('enabled', True) is not False and
@@ -144,7 +144,7 @@ port_busy() {
   local port
   port=$(.venv/bin/python -c "
 import sys; sys.path.insert(0, 'source')
-from core import load_config
+from config import load_config
 print((load_config(None).get('core') or {}).get('port', 8770))" 2>/dev/null || echo 8770)
   ss -ltn 2>/dev/null | grep -q ":$port " && return 0 || return 1
 }
