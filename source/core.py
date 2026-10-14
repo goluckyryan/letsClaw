@@ -29,6 +29,7 @@ from pathlib import Path
 
 import yaml
 
+import behavior
 import config
 import config_edit
 import paths
@@ -90,36 +91,6 @@ REASONING_STAT_INTERVAL = 0.25
 # stop until its timeout fires and SIGKILLs the core mid-write.
 CLOSE_TURN_GRACE = 10
 
-# Marks the forced-conclusion directive in base.md. The core extracts the
-# paragraph after this line and re-sends it as a user message when a cut-off
-# round cannot be resumed (resume_mode: off, or a server that won't prefill) —
-# the model's own words, tunable without a code change. Missing marker = a short
-# built-in sentence.
-CONCLUDE_MARKER = "## Forced conclusion"
-CONCLUDE_FALLBACK = ("Your reasoning was cut off at the token limit. Stop "
-                     "reasoning now and give your best final answer. If you "
-                     "truly cannot conclude, say in one sentence what single "
-                     "fact is missing.")
-
-# Sent when a thinking pad has filled the context and is about to be compacted:
-# the model writes down what it has established, and that note replaces the
-# reasoning it summarises. Lives in base.md for the same reason as the above.
-CHECKPOINT_MARKER = "## Checkpoint"
-CHECKPOINT_FALLBACK = ("Your reasoning has filled the available room. Write "
-                       "down everything you have established so far — every "
-                       "intermediate value exactly as you computed it, every "
-                       "assumption made, and what still has to be done. This "
-                       "note replaces the reasoning it summarises, so whatever "
-                       "you leave out is lost. This is not the final answer.")
-
-# The base behavior — identity, working style and the tool notes — lives in
-# plain Markdown (behavior.base_file) so it can be tuned without a code change.
-# It is read once per core and shared by every session, and it is always in the
-# system prompt: a missing file is a startup warning and an empty base, the
-# same behavior as a missing per-model behavior file.
-DEFAULT_BASE_FILE = "models/base.md"
-
-
 def ev(t, **kw):
     """An event is just a tagged dict; 13 types don't warrant a class each."""
     return {"t": t, **kw}
@@ -172,6 +143,17 @@ config_theme = config.config_theme
 config_pin = config.config_pin
 valid_pin_value = config.valid_pin_value
 _int_or = config.int_or
+
+# Moved to behavior.py along with the cache that reads them.
+DEFAULT_BASE_FILE = behavior.DEFAULT_BASE_FILE
+CONCLUDE_MARKER = behavior.CONCLUDE_MARKER
+CONCLUDE_FALLBACK = behavior.CONCLUDE_FALLBACK
+CHECKPOINT_MARKER = behavior.CHECKPOINT_MARKER
+CHECKPOINT_FALLBACK = behavior.CHECKPOINT_FALLBACK
+strip_directive_sections = behavior.strip_directive_sections
+extract_directive = behavior.extract_directive
+extract_conclude_directive = behavior.extract_conclude_directive
+extract_checkpoint_directive = behavior.extract_checkpoint_directive
 
 
 class Subscriber:
@@ -259,68 +241,6 @@ def strip_tool_markup(text):
         return text
     cleaned = re.sub(r"<tool_call>.*?(?:</tool_call>|\Z)", "", text, flags=re.S)
     return cleaned.strip()
-
-
-def strip_directive_sections(base_behavior):
-    """The base behavior minus the two blocks the core sends on its own.
-
-    "## Checkpoint" and "## Forced conclusion" are templates, not behavior: each
-    is extracted and sent as a *user* message at the one moment it applies. They
-    live in base.md so they can be tuned without a code change, but they are
-    also, redundantly, part of every system prompt — and a model that reads its
-    whole system prompt as standing instruction will simply obey them. Claude
-    Opus 5 over Argo answers nothing at all, having been told on every turn that
-    "This is not the final answer".
-
-    Local thinking models ignore them, so stripping is opt-in per model
-    (models.<name>.strip_directives) rather than done for everyone. Extraction
-    is unaffected: the directives still reach the model when they are meant to.
-    """
-    out, skipping = [], False
-    for line in base_behavior.splitlines(keepends=True):
-        if line.startswith("## "):
-            skipping = line.strip() in (CHECKPOINT_MARKER, CONCLUDE_MARKER)
-        if not skipping:
-            out.append(line)
-    return "".join(out).rstrip() + "\n"
-
-
-def extract_conclude_directive(base_behavior):
-    """The paragraph that forces a cut-off round to conclude. See extract_directive."""
-    return extract_directive(base_behavior, CONCLUDE_MARKER, CONCLUDE_FALLBACK)
-
-
-def extract_checkpoint_directive(base_behavior):
-    """The paragraph that asks a full pad to distil itself. See extract_directive."""
-    return extract_directive(base_behavior, CHECKPOINT_MARKER, CHECKPOINT_FALLBACK)
-
-
-def extract_directive(base_behavior, marker, fallback):
-    """The paragraph after `marker` in the base behavior file.
-
-    These are messages the core sends the model on its own initiative, so they
-    live in base.md — tunable with /reload, no code change. Without the heading,
-    a short built-in sentence.
-    """
-    if marker not in base_behavior:
-        return fallback
-    _, _, rest = base_behavior.partition(marker)
-    # The paragraph ends at the next heading or end of file. HTML comments are
-    # notes to whoever edits the file, not words for the model.
-    para = []
-    in_comment = False
-    for line in rest.splitlines():
-        if line.startswith("#"):
-            break
-        if in_comment:
-            in_comment = "-->" not in line
-            continue
-        if line.lstrip().startswith("<!--"):
-            in_comment = "-->" not in line
-            continue
-        para.append(line)
-    text = "\n".join(para).strip()
-    return text or CONCLUDE_FALLBACK
 
 
 class Session:
@@ -1989,7 +1909,7 @@ class SessionManager:
         self.config_path = Path(config_path or CONFIG_PATH)
         self.sessions = {}
         self._engines = {}
-        self._behaviors = {}
+        self.behaviors = behavior.BehaviorStore(self.config)
         # ssh port-forwards the core owns (models with an ssh_forward entry).
         # configure() is synchronous and spawns nothing; the keepalive loop
         # starts from the server's on_startup, where a running loop exists.
@@ -2001,10 +1921,10 @@ class SessionManager:
         # Read synchronously at startup — one small local file, the same way
         # the config file itself is read. A missing file warns and degrades to
         # an empty base; the core keeps starting.
-        self.base_behavior = self._behavior_sync(
-            config.get("behavior", {}).get("base_file") or DEFAULT_BASE_FILE)
-        self.conclude_directive = extract_conclude_directive(self.base_behavior)
-        self.checkpoint_directive = extract_checkpoint_directive(self.base_behavior)
+        self.base_behavior = self.behaviors.read(
+            config.get("behavior", {}).get("base_file") or behavior.DEFAULT_BASE_FILE)
+        self.conclude_directive = behavior.extract_conclude_directive(self.base_behavior)
+        self.checkpoint_directive = behavior.extract_checkpoint_directive(self.base_behavior)
         self._engine_lock = asyncio.Lock()
         # Serialises session creation in get(). Creation spans three awaits
         # between the "is it there?" test and the insert, which is long enough
@@ -2133,151 +2053,26 @@ class SessionManager:
                         session.name, session.session_id)
         await store.register_id(session.session_id, session.name, self.config)
 
-    def _behavior_sync(self, path):
-        """Cached read, synchronous: a missing file is a warning and ""."""
-        if path not in self._behaviors:
-            p = paths.resolve(path)
-            self._behaviors[path] = p.read_text() if p.exists() else ""
-            if not p.exists():
-                logger.warning("behavior file not found: %s", p)
-        return self._behaviors[path]
-
-    async def _behavior_text(self, path):
-        """Cached read off the event loop; a missing file is a warning and ""."""
-        return await asyncio.to_thread(self._behavior_sync, path)
+    # The behavior cache moved to behavior.BehaviorStore, which owns the dict
+    # behind a lock. These stay as the names the rest of the core already calls.
 
     def session_behavior_path(self, session_name):
-        """models/sessions/<session>.md for this session, or None.
-
-        None when the layer is switched off (no behavior.session_dir), or when
-        the name will not make a safe filename.
-
-        Session names are not validated on attach — server.py takes ?session=
-        from the query and mgr.get() creates whatever it is handed — so a
-        session called `../../etc/passwd` can exist. This is the one place a
-        session name becomes a path that is *read*, so it is guarded twice: the
-        name is slugged to the same character set session._safe() allows, and
-        the result is then required to sit directly in session_dir. Either
-        alone would do; both is cheap, and the failure mode is an arbitrary
-        file landing in a system prompt.
-        """
-        configured = (self.config.get("behavior", {}) or {}).get("session_dir")
-        if not configured:
-            return None
-        slug = "".join(c if c.isalnum() or c in "-_." else "_"
-                       for c in str(session_name))[:64]
-        if not slug or set(slug) <= {".", "_"}:
-            return None
-        root = paths.resolve(configured)
-        candidate = (root / f"{slug}.md").resolve()
-        if candidate.parent != root.resolve():
-            logger.warning("session %r does not make a safe behavior filename "
-                           "— skipping its layer", session_name)
-            return None
-        return candidate
-
-    async def behavior_for(self, entry, session_name=None):
-        """(base, model, session) behavior — the three layers of the prompt.
-
-        The shared base file, then the model's own, then one named for the
-        session. All cached; a missing file is "" (warned), which is what makes
-        the third layer optional per session rather than per install.
-        """
-        base = await self._behavior_text(
-            self.config.get("behavior", {}).get("base_file") or DEFAULT_BASE_FILE)
-        # Per model, because it is a property of how the model reads a prompt,
-        # not of the prompt. Applied after the cached read so the cache still
-        # holds the file as written.
-        if entry.get("strip_directives"):
-            base = strip_directive_sections(base)
-        model = await self._behavior_text(entry.get("behavior_file", "models/default.md"))
-
-        session = ""
-        path = self.session_behavior_path(session_name) if session_name else None
-        if path is not None:
-            # Quietly absent, unlike the other two: most sessions have no file
-            # and are not meant to, so a warning per attach would be noise.
-            session = await asyncio.to_thread(self._session_behavior_sync, path)
-        return base, model, session
-
-    def _session_behavior_sync(self, path):
-        key = str(path)
-        if key not in self._behaviors:
-            self._behaviors[key] = path.read_text() if path.exists() else ""
-        return self._behaviors[key]
-
-    def _stale_behaviors(self):
-        """Cache keys whose file on disk no longer matches what was read.
-
-        Content, not mtime: an editor that writes a file back byte-identical
-        should not be reported as a change, and these are a handful of small
-        local files, so reading them all costs less than being wrong. Every
-        path ever consulted is a key — a missing file caches "" — so a
-        session .md created after the session attached is caught too.
-
-        A file that has since been deleted compares as "", which is what
-        _behavior_sync would cache for it now.
-        """
-        stale = []
-        for key, cached in self._behaviors.items():
-            p = paths.resolve(key)
-            try:
-                current = p.read_text() if p.exists() else ""
-            except OSError as e:
-                # Not stale, not fatal: keep the cached text and say so. The
-                # alternative is refusing the whole reload over one unreadable
-                # file that may not even be in use any more.
-                logger.warning("behavior file unreadable, keeping cached: %s: %s", p, e)
-                continue
-            if current != cached:
-                stale.append(key)
-        return stale
+        return self.behaviors.session_path(session_name)
 
     def behavior_keys_for(self, entry, session_name=None):
-        """The cache keys behavior_for would read for this session.
+        return self.behaviors.keys_for(entry, session_name)
 
-        Same strings _behavior_sync and _session_behavior_sync key on, so a
-        caller can ask which of its own three files a refresh touched.
-        """
-        keys = [self.config.get("behavior", {}).get("base_file") or DEFAULT_BASE_FILE,
-                entry.get("behavior_file", "models/default.md")]
-        path = self.session_behavior_path(session_name) if session_name else None
-        if path is not None:
-            keys.append(str(path))
-        return keys
-
-    def _refresh_behaviors_sync(self):
-        """Re-read every changed behavior file into the cache. Returns the keys.
-
-        A file that has gone *empty* having had content is treated as a save in
-        progress, not a deletion: the cached text is kept and the caller warned.
-        Truncation in general cannot be detected — empty is the case that would
-        otherwise blank a session's instructions, and it is the state an editor
-        passes through on the way to writing a file out.
-        """
-        refreshed = []
-        for key in self._stale_behaviors():
-            p = paths.resolve(key)
-            try:
-                text = p.read_text() if p.exists() else ""
-            except OSError as e:
-                logger.warning("behavior file unreadable, keeping cached: %s: %s", p, e)
-                continue
-            if not text.strip() and self._behaviors.get(key, "").strip():
-                logger.warning("behavior file %s is empty — keeping the cached text "
-                               "(a save in progress?)", p)
-                continue
-            self._behaviors[key] = text
-            refreshed.append(key)
-        return refreshed
+    async def behavior_for(self, entry, session_name=None):
+        """(base, model, session) behavior, read off the event loop."""
+        return await asyncio.to_thread(self.behaviors.layers_sync, entry, session_name)
 
     async def refresh_behaviors(self):
-        """_refresh_behaviors_sync off the event loop.
+        """Reconcile the behavior cache with disk, off the event loop.
 
         Touches the cache and nothing else — no live window is rebuilt here, so
         this is safe to call from /reload as well as from the rebuild paths.
         """
-        return await asyncio.to_thread(self._refresh_behaviors_sync)
+        return await asyncio.to_thread(self.behaviors.refresh_sync)
 
     async def get(self, name, model=None):
         """The session called `name`, created on first use.
@@ -2383,10 +2178,12 @@ class SessionManager:
         # manager's own copy is safe to move immediately: the directives below
         # are re-sent as user messages mid-turn, not held in the prompt prefix,
         # so updating them costs no KV cache.
-        self.base_behavior = await self._behavior_text(
-            fresh.get("behavior", {}).get("base_file") or DEFAULT_BASE_FILE)
-        self.conclude_directive = extract_conclude_directive(self.base_behavior)
-        self.checkpoint_directive = extract_checkpoint_directive(self.base_behavior)
+        self.base_behavior = await asyncio.to_thread(
+            self.behaviors.read,
+            fresh.get("behavior", {}).get("base_file") or behavior.DEFAULT_BASE_FILE)
+        self.conclude_directive = behavior.extract_conclude_directive(self.base_behavior)
+        self.checkpoint_directive = behavior.extract_checkpoint_directive(
+            self.base_behavior)
         tools_cfg = fresh.get("tools", {})
         workdir = tools_cfg.get("workdir") or str(paths.REPO_ROOT)
         from tools import build_tools
