@@ -13,7 +13,7 @@ state dir, so the panel's Save button writes the copy — never the real file.
 What it proves:
   1. GET/POST /config need the token; GET returns the live config dict.
   2. The panel renders every top-level section; webui is open and editable,
-     the rest is read-only; secrets are masked behind a reveal; the
+     the rest is read-only; secrets never leave the core at all; the
      restart-only keys (core.bind, core.port, discord.enabled) carry a badge.
   3. Saving webui rewrites only that block — every comment and every other
      section of the file survives — and re-themes the live tab without a
@@ -131,17 +131,26 @@ async def run(http):
                               " .querySelector('summary').textContent.trim().startsWith('webui');"
                               " })()", 10))
 
-        # Secrets are masked; the eye reveals. The first one in the panel is
-        # core.token — this core's own token, so the expected value is known.
-        check("core.token is masked by default",
+        # Secrets are redacted by the core, so the panel has nothing to reveal.
+        # The first one in the panel is core.token — this core's own token, so
+        # the value that must NOT appear is known exactly.
+        check("core.token is masked, with no reveal to click",
               await tab.until("(() => { const s = document.querySelector('#set-body .cfg-secret');"
-                              " return s && s.querySelector('.dots') && s.querySelector('.cfg-val').hidden;"
-                              " })()", 10))
-        await tab.js("document.querySelector('#set-body .cfg-secret button').click()")
-        check("reveal shows the real token",
-              await tab.until("(() => { const s = document.querySelector('#set-body .cfg-secret');"
-                              f" return s.querySelector('.cfg-val').textContent === {json.dumps(TOKEN)};"
-                              " })()", 10))
+                              " return !!s && !!s.querySelector('.dots')"
+                              "   && !!s.querySelector('.cfg-hint')"
+                              "   && !s.querySelector('button'); })()", 10))
+        # The real check: the token is absent from the whole panel, not merely
+        # hidden in it. A CSS-hidden node would still be in the DOM, in the
+        # /config response, and in a screenshot of the Network tab.
+        check("the token is nowhere in the rendered panel",
+              await tab.js(f"!document.querySelector('#set-body').innerHTML"
+                           f".includes({json.dumps(TOKEN)})"))
+        check("and nowhere in what /config returned",
+              await tab.js(
+                  "(async () => { const r = await fetch('/config', {headers:"
+                  f" {{Authorization: 'Bearer ' + {json.dumps(TOKEN)}}}}});"
+                  f" return !(JSON.stringify(await r.json())).includes({json.dumps(TOKEN)});"
+                  " })()"))
 
         # Restart-only keys are badged; the live ones are not.
         await tab.js("(() => { for (const name of ['core', 'discord']) {"

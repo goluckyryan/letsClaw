@@ -16,7 +16,14 @@ session history.
 import asyncio, json, os, re, shutil, subprocess, tempfile, time
 import aiohttp
 
-CORE = os.environ.get("CORE", "http://127.0.0.1:8770")
+try:
+    CORE = os.environ["CORE"]
+except KeyError:
+    raise SystemExit(
+        "web/image_test.py: set CORE first.\n"
+        "This suite attaches a session on whatever core CORE names, and used to\n"
+        "default to the live core at http://127.0.0.1:8770.\n"
+        "    CORE=http://127.0.0.1:9131 .venv/bin/python web/image_test.py")
 CHROME = shutil.which("google-chrome") or shutil.which("chromium")
 results = []
 

@@ -26,7 +26,18 @@ import re
 import aiohttp
 import yaml
 
-CORE = os.environ.get("CORE", "http://127.0.0.1:8770")
+try:
+    CORE = os.environ["CORE"]
+except KeyError:
+    raise SystemExit(
+        "web/browser_test.py: set CORE first.\n"
+        "This suite creates, renames and deletes sessions on whatever core CORE\n"
+        "names. It used to default to http://127.0.0.1:8770 — the live core — so\n"
+        "running it bare scribbled fixtures over real state (see scratch_config's\n"
+        "note about session_ID.log). Point it at a scratch core:\n"
+        "    CORE=http://127.0.0.1:8899 .venv/bin/python web/browser_test.py\n"
+        "or, deliberately, at the live one:\n"
+        "    CORE=http://127.0.0.1:8770 .venv/bin/python web/browser_test.py")
 CHROME = shutil.which("google-chrome") or shutil.which("chromium")
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / "config.yaml"
@@ -61,9 +72,22 @@ def scratch_config(cfg):
     real state/sessions too; nothing landed there only because these cores
     never roll over. Deleting a session now purges by id, so leaving them
     pointed at real state is a sharper edge than it was.
+
+    Those three keys were not all of them. `memory.long_term_file` and
+    `webui.files_dir` are writable paths too, and paths.resolve() anchors a
+    relative one at the repo root, so a test core was configured to append
+    rollover handoffs to the real state/memory_store/long_term.md and to serve
+    and create files under the real state/files. Nothing had landed there, but
+    only because no test had yet rolled over — the same "it has not happened
+    yet" that the paragraph above was written about.
+
+    So rather than redirect a list of keys that keeps turning out to be
+    incomplete, the sweep at the end refuses *any* remaining value that would
+    resolve back into state/ or logs/. A writable key added to config.yaml
+    later fails here instead of quietly writing to real state.
     """
     tmp = tempfile.mkdtemp(prefix="letsclaw-test-")
-    for sub in ("sessions", "live", "logs"):
+    for sub in ("sessions", "live", "logs", "memory", "files"):
         Path(tmp, sub).mkdir()
     cfg.setdefault("conversation", {})
     cfg["conversation"]["sessions_dir"] = f"{tmp}/sessions"
@@ -71,6 +95,33 @@ def scratch_config(cfg):
     cfg.setdefault("logging", {})
     # log_dir() is the parent of logging.file, and session_ID.log sits beside it.
     cfg["logging"]["file"] = f"{tmp}/logs/letclaw.log"
+    cfg.setdefault("memory", {})
+    cfg["memory"]["long_term_file"] = f"{tmp}/memory/long_term.md"
+    cfg.setdefault("webui", {})
+    # Seeded with a copy of whatever the real files_dir holds: image_test renders
+    # ![p](testplot.png) and needs the fixture to be there, and a suite reading a
+    # fixture is fine — it is writing to real state that is not. Copying means a
+    # test that saves a file writes into the temp dir beside the copy.
+    real_files = ROOT / str(cfg["webui"].get("files_dir") or "state/files")
+    if real_files.is_dir():
+        shutil.copytree(real_files, f"{tmp}/files", dirs_exist_ok=True)
+    cfg["webui"]["files_dir"] = f"{tmp}/files"
+
+    def sweep(node, trail=""):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                sweep(v, f"{trail}.{k}" if trail else str(k))
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                sweep(v, f"{trail}[{i}]")
+        elif isinstance(node, str):
+            head = node.split("/", 1)[0]
+            if head in ("state", "logs"):
+                raise AssertionError(
+                    f"scratch_config left {trail} = {node!r} pointing at real "
+                    f"state; redirect it into the temp dir before starting a core")
+
+    sweep(cfg)
     return cfg
 
 
@@ -278,12 +329,12 @@ async def run(http):
     check("user message carries a gutter stamp",
           await tab.until(
               "(document.querySelector('.msg.user .ts')||{}).textContent"
-              ".match(/^\d{4}-\d{2}-\d{2}\\n\d{2}:\d{2}:\d{2}$/)", 10))
+              r".match(/^\d{4}-\d{2}-\d{2}\n\d{2}:\d{2}:\d{2}$/)", 10))
     user_ts = await tab.js("document.querySelector('.msg.user .ts').title")
     check("llm answer carries a gutter stamp",
           await tab.until(
               "(document.querySelector('.msg.llm .ts')||{}).textContent"
-              ".match(/^\d{4}-\d{2}-\d{2}\\n\d{2}:\d{2}:\d{2}$/)", 10))
+              r".match(/^\d{4}-\d{2}-\d{2}\n\d{2}:\d{2}:\d{2}$/)", 10))
     # The stamp is the first child — the column sits left of the avatar.
     check("stamp sits in the left column",
           await tab.js("document.querySelector('.msg.user').firstElementChild.classList.contains('ts')"))
@@ -371,10 +422,10 @@ async def run(http):
     check("tool call slab carries its gutter stamp",
           await tab.until(
               "(document.querySelector('.slab.tool .ts')||{}).textContent"
-              ".match(/^\d{4}-\d{2}-\d{2}\\n\d{2}:\d{2}:\d{2}$/)", 10))
+              r".match(/^\d{4}-\d{2}-\d{2}\n\d{2}:\d{2}:\d{2}$/)", 10))
     check("the tool result tag carries its own time",
           await tab.until(
-              "/\d{2}:\d{2}:\d{2}/.test(document.querySelector('.slab.tool .done')?.textContent||'')", 10))
+              r"/\d{2}:\d{2}:\d{2}/.test(document.querySelector('.slab.tool .done')?.textContent||'')", 10))
     check("tool turn finishes",
           await tab.until("document.querySelectorAll('.slab.stats').length === 2", 180))
     check("tool arguments are inspectable",
@@ -457,8 +508,12 @@ async def run(http):
               f"  .find(t => t.title === {user_ts!r});"
               "  return u && u.textContent; })()"))
           == (await tab.js("document.querySelector('.msg.user .ts').textContent")))
+    # The await was missing here, so the condition was a non-empty Python string
+    # — truthy — and this check passed for years without ever running its JS.
     check("replayed tool result keeps its time",
-          "/\d{2}:\d{2}:\d{2}/.test(document.querySelector('.slab.tool .done')?.textContent||'')")
+          await tab2.js(
+              r"/\d{2}:\d{2}:\d{2}/.test("
+              r"document.querySelector('.slab.tool .done')?.textContent||'')"))
     check("replayed tool call is paired with its result",
           "chars" in (await tab2.js("document.querySelector('.slab.tool').textContent") or ""))
     # Replay builds the log from history, not from events, so it needs its own check.
@@ -513,12 +568,18 @@ async def run(http):
     # The sidebar takes 210px off the header's width; at the default window size
     # that was enough to wrap the status pill onto a second row. Compare the two
     # ends of the header rather than pick a magic height.
-    check("header still fits on one row", await tab3.js(
-        "(() => { const a = document.querySelector('.brand').getBoundingClientRect();"
-        "  const b = document.querySelector('#status').getBoundingClientRect();"
-        "  return Math.abs(a.top - b.top) < 6; })()"))
-    check("busy dot tracks a live turn", await tab3.js(
-        "[...document.querySelectorAll('#side-list .dot')].every(d => d.hidden)"))
+    geom = await tab3.js(
+        "(() => { const a = document.querySelector('.brand')?.getBoundingClientRect();"
+        "  const b = document.querySelector('#status')?.getBoundingClientRect();"
+        "  if (!a || !b) return {missing: !a ? 'brand' : 'status'};"
+        "  return {brand: a.top, status: b.top, gap: Math.abs(a.top - b.top),"
+        "          width: innerWidth}; })()")
+    check("header still fits on one row", isinstance(geom, dict)
+          and geom.get("gap", 99) < 6, f"{geom}")
+    dots = await tab3.js(
+        "[...document.querySelectorAll('#side-list .dot')]"
+        "  .filter(d => !d.hidden).map(d => d.closest('.srow')?.dataset.name)")
+    check("busy dot tracks a live turn", not dots, f"lit for: {dots}")
     shown = await tab3.js(
         f"(() => {{ const r = [...document.querySelectorAll('#side-list .srow')]"
         f"  .find(r => r.dataset.name === '{sess}');"
@@ -546,8 +607,7 @@ async def run(http):
     check("the + form creates and switches to a new session",
           await tab3.until(f"document.querySelector('#side-list .srow.on')"
                            f"  .dataset.name === '{born}'", 20))
-    check("the new session exists core-side",
-          born in [s["name"] for s in (await http_json(http, f"{CORE}/sessions"))["sessions"]])
+    check("the new session exists core-side", await listed(http, born))
     check("new session starts empty",
           (await tab3.js("document.querySelectorAll('.msg').length")) == 0)
 
@@ -1052,14 +1112,22 @@ async def run_reload(http):
         # --- mid-turn: deferred, then applied at turn_end ------------------------
         async with http.ws_connect(f"{base}/ws?session=reload-busy") as ws:
             await ws.receive_json()
-            await ws.send_json({"t": "submit", "text": "Count from 1 to 30, one per line."})
+            await ws.send_json({"t": "submit", "text": "Count from 1 to 60, one per line."})
             await asyncio.wait_for(ws.receive_json(), 30)      # turn_start
-            await asyncio.sleep(1.5)                            # let it get going
+            # Reload on the first streamed event, not after a fixed sleep. This
+            # used to sleep 1.5s "to let it get going"; the model now answers in
+            # less than that, so the turn was already over and deferred==0 was the
+            # correct answer to a question the test only meant to ask mid-turn.
+            # One event in, the turn is provably live however fast the model is.
+            first = await asyncio.wait_for(ws.receive_json(), 30)
             cfg["models"][model]["context_length"] = good + 100
             write(cfg)
             status, body = await reload()
             check("a reload during a turn is deferred, not forced",
-                  status == 200 and body["deferred"] >= 1, str(body)[:200])
+                  status == 200 and body["deferred"] >= 1,
+                  f"{str(body)[:160]} — first streamed event was "
+                  f"{first.get('t')!r}; if that is 'turn_end' the turn outran "
+                  f"the test rather than the core getting it wrong")
             # And it must actually land: ordering matters, so the reloaded event has
             # to come after turn_end rather than interleaved with the stream.
             ended = applied = False
@@ -1127,6 +1195,24 @@ async def gone(http, name, timeout=20):
     while time.time() < end:
         d = await http_json(http, f"{CORE}/sessions")
         if name not in d["by"]:
+            return True
+        await asyncio.sleep(0.25)
+    return False
+
+
+async def listed(http, name, timeout=20):
+    """True once the core lists this session.
+
+    The mirror of gone(), and it has to poll for the same reason. The sidebar
+    row switches on local state the moment you submit the + form — app.js:1830
+    says so: nothing is created core-side there, sessions spring into existence
+    on attach. So the row can be `.on` before the attach has reached the core,
+    and reading /sessions once right after it is a coin flip.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        d = await http_json(http, f"{CORE}/sessions")
+        if name in d["by"]:
             return True
         await asyncio.sleep(0.25)
     return False

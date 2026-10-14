@@ -16,7 +16,14 @@ sends a turn, so it costs no tokens and touches no session's history.
 import asyncio, json, os, shutil, subprocess, tempfile, time
 import aiohttp
 
-CORE = os.environ.get("CORE", "http://127.0.0.1:8770")
+try:
+    CORE = os.environ["CORE"]
+except KeyError:
+    raise SystemExit(
+        "web/math_test.py: set CORE first.\n"
+        "This suite attaches a session on whatever core CORE names, and used to\n"
+        "default to the live core at http://127.0.0.1:8770.\n"
+        "    CORE=http://127.0.0.1:8899 .venv/bin/python web/math_test.py")
 CHROME = shutil.which("google-chrome") or shutil.which("chromium")
 results = []
 
