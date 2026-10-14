@@ -116,8 +116,11 @@ models:
 core:
   bind: "127.0.0.1"     # tools are unconfined: anyone who can reach this port gets a shell here
   port: 8770            # also serves the WebUI at http://<bind>:<port>/
-  token: ""             # optional shared secret; required in practice if bind is not loopback
-                        # the WebUI prompts for it (the page itself is served unauthenticated)
+  token: ""             # shared secret. Optional on loopback; REQUIRED if bind is not
+                        # loopback — the core refuses to start otherwise, because the
+                        # tools are unconfined. The WebUI prompts for it (the page
+                        # itself is served unauthenticated). Loopback with no token is
+                        # still guarded against drive-by pages by the Origin check.
                         #
                         # bind and port are the only settings here that need a restart:
                         # the socket is already bound, and rebinding it would drop every

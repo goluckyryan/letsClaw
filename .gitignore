@@ -22,6 +22,10 @@ tests/
 models/sessions/*.md
 !models/sessions/README.md
 
+# Voice models/samples: 61 MB of binary next to a 5.3 MB repo, and regenerable.
+# One `git add -A` would commit the lot and there is no taking it back out.
+voices/
+
 # Editor / OS
 .vscode/
 .idea/

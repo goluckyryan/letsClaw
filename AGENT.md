@@ -58,43 +58,24 @@ To confirm a model, open a client and send a message.
 
 ## Security (read before exposing it)
 
-- Default `core.bind` is `127.0.0.1` (loopback) — reachable from this machine only.
+- Default `core.bind` is `127.0.0.1` (loopback) — reachable from no *other* machine.
+  It is **not** a wall against your own browser: any page you visit can open
+  `ws://127.0.0.1:8770/ws`. What stops that is the `Origin` check on `/ws` and on
+  every state-changing route — browsers always send `Origin` and cannot forge it,
+  while the terminal and the bot send none and are unaffected. A cross-origin
+  attempt is refused with 403 and logged.
 - The agent tools are **unconfined**: anyone who can reach the port gets a shell on
   this host. So if you change `bind` to anything non-loopback (e.g. `0.0.0.0` for a
-  LAN), you **must** set a `core.token` too. The core prints a warning on
-  non-loopback, and its banner line shows the LAN address to type into a browser
-  (e.g. `http://192.168.203.75:8770/`) instead of the untypeable `0.0.0.0`.
+  LAN), you **must** set a `core.token` too — the core now refuses to start in that
+  combination rather than warning about it. Its banner line shows the LAN address to
+  type into a browser (e.g. `http://192.168.203.75:8770/`) instead of the untypeable
+  `0.0.0.0`.
+- `GET /config` redacts `core.token` and `discord.token`; the token comparison is
+  constant-time. `webui.pin` values are validated as CSS at save and at render,
+  because `/theme.css` is generated and served unauthenticated.
 - Across the internet, do not just open the port: put it behind a VPN or a TLS+auth
   reverse proxy.
 - `config.yaml` holds the bot token and is gitignored for exactly this reason.
-
-## Tests
-
-Run from the repo root with the venv interpreter. The unit tests need no core.
-The two CDP browser tests (`steering_test.py`, `settings_test.py`) each start
-their own scratch core on a temp config and a temp state dir, so they never
-touch your real `config.yaml` or `state/` — run them any time. `browser_test.py`
-is different: its main flow runs against the **real** core (the `CORE` env var,
-default `http://127.0.0.1:8770`), so have `./serve.sh` up first; only its
-token-gate sub-scenario spawns a scratch core. All three need a headless
-Chrome on the box.
-
-```bash
-.venv/bin/python tests/test_chunk.py        # chunker (no core needed)
-# ... the other tests/test_*.py are the unit suite (see tests/)
-
-# End-to-end over CDP:
-.venv/bin/python web/steering_test.py       # own scratch core — safe anytime
-.venv/bin/python web/settings_test.py       # own scratch core — safe anytime
-.venv/bin/python web/browser_test.py        # main flow hits the REAL core: ./serve.sh first
-
-# The markdown/maths renderer:
-node web/test_md.mjs                        # renderer as a pure function (no KaTeX)
-node web/test_math.mjs                      # same, with the real vendored KaTeX
-.venv/bin/python web/math_test.py           # maths in a real browser; sends no turn
-.venv/bin/python web/files_test.py          # the /files route; no core, no browser
-.venv/bin/python web/image_test.py          # images in a real browser; sends no turn
-```
 
 ## Showing the user a picture
 
@@ -103,8 +84,6 @@ Write the file into `state/files/` (or whatever `webui.files_dir` says), then pu
 `/files/` and renders it inline. Only a **flat filename with an image extension**
 works: no subdirectory, no URL, no `data:`. The terminal and Discord clients show
 the Markdown as text, so say where the file is in words too if it matters.
-
-`web/*_test.py` are tracked in git; `tests/` is gitignored (a local suite).
 
 ## Repo layout (where things live)
 
@@ -115,7 +94,7 @@ source/server.py         the aiohttp WS/HTTP server, serves the WebUI
 source/chat.py           the terminal client
 source/discord_client.py the Discord bot (optional)
 source/chunker.py        fence-aware answer chunking (shared by the clients)
-web/                     the WebUI (vanilla JS, no build) + its CDP tests
+web/                     the WebUI (vanilla JS, no build)
 models/base.md           the base behavior file (committed)
 models/sessions/*.md     per-session behavior + archived transcripts (gitignored)
 config.example.yaml      the documented config template (committed)
