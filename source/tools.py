@@ -131,7 +131,7 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None) -> list:
         p = Path(path).expanduser()
         if not p.is_file():
             return f"error: not a file: {path}"
-        return p.read_text(errors="replace")
+        return p.read_text(encoding="utf-8", errors="replace")
 
     async def read_file(path: str) -> str:
         return await asyncio.to_thread(_read_file, path)
@@ -139,7 +139,7 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None) -> list:
     def _write_file(path: str, content: str) -> str:
         p = Path(path).expanduser()
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
+        p.write_text(content, encoding="utf-8")
         return f"wrote {len(content)} chars to {p}"
 
     async def write_file(path: str, content: str) -> str:

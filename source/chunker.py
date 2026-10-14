@@ -123,6 +123,12 @@ def chunk_discord_text(text, max_chars=DEFAULT_MAX_CHARS, max_lines=DEFAULT_MAX_
     if len(body) <= max_chars and _count_lines(body) <= max_lines:
         return [body]
 
+    # `_rebalance_italics` closes and reopens the span on every chunk *after*
+    # the limits have been applied, so a chunk that landed exactly on 2000 comes
+    # back at 2002 and Discord rejects it. Hold the two characters back now.
+    if _is_italic_block(body):
+        max_chars = max(1, max_chars - 2)
+
     chunks = []
     current = ""
     current_lines = 0
@@ -163,21 +169,50 @@ def chunk_discord_text(text, max_chars=DEFAULT_MAX_CHARS, max_lines=DEFAULT_MAX_
         char_limit = effective_chars if effective_chars > 0 else max_chars
         line_limit = effective_lines if effective_lines > 0 else max_lines
 
-        prefix = len(current) + 1 if current else 0
-        segments = _split_long_line(original, max(1, char_limit - prefix),
-                                    preserve_whitespace=was_inside)
+        # Only the first piece can join the chunk in progress; every piece after
+        # it starts a fresh one, which inside a fence opens with the fence line
+        # again. Those are two different budgets, and using either on its own is
+        # wrong in one direction: size everything to the room left here and a
+        # line that would have fitted whole into the next chunk is shredded,
+        # down to a character a piece at the worst; size everything to the fresh
+        # budget and the room left here is abandoned, which a reader sees as a
+        # code block posted with nothing in it.
+        reopen = len(fence.open_line) + 1 if fence is not None else 0
+        room_fresh = max(1, char_limit - reopen)
+
+        if was_inside and current and len(original) > room_fresh:
+            # Too long to fit a chunk of its own however it is placed, so the
+            # leftover here is worth filling rather than wasting — and inside a
+            # fence this is code, cut at an exact limit either way, so the head
+            # is as good a cut as the one that would replace it.
+            room_here = max(1, char_limit - (len(current) + 1))
+            head = _split_long_line(original, room_here, True)[0]
+            tail = original[len(head):]
+            segments = [head] + (_split_long_line(tail, room_fresh, True)
+                                 if tail else [])
+        else:
+            segments = _split_long_line(original, room_fresh,
+                                        preserve_whitespace=was_inside)
 
         for index, segment in enumerate(segments):
             continuation = index > 0
-            delimiter = "" if continuation else ("\n" if current else "")
-            addition = delimiter + segment
-            over_chars = len(current) + len(addition) > char_limit
+            # A continuation piece rejoins the line it was cut from, so it is
+            # appended with no delimiter — that is what makes the pieces
+            # concatenate back to the original.
+            joiner = "" if continuation else ("\n" if current else "")
+            over_chars = len(current) + len(joiner) + len(segment) > char_limit
             over_lines = current_lines + (0 if continuation else 1) > line_limit
             if (over_chars or over_lines) and current:
                 flush()
+                # flush() reopens the fence, so the chunk is not empty any more.
+                # Decide the join against what it actually left behind: a
+                # continuation welded straight onto a ```lang opener becomes
+                # part of the fence's info string and the code disappears.
+                joiner = "\n" if current else ""
+
             if current:
-                current += addition
-                if not continuation:
+                current += joiner + segment
+                if joiner:
                     current_lines += 1
             else:
                 current = segment
@@ -193,6 +228,19 @@ def chunk_discord_text(text, max_chars=DEFAULT_MAX_CHARS, max_lines=DEFAULT_MAX_
     return _rebalance_italics(body, chunks)
 
 
+def _is_italic_block(source):
+    """Is this a reasoning pad — one `_…_` span, rather than prose with emphasis?"""
+    return source.startswith("Reasoning:\n_") and source.rstrip().endswith("_")
+
+
+def _opens_on_fence(text):
+    return _parse_fence(text.split("\n", 1)[0]) is not None
+
+
+def _closes_on_fence(text):
+    return _parse_fence(text.rsplit("\n", 1)[-1]) is not None
+
+
 def _rebalance_italics(source, chunks):
     """Keep a wholly-italicised block italic in every chunk.
 
@@ -203,17 +251,24 @@ def _rebalance_italics(source, chunks):
     """
     if len(chunks) <= 1:
         return chunks
-    if not (source.startswith("Reasoning:\n_") and source.rstrip().endswith("_")):
+    if not _is_italic_block(source):
         return chunks
 
+    # Reasoning that contains a code fence is ordinary, and the span's markers
+    # must not land on the fence lines the chunker just wrote: "```" with an
+    # underscore stuck to it is an *opener* whose info string is "_", so the
+    # block never closes and swallows the rest of the message, and "_```py" is
+    # not a fence at all. Skipping those two spots leaves a literal underscore
+    # showing in the odd chunk, which is a blemish rather than lost content —
+    # and inside a fence the text is code, which was never going to be italic.
     out = list(chunks)
     for i, current in enumerate(out):
-        if not current.rstrip().endswith("_"):
+        if not _closes_on_fence(current) and not current.rstrip().endswith("_"):
             out[i] = current + "_"
         if i == len(out) - 1:
             break
         nxt = out[i + 1]
         lead = len(nxt) - len(nxt.lstrip())
-        if not nxt[lead:].startswith("_"):
+        if not _opens_on_fence(nxt) and not nxt[lead:].startswith("_"):
             out[i + 1] = nxt[:lead] + "_" + nxt[lead:]
     return out
