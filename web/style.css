@@ -232,6 +232,25 @@ header {
 .brand { font-size: 16px; white-space: nowrap; }
 .spacer { flex: 1; }
 
+/* Keep the header on one row wherever one row actually fits. The sidebar takes
+   210px off it, leaving 1070 at the 1280 default for 1155 of content, and the
+   status pill was the bit that wrapped off the end. flex-wrap places items at
+   their base size *before* shrinking any of them, so permitting shrink is not
+   enough — the wrap itself has to go, and then something has to yield.
+   Not the buttons: they are labelled on purpose (index.html says why).
+   Not the gauge: its trip marker sits at 90% of its width and the label has to
+   stay clear of it, so narrowing it collides the two.
+   That leaves the model select, which truncates harmlessly. It floors at 90px,
+   which puts the narrowest one-row layout at 1048 + 210 of sidebar — hence the
+   1260 breakpoint. Below it, wrapping is still the honest answer: better a
+   second row than a clipped one. */
+@media (min-width: 1260px) {
+  header { flex-wrap: nowrap; }
+  header > button, .brand, .gauge, #status, #side-toggle { flex-shrink: 0; }
+  .field { min-width: 0; }
+  .field select { min-width: 90px; width: 100%; }
+}
+
 .field {
   display: flex;
   align-items: center;
@@ -936,23 +955,15 @@ footer {
 .chip.on { border-color: var(--ok); color: var(--ok); }
 .chip.off { color: var(--dim); }
 
-/* Secrets: masked until the eye is clicked. */
+/* Secrets: the core redacts these before they leave it, so there is nothing
+   here to unmask — the hint says where the real value lives instead. */
 .cfg-secret {
   display: inline-flex;
   align-items: center;
   gap: 6px;
 }
 .cfg-secret .dots { letter-spacing: 2px; color: var(--dim); }
-.cfg-secret button {
-  font-size: 11px;
-  padding: 1px 6px;
-  background: var(--bg3);
-  color: var(--fg);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  cursor: pointer;
-}
-.cfg-secret button:hover { border-color: var(--accent); }
+.cfg-secret .cfg-hint { font-size: 11px; color: var(--dim); font-style: italic; }
 
 /* Nested maps (models.<name>.<key>) become an indented card. */
 .cfg-card {

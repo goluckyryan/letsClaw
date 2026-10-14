@@ -77,6 +77,10 @@ const S = {
   busy: false,
   closing: false,
   backoff: 500,
+  reconnectTimer: null,
+  // Set by submit(), consumed by turn_start: did the turn now starting come
+  // from this tab? turn_start is a broadcast, so nothing else can tell.
+  weAsked: false,
   turn: null,
   sent: loadSent(SESSION0),
   histIdx: -1,
@@ -91,6 +95,19 @@ const log = $('#log');
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/* A number off the wire, rendered as a number.
+
+   Token counts, percentages and timeouts are ints from the core today, which
+   is why none of the innerHTML templates that interpolate them bare has ever
+   gone wrong. But that makes the markup's safety a property of a producer
+   three files away rather than of the markup, and the two drift apart the
+   first time a field becomes optional or a string. Coercing at the boundary
+   costs nothing and makes it true by construction. */
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? String(n) : '?';
 }
 
 /* ![alt](src) -> <img>, but only for an image this core is serving.
@@ -422,14 +439,141 @@ log.addEventListener('error', (e) => {
   const miss = document.createElement('span');
   miss.className = 'md-img-missing';
   miss.textContent = `🖼 ${img.getAttribute('alt') || 'image'} — not found`;
-  miss.title = img.getAttribute('src') || '';
+  // The alt, not the src: imgTag puts ?token= in the URL, and the rest of the
+  // file goes out of its way to keep that out of anything the user can see and
+  // paste (see the lightbox note below). A hover tooltip is exactly that.
+  miss.title = img.getAttribute('alt') || '';
+  // Remembered under the src so the next repaint re-adopts the notice rather
+  // than the <img> that produced it; otherwise a streaming message reinstates
+  // the broken image every 60ms and this handler runs again, and again.
+  if (img._kept) img._kept.set(img.getAttribute('src'), miss);
   img.replaceWith(miss);
 }, true);
 
+/* While a replay is building the log, every append() scrolls and every pin
+   re-measures — both read layout, so the browser reflows once per replayed
+   message and a few hundred of them take visible seconds on a cold switch.
+   Nothing is on screen until the replay finishes anyway, so suspend both and
+   do each exactly once at the end. */
+let batching = false;
+function batch(fn) {
+  batching = true;
+  try { fn(); } finally { batching = false; }
+  layoutPins();
+  if (follow) log.scrollTop = log.scrollHeight;
+}
+
 function append(el) {
   log.insertBefore(el, waitEl);          // the spinner stays last
-  if (follow) log.scrollTop = log.scrollHeight;
+  trimLog();
+  if (follow && !batching) log.scrollTop = log.scrollHeight;
   return el;
+}
+
+/* Cap the log.
+
+   Nothing trimmed it, so a session left open all day grows without bound: every
+   message, every tool slab and every decoded image stays in the document, and
+   the layout reads append() and layoutPins() do get slower in step with it.
+   What is dropped here is only the *view* — the session transcript is the
+   record, and switching back to the session replays it. */
+const LOG_MAX = 1500;
+
+/* The direct children of #log that the turn in flight is still writing into.
+   Trimming stops at the oldest of them: a single enormous turn must never have
+   the element its own deltas are appending to pulled out from under it. */
+function liveTops() {
+  const tops = new Set();
+  if (!S.turn) return tops;
+  const add = (el) => {
+    while (el && el.parentElement && el.parentElement !== log) el = el.parentElement;
+    if (el && el.parentElement === log) tops.add(el);
+  };
+  add(S.turn.textEl);
+  add(S.turn.reasonEl);
+  for (const t of S.turn.tools.values()) add(t);
+  return tops;
+}
+
+function trimLog() {
+  let n = log.childElementCount;
+  if (n <= LOG_MAX) return;
+  const live = liveTops();
+  let droppedPin = false;
+  let el = log.firstElementChild;
+  while (el && n > LOG_MAX) {
+    const next = el.nextElementSibling;
+    if (el === waitEl || live.has(el)) break;
+    if (el.classList.contains('pin')) droppedPin = true;
+    el.remove();
+    n -= 1;
+    el = next;
+  }
+  // The stack is offset by the measured height of the pins above each one, so
+  // losing one off the top leaves every pin below it sitting too low.
+  if (droppedPin) layoutPins();
+}
+
+/* Ride the bottom, at most once a frame.
+
+   Reading scrollHeight forces the browser to lay out the whole log, so doing it
+   per token — which the reasoning path did, being the one path with no buffer
+   in front of it — reflows thousands of times across a single long think. Once
+   a frame looks identical and costs one reflow per 16ms instead of per token. */
+let scrollQueued = false;
+function scrollSoon() {
+  if (scrollQueued) return;
+  scrollQueued = true;
+  requestAnimationFrame(() => {
+    scrollQueued = false;
+    // Re-read follow at paint time, not at queue time: the user may have
+    // scrolled up in between, and this is the one place that would drag them
+    // back down after they did.
+    if (follow) log.scrollTop = log.scrollHeight;
+  });
+}
+
+/* Append plain text to an element without rebuilding what is already there.
+
+   `el.textContent += delta` reads the whole accumulated string back out of the
+   DOM and writes a fresh text node in its place for every single token — O(n²)
+   over a think that routinely runs to tens of thousands of characters. It also
+   flattens anything in the block that is not text, which is how the 🧠 cost
+   stamp stampThinking() hangs off a reasoning block would come back as bare
+   characters. Appending to the trailing text node touches only what arrived. */
+function appendText(el, delta) {
+  let tail = el._tail;
+  if (!tail || tail.parentNode !== el || tail !== el.lastChild) {
+    tail = document.createTextNode('');
+    el.appendChild(tail);
+    el._tail = tail;
+  }
+  tail.appendData(delta);
+}
+
+/* Keep images alive across a streaming repaint.
+
+   stream() replaces the body's whole innerHTML every 60ms, which destroys and
+   recreates every <img> inside it ~16 times a second. A decoded image returns
+   from cache fast enough to look stable, but one that is still loading restarts
+   its load on each pass and can take the rest of the turn to settle, and one
+   that is broken has the missing-image notice below swapped back out for a
+   fresh <img> that fails again — so the placeholder strobes for as long as the
+   message streams. Re-adopting the node already on screen means each src is
+   fetched once, fails at most once, and then stays put. */
+function adoptImages(el) {
+  const kept = el._imgs || (el._imgs = new Map());
+  const placed = new Set();
+  for (const img of el.querySelectorAll('img')) {
+    const src = img.getAttribute('src');
+    if (!src) continue;
+    const prev = kept.get(src);
+    // `placed` covers one message showing the same src twice: the second
+    // occurrence must not steal the node standing at the first.
+    if (prev && !placed.has(prev)) { img.replaceWith(prev); placed.add(prev); continue; }
+    if (!prev) { img._kept = kept; kept.set(src, img); }
+    placed.add(img);
+  }
 }
 
 function node(cls, html) {
@@ -458,7 +602,7 @@ function tsEl(iso) {
 
 function msg(kind, who, html, ts) {
   const el = node(`msg ${kind}`);
-  el.innerHTML = `<div class="who">${who}</div><div class="body"></div>`;
+  el.innerHTML = `<div class="who">${esc(who)}</div><div class="body"></div>`;
   el.insertBefore(tsEl(ts), el.firstChild);
   if (html !== undefined) el.querySelector('.body').innerHTML = html;
   return append(el);
@@ -490,6 +634,9 @@ function addPin(el) {
    re-wraps as the log narrows — so a ResizeObserver re-runs this whenever the
    log's box changes (window resize, sidebar drag, sidebar toggle). */
 function layoutPins() {
+  // offsetHeight below is a layout read; batch() calls this once when the
+  // replay that would otherwise trigger one per message is finished.
+  if (batching) return;
   let top = 0;
   for (const p of log.querySelectorAll('.msg.user.pin')) {
     p.style.top = top + 'px';
@@ -528,7 +675,8 @@ function stream(el, delta) {
   setTimeout(() => {
     el._pending = false;
     el.innerHTML = renderMd(el._raw);
-    if (follow) log.scrollTop = log.scrollHeight;
+    adoptImages(el);
+    scrollSoon();
   }, 60);
 }
 
@@ -536,9 +684,12 @@ function flushStream(el) {
   if (!el) return;
   el._pending = false;
   el.innerHTML = renderMd(el._raw || '');
+  adoptImages(el);
   // A round can end mid-batch: the last chunk is still in the 60ms buffer, so
   // this re-render grows the log with no stream tick to re-pin. Do it here, or
   // the next turn_start reads the view as "scrolled up" and never follows.
+  // Synchronous, not scrollSoon(): turn_start can land in the same task as this
+  // one, and it reads the view to decide whether to keep following.
   if (follow) log.scrollTop = log.scrollHeight;
   // Models routinely emit a bare "\n\n" before calling a tool. Rendered, that is an
   // avatar next to nothing; drop the whole message rather than leave a stray 🐱.
@@ -570,12 +721,45 @@ function clearWaiting() {
   if (waitEl) { waitEl.remove(); waitEl = null; }
 }
 
+/* Copy to the clipboard, saying whether it worked.
+
+   navigator.clipboard exists only on a secure origin. Served over plain http
+   from the LAN address config.example.yaml contemplates, it is `undefined`, so
+   the copy button threw on every click and still painted a ✓ — the code was
+   never copied and the page said it was. The textarea fallback is the pre-
+   Clipboard-API route and still works on http; if that fails too, say so. */
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (err) { /* fall through to the old route */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    // Off-screen rather than hidden: execCommand copies from the selection, and
+    // display:none elements cannot hold one.
+    ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    const did = document.execCommand('copy');
+    ta.remove();
+    return did;
+  } catch (err) {
+    return false;
+  }
+}
+
 log.addEventListener('click', (e) => {
   const btn = e.target.closest('.copy');
   if (btn) {
-    navigator.clipboard.writeText(btn.parentElement.querySelector('code').textContent);
-    btn.textContent = '✓';
-    setTimeout(() => { btn.textContent = '⧉'; }, 1200);
+    const code = btn.parentElement.querySelector('code');
+    copyText(code ? code.textContent : '').then((did) => {
+      btn.textContent = did ? '✓' : '✗';
+      btn.title = did ? '' : 'the browser would not let the page copy';
+      setTimeout(() => { btn.textContent = '⧉'; btn.title = ''; }, 1200);
+    });
     return;
   }
   // A plot in a chat column is small. Clicking it opens it full size over the
@@ -688,6 +872,14 @@ function authQuery() { return S.token ? `&token=${encodeURIComponent(S.token)}` 
 function authHeaders() { return S.token ? { Authorization: `Bearer ${S.token}` } : {}; }
 
 function connect() {
+  clearReconnect();
+  // A socket that is open, or still opening, is the one to keep. Without this
+  // a stray timer firing next to a deliberate connect() — a reconnect pending
+  // when you switch sessions, a tab waking while one is queued — left two
+  // live sockets on one page, both attached to the same session, every event
+  // rendered twice. The next pair doubled it again.
+  if (S.ws && (S.ws.readyState === WebSocket.OPEN
+               || S.ws.readyState === WebSocket.CONNECTING)) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const url = `${proto}://${location.host}/ws?session=${encodeURIComponent(S.session)}`
             + `&last_seq=${S.lastSeq}${authQuery()}`;
@@ -724,6 +916,11 @@ function connect() {
     if (ws._replaced) return;
     clearWaiting();
     setBusy(false);
+    // Nothing is coming back for these now. Left pending, each one sat on its
+    // own five-minute timer and rejected long after the fact — into whatever
+    // session the page had switched to by then, so an /info asked for session
+    // A surfaced as a timeout against session B.
+    rejectRpcs('the link to the core went away');
     if (S.closing) return;
     if (ev.code === 1013) notice('the core dropped this client for falling behind — reconnecting', 'warn');
     setStatus('off', 'offline');
@@ -733,11 +930,34 @@ function connect() {
   ws.onerror = () => { /* onclose always follows; report there */ };
 }
 
+function clearReconnect() {
+  if (S.reconnectTimer !== null) { clearTimeout(S.reconnectTimer); S.reconnectTimer = null; }
+}
+
 function scheduleReconnect() {
-  setTimeout(() => {
+  // At most one pending, ever. Three places schedule a reconnect — connect()'s
+  // own catch, every onclose, and this timer's own retry — and the handle was
+  // not kept, so they stacked. See the guard at the top of connect() for what
+  // that cost.
+  clearReconnect();
+  S.reconnectTimer = setTimeout(() => {
+    S.reconnectTimer = null;
     if (!S.closing) connect();
   }, S.backoff);
   S.backoff = Math.min(S.backoff * 2, 10000);
+}
+
+/* Fail every in-flight command at once. Called when the socket goes away: the
+   core answers a command to the asking client only, so a reply to a request
+   made on a socket that no longer exists is never coming. */
+function rejectRpcs(why) {
+  if (!S.rpcs.size) return;
+  const pending = [...S.rpcs.values()];
+  S.rpcs.clear();
+  for (const r of pending) {
+    clearTimeout(r.timer);
+    if (r.reject) r.reject(new Error(why));
+  }
 }
 
 function send(obj) {
@@ -755,13 +975,21 @@ function rpc(name, args, silent) {
     if (!send({ t: 'command', name, args: args || '', request_id })) return reject(new Error('offline'));
     // /rollover summarises with the model before replying, so this waits minutes, not seconds.
     const timer = setTimeout(() => { S.rpcs.delete(request_id); reject(new Error('timed out')); }, 300000);
-    S.rpcs.set(request_id, { resolve, timer, silent });
+    // reject is kept too, so rejectRpcs can fail this the moment the socket
+    // goes away rather than leaving it to time out five minutes later.
+    S.rpcs.set(request_id, { resolve, reject, timer, silent });
   });
 }
 
 function switchSession(name) {
   if (!name || name === S.session) return;
   if (S.ws) { S.ws._replaced = true; S.ws.close(); }
+  // A reconnect queued for the session being left would otherwise fire after
+  // connect() below and open a second socket on the new one.
+  clearReconnect();
+  // Nothing in flight belongs to the new session; _replaced makes onclose
+  // return before it can do this itself.
+  rejectRpcs('switched session');
   S.session = name;
   S.lastSeq = 0;
   S.turn = null;
@@ -804,11 +1032,19 @@ function handle(e) {
     S.turn = { textEl: null, reasonEl: null, tools: new Map() };
     think = newThink();
     setBusy(true);
-    // Asking is the intent to follow, whatever the view was doing: re-assert it
-    // before the question lands. This is also what broke the old cascade — a
-    // view left mid-log by a previous round now resumes the moment the user
+    // Asking is the intent to follow, whatever the view was doing: re-assert
+    // it before the question lands. This is also what broke the old cascade —
+    // a view left mid-log by a previous round resumes the moment the user
     // asks again.
-    follow = true;
+    //
+    // But only for the tab that asked. turn_start is broadcast to every
+    // subscriber, so re-asserting it unconditionally meant a question typed
+    // in one tab, or in Discord, yanked a second tab back to the bottom while
+    // someone was reading halfway up it. The flag is set in submit() and
+    // consumed here; a turn started anywhere else leaves this view where its
+    // reader put it.
+    if (S.weAsked) follow = true;
+    S.weAsked = false;
     pinUser(msg('user', '👤', esc(e.text), e.at));
     setWaiting('thinking');
     return;
@@ -821,8 +1057,8 @@ function handle(e) {
     if (!S.showReasoning) return;
     if (!S.turn) S.turn = { textEl: null, reasonEl: null, tools: new Map() };
     if (!S.turn.reasonEl) S.turn.reasonEl = msg('reasoning', '🧠', null, e.at).querySelector('.body');
-    S.turn.reasonEl.textContent += e.delta;
-    if (follow) log.scrollTop = log.scrollHeight;
+    appendText(S.turn.reasonEl, e.delta);
+    scrollSoon();
     return;
 
   // The core's own count, pushed a few times a second while it thinks. It
@@ -865,8 +1101,8 @@ function handle(e) {
       el.querySelector('summary').appendChild(tag);
     } else {
       // Attached mid-turn: we never saw the tool_call this answers.
-      slab('tool', `⚙️ <b>${esc(e.name)}</b> <span class="done">↳ ${e.size} chars`
-        + (e.at ? ` · ${e.at.slice(11, 19)}` : '') + `</span>`, null, e.at);
+      slab('tool', `⚙️ <b>${esc(e.name)}</b> <span class="done">↳ ${num(e.size)} chars`
+        + (e.at ? ` · ${esc(e.at.slice(11, 19))}` : '') + `</span>`, null, e.at);
     }
     setWaiting('thinking');
     return;
@@ -936,7 +1172,7 @@ function handle(e) {
       ? `<details class="handoff" open><summary>🧠 what the new window carries</summary>` +
         `<pre>${esc(e.handoff_text)}</pre></details>`
       : '';
-    slab('roll', `✨ New session — ${e.used}/${e.budget} tok` +
+    slab('roll', `✨ New session — ${num(e.used)}/${num(e.budget)} tok` +
                  (paths.length ? `<div class="paths">${paths.join('<br>')}</div>` : '') +
                  handoff);
     separator('fresh context from here');
@@ -1037,6 +1273,18 @@ function hello(e) {
   if (e.proto !== PROTOCOL_VERSION) {
     notice(`the core speaks protocol ${e.proto}, this page speaks ${PROTOCOL_VERSION} — update one of them.`, 'warn');
   }
+  // The core numbers events per session from 1, and a session that was deleted
+  // and made again starts over. S.lastSeq only ever goes up, so it stayed above
+  // the new numbering for good: every last_seq this page sent then asked for
+  // events past a point the core had not reached yet, so `missed` came back
+  // empty and `gap` false, and everything the new session said was dropped
+  // with nothing on screen to say why. Clearing the log makes the replay below
+  // fire, which is how the page catches up.
+  if (typeof e.seq === 'number' && e.seq < S.lastSeq) {
+    S.lastSeq = e.seq;
+    log.innerHTML = '';
+    notice('this session restarted its event numbering — replaying it from the top', 'warn');
+  }
   S.model = e.model;
   S.budget = e.budget;
   // Zeroed before the replay below: attaching to a turn already in flight, we
@@ -1078,6 +1326,10 @@ function hello(e) {
 /* Draw the history the core hands us on attach, pairing each tool call with its
    result so a reloaded page looks like the session you left. */
 function replayHistory(messages) {
+  batch(() => replayInto(messages));
+}
+
+function replayInto(messages) {
   const pending = new Map();
   for (const m of messages) {
     if (m.role === 'user') {
@@ -1112,8 +1364,9 @@ function replayHistory(messages) {
 function askRollover(e) {
   clearWaiting();
   const el = slab('roll',
-    `⚠️ Context at ${e.used}/${e.budget} (${e.percent}%). Roll over to a new session?` +
-    `<div class="paths">no answer in <b class="cd">${e.timeout_s}</b>s keeps it</div>`);
+    `⚠️ Context at ${num(e.used)}/${num(e.budget)} (${num(e.percent)}%). ` +
+    `Roll over to a new session?` +
+    `<div class="paths">no answer in <b class="cd">${num(e.timeout_s)}</b>s keeps it</div>`);
   const yes = document.createElement('button');
   yes.className = 'yes';
   yes.textContent = 'Roll over';
@@ -1329,6 +1582,10 @@ function submit() {
   }
 
   if (!send({ t: 'submit', text })) return;   // keep the text if we're offline
+  // This tab asked, so this tab follows the answer. turn_start is a broadcast
+  // — see where it is handled.
+  S.weAsked = true;
+  follow = true;
   remember(text);
   input.value = '';
   autosize();
@@ -1620,19 +1877,18 @@ function cfgValue(v) {
   return cfgEl('span', 'cfg-val', String(v));
 }
 
-function cfgSecret(key, v) {
+function cfgSecret() {
+  // There used to be an eye here. The value it revealed no longer arrives:
+  // /config replaces core.token, discord.token and every models.*.api_key
+  // with a placeholder before the response leaves the core, so a reveal could
+  // only ever show the placeholder — and a button that promises the secret and
+  // shows "********" is worse than no button. A secret that reaches the page
+  // is in devtools, in a HAR export and on screen during a screen-share; this
+  // is the one place that can keep it out of all three. The hint says where
+  // the real value lives instead of implying the panel is withholding it.
   const wrap = cfgEl('span', 'cfg-secret');
-  const show = cfgEl('span', 'cfg-val', String(v));
-  show.hidden = true;
-  const dots = cfgEl('span', 'dots', '••••••••');
-  const btn = cfgEl('button', '', '👁');
-  btn.title = 'reveal';
-  btn.onclick = () => {
-    show.hidden = !show.hidden;
-    dots.hidden = !dots.hidden;
-    btn.textContent = show.hidden ? '👁' : '🙈';
-  };
-  wrap.append(dots, show, btn);
+  wrap.append(cfgEl('span', 'dots', '••••••••'),
+              cfgEl('span', 'cfg-hint', 'set — in config.yaml'));
   return wrap;
 }
 
@@ -1640,7 +1896,9 @@ function cfgRow(key, v, path) {
   const row = cfgEl('div', 'cfg-row');
   const k = cfgEl('span', 'cfg-key', key);
   if (SET_RESTART.has(path)) k.append(cfgEl('span', 'badge', 'restart'));
-  row.append(k, SET_SECRETS.has(key) && v ? cfgSecret(key, v) : cfgValue(v));
+  // `&& v` still matters: an unset secret stays "(unset)" rather than claiming
+  // to be a value the panel is keeping from you.
+  row.append(k, SET_SECRETS.has(key) && v ? cfgSecret() : cfgValue(v));
   return row;
 }
 
@@ -1702,12 +1960,18 @@ function renderSettings(data) {
 
 function webuiEditor(val) {
   const rows = cfgEl('div', 'set-rows');
-  const orig = JSON.stringify(val);
   const form = { theme: String(val.theme || 'auto'),
                  pin: { background: val.pin?.background ?? 'var(--bg)',
                         transparency: val.pin?.transparency ?? 1,
                         font_size: val.pin?.font_size ?? '15px',
                         font_color: val.pin?.font_color ?? 'var(--fg)' } };
+  // The form exactly as it was built, which is what "pristine" means. Compared
+  // against this rather than against `val`, because the form fills in a default
+  // for everything the file leaves out: a config with no `pin:` block read as
+  // dirty before the panel had even been looked at, so Save was live on arrival
+  // and clicking it wrote those defaults into the file and reloaded the core
+  // for nothing.
+  const base = { theme: form.theme, pin: { ...form.pin } };
 
   const themeRow = cfgEl('div', 'cfg-row cfg-edit');
   themeRow.append(cfgEl('span', 'cfg-key', 'theme'));
@@ -1781,13 +2045,17 @@ function webuiEditor(val) {
       notice.className = 'set-notice err';
       notice.textContent = String(e);
     } finally {
-      save.disabled = false;
+      // Not `disabled = false`: a save that went through leaves the form
+      // matching what was just written, and re-enabling unconditionally
+      // invited a second identical POST and a second core reload.
+      dirty();
     }
   };
   // A semantic compare, not a string one: the server's key order is the file's,
   // and the form builds its own — a string diff would call an unchanged form
   // dirty (or the reverse) whenever the order differs.
-  const dirty = () => { save.disabled = deepEq({ theme: form.theme, pin: { ...form.pin } }, val); };
+  const dirty = () => { save.disabled = deepEq({ theme: form.theme, pin: { ...form.pin } }, base); };
+  dirty();   // pristine on arrival, so Save starts disabled
   foot.append(save, notice);
   rows.append(foot);
   return rows;
