@@ -17,7 +17,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 from datetime import datetime
 from pathlib import Path
 
@@ -119,18 +118,8 @@ async def save_live(payload, config=None):
     one. Compact JSON, unlike the indented archives: this runs after every turn.
     """
     path = live_path(payload["name"], config)
-    tmp = path.with_suffix(".tmp")
-
-    def _write():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        blob = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        with open(tmp, "w") as f:
-            f.write(blob)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-
-    await asyncio.to_thread(_write)
+    blob = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    await asyncio.to_thread(paths.atomic_write, path, blob)
     return path
 
 
@@ -209,9 +198,13 @@ def _read_id_log(path):
 
 
 def _write_id_log(path, records):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join([_ID_LOG_HEADER] + ["\t".join(r) for r in records])
-                    + "\n", encoding="utf-8")
+    # Atomically: this is a full rewrite of the whole registry, so a torn write
+    # does not lose the one id being added, it loses every id ever issued — and
+    # known_ids() reads this to decide what a new session may be called, so the
+    # next id after such a write could collide with a live one.
+    paths.atomic_write(
+        path,
+        "\n".join([_ID_LOG_HEADER] + ["\t".join(r) for r in records]) + "\n")
 
 
 async def known_ids(config=None):
