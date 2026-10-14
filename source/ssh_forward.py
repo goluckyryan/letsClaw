@@ -76,6 +76,9 @@ class SSHForward:
         # True once ensure() has succeeded: a keepalive failure for a forward
         # that never came up is logged once, not every cycle.
         self._started = False
+        # pid of the exited child _healthy() has already complained about, so
+        # ensure()'s fifteen retries do not print the same line fifteen times.
+        self._warned_dead = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -115,13 +118,33 @@ class SSHForward:
         return self._proc
 
     async def _healthy(self) -> bool:
-        """True when the local end of the forward accepts TCP.
+        """True when the local end of the forward accepts TCP *and is ours*.
 
-        A connect (not an HTTP probe) is the right test: it is
-        protocol-agnostic, and the port is listening only while the forward is
-        actually up — ssh with ExitOnForwardFailure holds the port for the
+        A connect (not an HTTP probe) is the right test for the first half: it
+        is protocol-agnostic, and the port is listening only while the forward
+        is actually up — ssh with ExitOnForwardFailure holds the port for the
         whole life of the child.
+
+        But a connect alone only proves *something* is listening. Once our own
+        ssh has exited, the port is free for anything on this machine to bind,
+        and the next thing to bind it inherits every request we then send down
+        it — requests that carry the model's API key in a header. So once we
+        have a child, it has to still be alive: a dead child plus an open port
+        is not a healthy forward, it is a stranger on our port. ensure() then
+        respawns, the new ssh cannot bind, and the forward reports itself down
+        rather than handing out an engine pointed at whoever is there.
+
+        Before the first spawn (_proc is None) the connect stands on its own,
+        which is what lets a forward set up by hand, or left by a previous run
+        of the core, be reused instead of fought over.
         """
+        if self._proc is not None and self._proc.poll() is not None:
+            if self._warned_dead != self._proc.pid:
+                self._warned_dead = self._proc.pid
+                logger.warning("ssh forward %s: our ssh exited (status %s); "
+                               "not trusting 127.0.0.1:%s until we own it again",
+                               self.name, self._proc.poll(), self.local_port)
+            return False
         try:
             _, writer = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", self.local_port), timeout=3)
@@ -308,7 +331,21 @@ class SSHForwardManager:
             self._forwards.pop(name, None)
 
     def set_zombies(self, zombies):
-        self._zombies = dict(zombies)
+        """Track these as zombies, keeping any that were already pending.
+
+        Merge, not replace. A zombie is a removed forward whose port a live
+        engine still points at; the keepalive closes it once nothing points
+        there any more. Replacing the dict dropped every zombie this reload
+        did not name again — and nothing else holds a reference, so that ssh
+        child was never closed and never would be, for the life of the core.
+
+        Returns the forwards this call displaced (same name, a different
+        object) so the caller, which is in async code, can close them.
+        """
+        displaced = [self._zombies[n] for n, f in zombies.items()
+                     if n in self._zombies and self._zombies[n] is not f]
+        self._zombies.update(zombies)
+        return displaced
 
     def forward(self, model_name):
         return self._forwards.get(model_name)
@@ -338,26 +375,47 @@ class SSHForwardManager:
             self._task = asyncio.get_running_loop().create_task(self._loop())
 
     async def _loop(self):
+        # Everything below the sleep is wrapped, and the loop never breaks on
+        # anything but a cancel. This task is the *only* thing that revives a
+        # dropped forward, and nobody ever retrieves its exception: one raise
+        # here — a zombie whose close() times out oddly, a referenced_ports
+        # callback into a half-torn-down manager — used to end forward
+        # recovery for the life of the process, silently. Every model behind
+        # ssh would then stay down until the core was restarted, with the
+        # traceback appearing only at interpreter exit, if at all.
         while True:
-            # The first pass is immediate: the core starts its forwards at
-            # startup, and a dead path is noticed and retried every cycle
-            # after that.
-            for fwd in list(self._forwards.values()):
-                await fwd.maintain()
+            try:
+                # The first pass is immediate: the core starts its forwards at
+                # startup, and a dead path is noticed and retried every cycle
+                # after that.
+                for fwd in list(self._forwards.values()):
+                    await fwd.maintain()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("ssh keepalive: maintenance pass failed")
             await asyncio.sleep(self._interval)
-            # A zombie is retired the moment no engine points at its port any
-            # more — the last session on that model has swapped or the engine
-            # was closed, so the ssh process can go with it.
-            if self._referenced_ports is not None:
-                try:
-                    ports = set(self._referenced_ports())
-                except Exception:
-                    ports = set()
-                for name in list(self._zombies):
-                    if self._zombies[name].status()["local"] not in ports:
-                        logger.info("ssh forward %s: last engine on its port "
-                                    "is gone — closing", name)
-                        await self._zombies.pop(name).close()
+            try:
+                # A zombie is retired the moment no engine points at its port
+                # any more — the last session on that model has swapped or the
+                # engine was closed, so the ssh process can go with it.
+                if self._referenced_ports is not None:
+                    try:
+                        ports = set(self._referenced_ports())
+                    except Exception:
+                        ports = set()
+                    for name in list(self._zombies):
+                        if self._zombies[name].status()["local"] not in ports:
+                            logger.info("ssh forward %s: last engine on its "
+                                        "port is gone — closing", name)
+                            # Popped before the await, not after: close() can
+                            # take five seconds, and a second pass starting in
+                            # that window would close the same forward twice.
+                            await self._zombies.pop(name).close()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("ssh keepalive: retiring zombies failed")
 
     async def close(self):
         if self._task is not None:
