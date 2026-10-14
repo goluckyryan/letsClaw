@@ -24,6 +24,7 @@ import asyncio
 import os
 import sys
 import threading
+import traceback
 from urllib.parse import quote
 
 try:
@@ -397,11 +398,21 @@ async def run_client(url, session_name, render, token=""):
             async for msg in ws:
                 if msg.type is not aiohttp.WSMsgType.TEXT:
                     continue
-                e = msg.json()
+                # Parsed inside a try of its own. It used to sit above the
+                # try meant to protect it, so a truncated or non-JSON frame
+                # raised straight out of `async for` and killed the pump: the
+                # terminal went on looking connected while nothing the core
+                # said ever reached it again.
+                try:
+                    e = msg.json()
+                except (ValueError, TypeError) as exc:
+                    render.line(f"⚠️  ignored a malformed event from the core "
+                                f"({type(exc).__name__})")
+                    continue
                 try:
                     _dispatch(e, render, ws)
                 except Exception as exc:
-                    # One malformed event must not silently kill the stream —
+                    # One unrenderable event must not silently kill the stream —
                     # which is exactly what a bare create_task() would do.
                     render.line(f"⚠️  could not render {e.get('t')!r}: "
                                 f"{type(exc).__name__}: {exc}")
@@ -479,7 +490,7 @@ async def run_client(url, session_name, render, token=""):
                 await ws.send_json({"t": "stop"})
                 continue
             if text.startswith("/steering"):
-                args = text[4:].strip()
+                args = text[len("/steering"):].strip()
                 if not args:
                     render.line("   /steering needs text — /steering the right IP is 10.0.0.5")
                 else:
@@ -534,8 +545,17 @@ def main():
         code = asyncio.run(run_client(url, args.session, render, token))
     except KeyboardInterrupt:
         pass
+    except Exception:
+        # The os._exit below runs from the finally whatever happens, which
+        # means it also runs past an unhandled exception — bypassing the
+        # default handler that would have printed the traceback and exited
+        # non-zero. A crash looked exactly like a clean quit: same "Bye!",
+        # same status 0, nothing to tell a script or a human otherwise.
+        traceback.print_exc()
+        code = 1
     finally:
-        print("\n\nBye! 👋  (the core keeps running)")
+        print("\n\nBye! 👋  (the core keeps running)" if not code
+              else "\n\nExiting after an error.")
         sys.stdout.flush()
         # The stdin thread is parked in a blocking tty read and cannot be joined.
         os._exit(code)
