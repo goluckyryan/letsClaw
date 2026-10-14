@@ -16,12 +16,15 @@ readable for `stop` and for the rollover answer while a turn is in flight.
 
 import argparse
 import asyncio
+import copy
 import logging
+import secrets
 import shutil
 import socket
 import sys
 import weakref
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
@@ -65,7 +68,18 @@ def _configure_logging(config):
     # lines: the WebUI polls /sessions every 5 s (aiohttp.access), and every
     # model call is logged by httpx. Both go to WARNING.
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
-    logging.getLogger("httpx2").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+# Addresses that are not reachable from another machine. Used both by the
+# startup check and by the banner, so the two cannot disagree about what
+# "loopback" means.
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+# What /config shows in place of a secret. Non-empty, so the Settings panel can
+# still tell that a token is set; nothing like a real token, so it cannot be
+# mistaken for one or accidentally saved back as one.
+REDACTED = "********"
 
 
 def _authorised(request):
@@ -74,7 +88,50 @@ def _authorised(request):
         return True
     sent = (request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
             or request.query.get("token", ""))
-    return sent == token
+    # compare_digest, not ==: string equality returns as soon as two bytes
+    # differ, so its running time leaks how long a correct prefix was and a
+    # patient client can recover the token one character at a time.
+    return secrets.compare_digest(sent, token)
+
+
+def _same_origin(request):
+    """False only when a browser is driving this request from another site.
+
+    Loopback is not a wall against the user's own browser: any page they visit
+    can open ws://127.0.0.1:8770/ws and drive an unconfined `exec`. The defence
+    is that browsers attach `Origin` to WebSocket handshakes and to every
+    cross-origin request, and script cannot forge it — while non-browser
+    clients (the bot, the terminal, curl) send none at all.
+
+    So a missing Origin is allowed through, which keeps every existing client
+    working and costs nothing: the attack this closes is specifically a browser,
+    and a browser always tells us. An Origin that is present must name this very
+    server, port included — another port on localhost is a different origin and
+    is exactly where a hostile page would be served from.
+    """
+    origin = request.headers.get("Origin")
+    if origin is None:
+        return True
+    # "null" (a sandboxed iframe, a file:// page) parses to an empty netloc and
+    # is refused along with anything else that does not name a host.
+    netloc = urlsplit(origin).netloc
+    return bool(netloc) and netloc == request.headers.get("Host", "")
+
+
+def _guard(request):
+    """Both gates a state-changing route needs: who is asking, and from where.
+
+    Read-only routes need only the first — we send no CORS headers, so a hostile
+    page can fire a cross-origin GET but cannot read what comes back. A write
+    lands whether or not the reply is readable, and a WebSocket is exempt from
+    the same-origin policy altogether, which is why those two take both checks.
+    """
+    if not _authorised(request):
+        raise web.HTTPUnauthorized()
+    if not _same_origin(request):
+        logger.warning("refused a cross-origin %s %s from Origin %r",
+                       request.method, request.path, request.headers.get("Origin"))
+        raise web.HTTPForbidden(reason="cross-origin request refused")
 
 
 async def health(request):
@@ -126,8 +183,7 @@ async def session_history(request):
 
 
 async def delete_session(request):
-    if not _authorised(request):
-        raise web.HTTPUnauthorized()
+    _guard(request)
     name = request.match_info["name"]
     result = await request.app["mgr"].delete(name)
     if not result["ok"]:
@@ -138,14 +194,45 @@ async def delete_session(request):
     return web.json_response(result)
 
 
+def _redacted(config):
+    """The config with every secret replaced by a placeholder.
+
+    /config is authenticated, but authentication is not the point here. The
+    point is that a secret which reaches the browser is then in devtools, in a
+    HAR export, and on screen during a demo or a screen-share. Three kinds live
+    in this file and none of them has any business in a response body:
+
+      * core.token — the credential for this very service;
+      * discord.token — a credential for someone else's, and holding the core
+        token should not hand anyone the bot;
+      * models.*.api_key — third-party keys that cost real money.
+
+    Redacted rather than dropped, so the Settings panel can still distinguish
+    "set" from "unset"; the panel does not offer to reveal them, because there
+    is nothing here to reveal.
+    """
+    safe = copy.deepcopy(config)
+    for section, key in (("core", "token"), ("discord", "token")):
+        block = safe.get(section)
+        if isinstance(block, dict) and block.get(key):
+            block[key] = REDACTED
+    # models: is a mapping of name -> settings, each of which may carry a key.
+    models = safe.get("models")
+    if isinstance(models, dict):
+        for entry in models.values():
+            if isinstance(entry, dict) and entry.get("api_key"):
+                entry["api_key"] = REDACTED
+    return safe
+
+
 async def config_get(request):
     """The live config dict, for the Settings panel. Authenticated like the
-    other state reads: core.token and discord.token are in it."""
+    other state reads, and with the two tokens redacted on the way out."""
     if not _authorised(request):
         raise web.HTTPUnauthorized()
     return web.json_response({
         "path": str(request.app["config_path"]),
-        "config": request.app["config"],
+        "config": _redacted(request.app["config"]),
     })
 
 
@@ -153,8 +240,7 @@ async def config_save(request):
     """Save the webui: section and apply it live. Only webui is accepted:
     it is the one section whose change is safe to apply without a restart
     and that a browser should not be editing byte-for-byte."""
-    if not _authorised(request):
-        raise web.HTTPUnauthorized()
+    _guard(request)
     try:
         body = await request.json()
     except ValueError:
@@ -169,15 +255,13 @@ async def config_save(request):
 
 async def reload_config(request):
     """Re-read config.yaml in place. 400 and no change if the file will not load."""
-    if not _authorised(request):
-        raise web.HTTPUnauthorized()
+    _guard(request)
     result = await request.app["mgr"].reload()
     return web.json_response(result, status=200 if result["ok"] else 400)
 
 
 async def rename_session(request):
-    if not _authorised(request):
-        raise web.HTTPUnauthorized()
+    _guard(request)
     try:
         body = await request.json()
     except ValueError:
@@ -216,10 +300,18 @@ def _theme_css(config):
     pin = core.config_pin(config)
     lines = ["/* generated from config.yaml — webui.pin; /reload re-themes */", ":root {"]
     for key in core.PIN_KEYS:
-        if key in pin:
-            # CSS custom properties are case-sensitive and do NOT treat _ as
-            # - — --pin-font_size is a different name from --pin-font-size.
-            lines.append(f"  --pin-{key.replace('_', '-')}: {pin[key]};")
+        if key not in pin:
+            continue
+        if not core.valid_pin_value(pin[key]):
+            # Hand-edited into config.yaml, or saved before save_webui checked.
+            # Dropping the one property is the entire cost of refusing it;
+            # serving it would put attacker-chosen CSS on an unauthenticated
+            # route in every open tab.
+            logger.warning("webui.pin.%s is not a usable CSS value; ignoring it", key)
+            continue
+        # CSS custom properties are case-sensitive and do NOT treat _ as
+        # - — --pin-font_size is a different name from --pin-font-size.
+        lines.append(f"  --pin-{key.replace('_', '-')}: {pin[key]};")
     lines.append("}")
     return web.Response(text="\n".join(lines) + "\n", content_type="text/css",
                         headers={"Cache-Control": "no-cache"})
@@ -307,23 +399,51 @@ async def _writer(ws, sub):
         event = sub.queue.popleft()
         try:
             await ws.send_json(event)
-        except (ConnectionResetError, RuntimeError, asyncio.CancelledError):
+        except asyncio.CancelledError:
+            raise                       # the handler's finally, on the way out
+        except (ConnectionResetError, RuntimeError):
+            return                      # the peer went away; nothing to report
+        except Exception:
+            # Anything else — a payload json cannot serialise, an aiohttp
+            # connection error that is neither of the above — used to end this
+            # task silently while the reader stayed parked in `async for`. The
+            # socket stayed open, the client went on sending, and nothing ever
+            # came back: the UI just stopped updating with no error anywhere.
+            # Close it instead, so the client sees the drop and reconnects.
+            logger.exception("writer failed on a %s event; closing the socket",
+                             (event or {}).get("t"))
+            try:
+                await ws.close(code=WSCloseCode.INTERNAL_ERROR,
+                               message=b"writer failed; reconnect and replay")
+            except Exception:
+                logger.debug("close after writer failure", exc_info=True)
             return
 
 
 async def ws_handler(request):
-    if not _authorised(request):
-        raise web.HTTPUnauthorized()
+    _guard(request)
     mgr = request.app["mgr"]
+
+    # Read the query string BEFORE the handshake. After prepare() the response
+    # is a websocket, so a ValueError out of int() can no longer be turned into
+    # a status: aiohttp logs a 500 it cannot send and the socket just drops,
+    # with no close frame and nothing for the client to report. A bad last_seq
+    # should be a 400 the client can read.
+    name = request.query.get("session", "terminal")
+    want_reasoning = request.query.get("reasoning", "1") != "0"
+    try:
+        last_seq = int(request.query.get("last_seq", 0) or 0)
+    except (TypeError, ValueError):
+        raise web.HTTPBadRequest(reason="last_seq must be a whole number")
+    # A negative would make `if last_seq` true and then match every event, so
+    # a client replaying from "-1" would be sent the whole turn buffer twice.
+    last_seq = max(last_seq, 0)
+
     ws = web.WebSocketResponse(heartbeat=20)  # detect half-open peers
     await ws.prepare(request)
     # Tracked so shutdown can close it. Weak, so a socket that goes away on its
     # own is not kept alive here by the bookkeeping meant to tidy it up.
     request.app["websockets"].add(ws)
-
-    name = request.query.get("session", "terminal")
-    last_seq = int(request.query.get("last_seq", 0) or 0)
-    want_reasoning = request.query.get("reasoning", "1") != "0"
 
     try:
         # ?model= applies only where mgr.get() uses it — when this attach is what
@@ -337,15 +457,21 @@ async def ws_handler(request):
         return ws
 
     sub = core.Subscriber(wants_reasoning=want_reasoning)
+    writer = None
     # Attach, then greet, then start the writer — in that order. Attaching first
     # means no event emitted during the greeting is lost; starting the writer
     # last means none can overtake the greeting and reach the client before it.
+    #
+    # attach() sits immediately before the try, and the greeting inside it: a
+    # client that vanishes during the handshake makes send_json raise, and with
+    # that line outside the try the finally never ran — the subscriber stayed
+    # attached to a dead socket for the life of the process, taking a copy of
+    # every event the session emitted from then on.
     session.attach(sub)
-    await ws.send_json(session.snapshot(last_seq))
-    writer = asyncio.create_task(_writer(ws, sub))
-    logger.info("client attached to %s (%d total)", name, len(session.subscribers))
-
     try:
+        await ws.send_json(session.snapshot(last_seq))
+        writer = asyncio.create_task(_writer(ws, sub))
+        logger.info("client attached to %s (%d total)", name, len(session.subscribers))
         async for msg in ws:
             if msg.type is not WSMsgType.TEXT:
                 continue
@@ -417,7 +543,8 @@ async def ws_handler(request):
     finally:
         session.detach(sub)
         sub.wake.set()
-        writer.cancel()
+        if writer is not None:          # None when the greeting never got out
+            writer.cancel()
         logger.info("client left %s (%d remain)", name, len(session.subscribers))
     return ws
 
@@ -544,12 +671,23 @@ def main():
     bind = args.bind or core_cfg.get("bind", "127.0.0.1")
     port = args.port or int(core_cfg.get("port", 8770))
 
+    # An unconfined `exec` on an address other machines can reach, with nothing
+    # asked of whoever connects, is not a warning — it is a remote shell for the
+    # network. Loopback with no token still works untouched: that is the
+    # zero-config local case, and the Origin check is what defends it.
+    if bind not in LOOPBACK and not (core_cfg.get("token") or ""):
+        print(f"❌ refusing to bind {bind}: core.token is empty, and tools are "
+              "unconfined — anyone who can reach this port could run shell "
+              "commands here.\n   Set core.token in config.yaml, or bind "
+              "127.0.0.1.")
+        sys.exit(1)
+
     app = build_app(config, args.config)
     print(f"🧠 letsClaw core on ws://{bind}:{port}/ws  (proto {core.PROTOCOL_VERSION})")
     if (WEB_DIR / "index.html").exists():
         print(f"   WebUI:  http://{_webui_host(bind)}:{port}/")
     print(f"   models: {', '.join(core.known_models(config)) or '(none)'}")
-    if bind not in ("127.0.0.1", "localhost", "::1"):
+    if bind not in LOOPBACK:
         print("   ⚠️  not bound to loopback — tools are unconfined, so anyone who can "
               "reach this port can run shell commands here")
     # This is a daemon; its stdout is a log file far more often than a tty, and block
