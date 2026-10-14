@@ -29,6 +29,7 @@ from pathlib import Path
 
 import yaml
 
+import config_edit
 import paths
 import session as store
 from llm_engine import ChatResult, LLMEngine, RoundInterrupted
@@ -85,6 +86,12 @@ PAD_TAIL_TOKENS = 2000
 # to read as a counter rather than a stopwatch, slow enough that the tokeniser
 # runs a few times a second instead of once per delta.
 REASONING_STAT_INTERVAL = 0.25
+
+# How long close() waits for a cancelled turn to unwind before persisting
+# anyway. Long enough for an exec child to take its SIGKILL and for the model
+# read to abort, short enough that a wedged turn cannot hold up a systemctl
+# stop until its timeout fires and SIGKILLs the core mid-write.
+CLOSE_TURN_GRACE = 10
 
 # Marks the forced-conclusion directive in base.md. The core extracts the
 # paragraph after this line and re-sends it as a user message when a cut-off
@@ -151,7 +158,43 @@ def config_theme(config):
     return t if t in ("auto", "dark", "light") else "auto"
 
 
+def _int_or(value, default):
+    """int(value), or `default` when the config says something that is not one.
+
+    YAML hands back a string for `max_history_messages: "50"` and None for a
+    key written with no value at all, and both of those used to flow straight
+    into a comparison against len(history), where they raise rather than fall
+    back. A bad number in a config file should cost a log line, not the turn.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning("expected a number, got %r — using %s", value, default)
+        return default
+
+
 PIN_KEYS = ("background", "transparency", "font_size", "font_color")
+
+# A pin value is interpolated straight into the stylesheet /theme.css generates,
+# so it is CSS source, not data — and that route is unauthenticated, served to
+# every tab. Allowed is what colours, lengths and numbers are actually made of:
+# letters, digits, spaces, and  # % . , ( ) + - _  for rgba() and signed values.
+# Everything that could end the declaration or open another — ; } { : quotes
+# backslash @ — is absent by construction, which is the whole of the defence.
+_CSS_VALUE_RE = re.compile(r"^[A-Za-z0-9 #%.,()+_-]{0,200}$")
+
+
+def valid_pin_value(v):
+    """True if `v` can be interpolated into /theme.css as a CSS value.
+
+    Checked at save time so a bad value is refused with a message, and again at
+    render time so one hand-edited into config.yaml — or saved before this
+    existed — still cannot reach a browser.
+    """
+    s = str(v)
+    # url( survives the character class (rgba() needs parens) and is the one
+    # construct that turns a style into an outbound request, so it goes by name.
+    return bool(_CSS_VALUE_RE.match(s)) and "url(" not in s.lower().replace(" ", "")
 
 
 def config_pin(config):
@@ -178,53 +221,14 @@ def load_config(path=None):
         return yaml.safe_load(f) or {}
 
 
-_THEME_KEY_RE = re.compile(r"^  theme\s*:\s*(.*)$")
-_PIN_KEY_RE = re.compile(r"^    (\w+)\s*:\s*(.*)$")
-
-
-def _yaml_scalar(v):
-    """One value as a YAML line fragment, round-tripping through safe_load.
-
-    Booleans are spelled by hand so the intent is visible at the call site;
-    everything else goes through the dumper, which quotes exactly what needs
-    quoting (a '#1e222b' color, a value containing ': ').
-    """
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    dumped = yaml.safe_dump({"_": v}, default_flow_style=False, width=10 ** 6)
-    return dumped.splitlines()[0].split(": ", 1)[1]
-
-
-def _comment_start(line):
-    """The index of the '#' that starts an inline comment, or None.
-
-    A '#' with unbalanced quotes before it is inside a quoted value — a
-    hex color like '#1e222b' — not a comment, so the scan keeps going.
-    """
-    for i, ch in enumerate(line):
-        if ch == "#" and not (line[:i].count('"') % 2 or line[:i].count("'") % 2):
-            return i
-    return None
-
-
-def _revalue(line, new_head):
-    """A key line with its value replaced, keeping the inline comment —
-    spacing and all — and the line ending. The file's own notes survive
-    the save, a hex color in the value does not read as a comment, and
-    the comment keeps the gap it had, so the column stays put."""
-    eol = "\n"
-    for ch in ("\r\n", "\n", "\r"):
-        if line.endswith(ch):
-            eol = ch
-            line = line[: -len(ch)]
-            break
-    idx = _comment_start(line)
-    if idx is None:
-        return new_head + eol
-    sp = idx
-    while sp > 0 and line[sp - 1] in " \t":
-        sp -= 1
-    return new_head + line[sp:idx] + line[idx:] + eol
+# Moved to config_edit.py, which is where the webui-block editing now lives.
+# Re-exported under the old private names so importers and tests that reach for
+# core._yaml_scalar keep working; they are updated in a follow-up commit.
+_THEME_KEY_RE = config_edit._THEME_KEY_RE
+_PIN_KEY_RE = config_edit._PIN_KEY_RE
+_yaml_scalar = config_edit.yaml_scalar
+_comment_start = config_edit.comment_start
+_revalue = config_edit.revalue
 
 
 def known_models(config):
@@ -533,7 +537,13 @@ class Session:
         self.tools_tok = 0
 
         self.max_tool_rounds = int(config.get("tools", {}).get("max_iterations", 8))
-        self.max_history = conv.get("max_history_messages", 100)
+        # int() because YAML gives a string for `max_history_messages: "50"`,
+        # and `len(history) > "50"` raises on 3.x rather than comparing.
+        # 0 (or a negative, or junk) means "never trim", matching
+        # rollover_at_percent's documented `0 = never` — and matching what the
+        # code accidentally did before, since history[-0:] is the whole list,
+        # not the empty one the number literally asks for.
+        self.max_history = _int_or(conv.get("max_history_messages", 100), 100)
         # Per session, never on the shared config dict: a session that disables
         # its own rollover must not disable everyone else's.
         self.rollover_pct = int(conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0)
@@ -587,6 +597,12 @@ class Session:
         # reconnect handed it a fresh handler with no handle in it.
         self._turn_task = None
         self._last_used = None   # measured size of the next prompt, if known
+        # Set to the OSError text when a rollover could not archive the window.
+        # An automatic rollover will not retry while this is set: the disk that
+        # was full one turn ago is still full, and retrying every turn would
+        # turn one failure into an error on every message. /rollover ignores it,
+        # because a person asking again has usually just fixed the cause.
+        self.rollover_blocked = None
         # Serialises this session's own writes to state/live/. Not self.lock:
         # every save point below is already inside it.
         self._save_lock = asyncio.Lock()
@@ -809,7 +825,15 @@ class Session:
             if getattr(self, attr) == was:
                 setattr(self, attr, now)
 
-        if blob["engine"] is not None:
+        if blob["engine"] is not None and blob["engine"] is not self.engine:
+            # The engine being dropped still owns an httpx connection pool. On
+            # the immediate path reload() closes it afterwards; on the deferred
+            # path reload() has already finished its cleanup, and it counted
+            # this very engine as live precisely because the session still
+            # pointed at it. So nothing would ever close it: one leaked pool
+            # per reload that landed while the session was busy. Handed over
+            # rather than closed here, because this function must not await.
+            self.manager.retire_engine(self.engine)
             self.engine = blob["engine"]
         # history is deliberately untouched. The three behavior layers sit in
         # history[0], which is the prompt prefix the server has already
@@ -999,6 +1023,12 @@ class Session:
         Refuses rather than queues when a turn is already running — see the
         module docstring.
         """
+        # lock.locked(), not self.busy — the one place that difference is
+        # deliberate. start_turn has already pointed _turn_task at the task
+        # running this very call, so `busy` is True by construction here and
+        # the turn would refuse itself. This check is only a backstop for a
+        # caller that reaches run_turn directly instead of through start_turn;
+        # the real gate against two concurrent submits is in start_turn.
         if self.lock.locked():
             self.emit(ev("busy", reason="a turn is already running in this session"))
             return
@@ -1493,6 +1523,15 @@ class Session:
                          used=used, budget=self.budget,
                          measured=last_prompt is not None))
         elif not had_error:
+            # The window still grew even though nothing was appended: the user
+            # message went into history at the top of the turn, and the prompt
+            # the server measured already includes it. Leaving _last_used at the
+            # previous turn's value made used_now() report a window smaller than
+            # the real one, so the headroom check never tripped and a reasoning
+            # model that keeps returning empty could run the context to the wall
+            # without a single rollover. No answer to add, so no answer term.
+            if last_prompt is not None:
+                self._last_used = last_prompt
             # No answer, but the generation still happened and still cost — say
             # how much, or a turn spent entirely on reasoning looks free.
             # finish_reason says whether the cap was actually hit, so the advice
@@ -1540,6 +1579,10 @@ class Session:
         # threshold — would still be rolled over from here, which is both a
         # surprise and, in the auto-disable case, the loop that guard prevents.
         if not self.rollover_pct:
+            return
+        # Same guard as _maybe_roll, for the same reason: this fires before
+        # every turn, so an unarchivable window would error on every one.
+        if self.rollover_blocked:
             return
         if self._pad_headroom() >= MIN_THINK_HEADROOM:
             return
@@ -1807,7 +1850,7 @@ class Session:
                                   f"of {self.budget} tok — automatic rollover disabled; "
                                   "/new still works"))
                 self.rollover_pct = 0
-        elif len(self.history) > self.max_history:
+        elif self.max_history > 0 and len(self.history) > self.max_history:
             system = [m for m in self.history if m["role"] == "system"]
             rest = [m for m in self.history if m["role"] != "system"][-self.max_history:]
             while rest and rest[0]["role"] == "tool":
@@ -1816,16 +1859,19 @@ class Session:
 
     async def _maybe_roll(self, used, trip):
         pct = used * 100 // self.budget if self.budget else 0
+        # A rollover that could not archive its window left this set. Trying
+        # again unprompted would raise the same error on every turn from here
+        # on; the person has been told once and /rollover is the way back.
+        if self.rollover_blocked:
+            return False
         if self.rollover_mode == "auto":
-            await self.roll_over(f"context at {pct}%", used, trip)
-            return True
+            return await self.roll_over(f"context at {pct}%", used, trip)
         if self.rollover_mode == "ask":
             # Don't re-ask every turn once refused; wait for real growth.
             if self.declined_at is not None and used < self.declined_at + max(1, self.budget // 20):
                 return False
             if await self._ask_rollover(used, pct):
-                await self.roll_over(f"context at {pct}%", used, trip)
-                return True
+                return await self.roll_over(f"context at {pct}%", used, trip)
             self.declined_at = used
             self.emit(ev("notice", level="info",
                          text="keeping the session; /new rolls over when you're ready"))
@@ -1867,7 +1913,13 @@ class Session:
         """Archive, distil a handoff, and start a fresh window.
 
         Archive first: a failed summariser or a full disk costs the summary,
-        never the conversation.
+        never the conversation. Returns True if the window was actually rolled.
+
+        That promise used to be only a comment. A failed save_transcript warned
+        and fell through, and ~40 lines later `self.history = fresh` threw the
+        conversation away anyway — so the one failure the ordering exists to
+        survive was the one that lost everything. Now it aborts, and the window
+        it could not archive is still there to try again.
         """
         self.rollover_count += 1
         used = used if used is not None else self.used_now()
@@ -1878,8 +1930,20 @@ class Session:
                 self.history, self.model_name, self.config, self.name,
                 session_id=self.session_id)
         except OSError as e:
-            transcript = None
-            self.emit(ev("notice", level="warn", text=f"could not save transcript: {e}"))
+            # error, not warn: nothing was rolled, the window is still full, and
+            # the next turn will be refused the same way until the disk is fixed.
+            self.rollover_count -= 1
+            self.rollover_blocked = str(e)
+            self.emit(ev("notice", level="error",
+                         text=f"could not save the transcript ({e}) — rollover "
+                              "abandoned and the conversation kept. Free some "
+                              "disk, then /rollover."))
+            self.emit(ev("rollover_failed", reason=reason, error=str(e),
+                         used=used, budget=self.budget))
+            return False
+        # Cleared only on a save that worked, so the guard cannot outlive the
+        # condition that set it.
+        self.rollover_blocked = None
         # Closed here, not at the end: the path has to exist before the
         # carryover that advertises it is built, and the next segment then
         # opens on the first turn of the fresh window.
@@ -1939,6 +2003,7 @@ class Session:
                      handoff_text=handoff or None,
                      used=self.estimate(), budget=self.budget,
                      count=self.rollover_count))
+        return True
 
     # ---- commands --------------------------------------------------------
 
@@ -1994,7 +2059,12 @@ class Session:
             # the very session that asked, or deadlock waiting on itself.
             return await self.manager.reload()
 
-        if self.lock.locked():
+        # self.busy, not lock.locked(): a turn created by start_turn does not
+        # reach `async with self.lock` until the loop next runs it, so a /clear
+        # arriving in that gap saw an idle session and wiped the history out
+        # from under a turn that was about to start. rename and delete already
+        # use the property for this reason.
+        if self.busy:
             return {"ok": False, "error": "a turn is running in this session"}
         async with self.lock:
             # Each of these rewrites the history, so each has to reach disk:
@@ -2023,7 +2093,15 @@ class Session:
             if name == "rollover":
                 trip = (int(self.budget * self.rollover_pct / 100)
                         if self.rollover_pct else 0)
-                await self.roll_over("on request", trip=trip)
+                # Asked for by a person, so the guard an earlier disk failure
+                # set is cleared first: they have usually just freed the space
+                # and this is how they say so. If it fails again it is set again.
+                self.rollover_blocked = None
+                if not await self.roll_over("on request", trip=trip):
+                    return {"ok": False,
+                            "error": "could not archive this window — the "
+                                     "conversation is untouched. See the error "
+                                     "above; free some disk and try again."}
                 self.declined_at, self.warned_over = None, False
                 await self.persist()
                 return {"ok": True}
@@ -2120,6 +2198,15 @@ class SessionManager:
         self.conclude_directive = extract_conclude_directive(self.base_behavior)
         self.checkpoint_directive = extract_checkpoint_directive(self.base_behavior)
         self._engine_lock = asyncio.Lock()
+        # Serialises session creation in get(). Creation spans three awaits
+        # between the "is it there?" test and the insert, which is long enough
+        # for a second attach to the same new name to slip through and build a
+        # rival Session — see get() for what that cost.
+        self._create_lock = asyncio.Lock()
+        # Engines a session stopped using after reload()'s own cleanup had
+        # already run — see retire_engine. Drained at the next reload and at
+        # close(); an entry here is a connection pool nobody is reading from.
+        self._retired_engines = []
         tools_cfg = config.get("tools", {})
         workdir = tools_cfg.get("workdir") or str(paths.REPO_ROOT)
         from tools import build_tools
@@ -2151,6 +2238,44 @@ class SessionManager:
                         "retrying, try again in a moment") from e
                 self._engines[name] = build_engine(self.config, name, forward=fwd)
             return self._engines[name]
+
+    def retire_engine(self, engine):
+        """Note an engine a session has stopped using, to be closed later.
+
+        Synchronous on purpose: the only caller is Session.apply_config, which
+        must not await (see its docstring for why). The close itself happens at
+        the next reload or at shutdown, and only once nothing references the
+        engine any more — engines are shared per model, so the session that
+        dropped it is often not the last holder.
+        """
+        if engine is not None:
+            self._retired_engines.append(engine)
+
+    def _live_engine_ids(self):
+        """id() of every engine something could still read from."""
+        live = {id(e) for e, _, _ in self._engines.values()}
+        live |= {id(s.engine) for s in self.sessions.values()}
+        # A deferred blob's engine is not installed yet but is already spoken
+        # for: the session will swap to it the moment its turn ends.
+        live |= {id(b["engine"]) for s in self.sessions.values()
+                 if (b := s._pending_config) and b["engine"] is not None}
+        return live
+
+    async def _close_unreferenced(self, engines):
+        live = self._live_engine_ids()
+        for engine in engines:
+            if engine is None or id(engine) in live:
+                continue
+            try:
+                await engine.close()
+            except Exception:
+                logger.debug("engine close", exc_info=True)
+
+    async def _drain_retired_engines(self):
+        if not self._retired_engines:
+            return
+        retired, self._retired_engines = self._retired_engines, []
+        await self._close_unreferenced(retired)
 
     def _engine_ports(self):
         """The netlocs (host:port) every live engine points at.
@@ -2347,18 +2472,39 @@ class SessionManager:
         return await asyncio.to_thread(self._refresh_behaviors_sync)
 
     async def get(self, name, model=None):
-        if name not in self.sessions:
+        """The session called `name`, created on first use.
+
+        Creation is serialised and the existence test repeated inside the lock.
+        Without that, two clients attaching to the same new name at once both
+        saw it missing, and three awaits later both inserted: two Session
+        objects for one name, each with its own _save_lock, writing the same
+        live file over each other — and the loser still attached to whichever
+        client got there first, so its events went to an object the registry
+        no longer listed. The WebUI reconnecting while the bot bridges the same
+        channel is exactly this shape.
+        """
+        # The common case — the session already exists — costs no lock at all.
+        s = self.sessions.get(name)
+        if s is not None:
+            return s
+        async with self._create_lock:
+            # Checked again: whoever held the lock first may have just made it.
+            s = self.sessions.get(name)
+            if s is not None:
+                return s
             s = Session(name, self, self.config)
             s.session_id = await self._new_session_id()
             s.tools = self._tools
             s.schemas = self._schemas
             s.tools_tok = self._tools_tok
             await s.use_model(model)
+            # Registered in the dict last, and only once it is fully built: a
+            # half-initialised session must never be visible under its name.
             self.sessions[name] = s
             await store.register_id(s.session_id, name, self.config)
             logger.info("session %s created on model %s (id %s)",
                         name, s.model_name, s.session_id)
-        return self.sessions[name]
+            return s
 
     async def reload(self, path=None):
         """Re-read config.yaml and apply it to everything already running.
@@ -2452,8 +2598,8 @@ class SessionManager:
         scalars = [
             ("max_tool_rounds", int(old_tools.get("max_iterations", 8)),
                                 int(new_tools.get("max_iterations", 8))),
-            ("max_history", old_conv.get("max_history_messages", 100),
-                            new_conv.get("max_history_messages", 100)),
+            ("max_history", _int_or(old_conv.get("max_history_messages", 100), 100),
+                            _int_or(new_conv.get("max_history_messages", 100), 100)),
             ("rollover_pct", int(old_conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0),
                              int(new_conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0)),
             ("rollover_mode", str(old_conv.get("rollover_mode", DEFAULT_ROLLOVER_MODE)).lower(),
@@ -2483,7 +2629,10 @@ class SessionManager:
                 "engine": entry[0] if entry else None,
                 "lost_model": entry is None,
             }
-            if sess.lock.locked():
+            # busy, not lock.locked(): a turn between create_task and its first
+            # await would otherwise be treated as idle and have its engine and
+            # budget swapped mid-flight instead of being deferred.
+            if sess.busy:
                 sess._pending_config = blob
                 deferred += 1
             else:
@@ -2500,22 +2649,23 @@ class SessionManager:
         zombies = {n: f for n, f in removed.items()
                    if f.status()["local"] in ports}
         self.forwards.commit(removed)
-        self.forwards.set_zombies(zombies)
+        # set_zombies merges, so a zombie still waiting from an earlier reload
+        # survives this one; what it hands back is the forwards this reload
+        # displaced under a name already pending, which nothing points at any
+        # more and which only this caller is in async code to close.
+        for fwd in self.forwards.set_zombies(zombies):
+            await fwd.close()
         for name, fwd in removed.items():
             if name not in zombies:
                 await fwd.close()
 
         # Only the ones nothing points at any more. A session mid-stream on an old
         # engine must keep it: closing the client under it would abort the read.
-        live = {id(s.engine) for s in self.sessions.values()}
-        live |= {id(b["engine"]) for s in self.sessions.values()
-                 if (b := s._pending_config) and b["engine"] is not None}
-        for engine, _, _ in old_engines.values():
-            if id(engine) not in live:
-                try:
-                    await engine.close()
-                except Exception:
-                    logger.debug("engine close during reload", exc_info=True)
+        await self._close_unreferenced(e for e, _, _ in old_engines.values())
+        # Engines retired by a deferred apply since the last reload. They were
+        # spared by the pass above — at the time, the session still pointed at
+        # them — and this is the first moment it is safe to look again.
+        await self._drain_retired_engines()
 
         logger.info("config reloaded from %s: %s (%d session(s) updated, %d deferred)",
                     path, "; ".join(changed), updated, deferred)
@@ -2550,66 +2700,45 @@ class SessionManager:
             for k, v in pin.items():
                 if isinstance(v, (dict, list)):
                     return {"ok": False, "error": f"webui.pin.{k} must be a scalar"}
+                if not valid_pin_value(v):
+                    # Refused here rather than sanitised: a value that needs
+                    # characters this rejects is not a colour or a length, and
+                    # quietly rewriting what the user typed would be worse than
+                    # telling them it will not do.
+                    return {"ok": False, "error": (
+                        f"webui.pin.{k} is not a usable CSS value — letters, "
+                        "digits, spaces and  # % . , ( ) + - _  only")}
                 values[f"pin.{k}"] = _yaml_scalar(v)
 
         try:
             text = self.config_path.read_text()
         except OSError as e:
             return {"ok": False, "error": f"cannot read config: {e}"}
-        out = []
-        in_block = False
-        pin_header = False
-        for line in text.splitlines(keepends=True):
-            if not in_block:
-                if line.startswith("webui:"):
-                    in_block = True
-                out.append(line)
-                continue
-            if line.strip() and line[0] not in " \t":
-                in_block = False      # the next top-level section: the block is over
-                out.append(line)
-                continue
-            if re.match(r"^  pin\s*:", line):
-                pin_header = True
-            m = _THEME_KEY_RE.match(line)
-            if m and "theme" in values:
-                out.append(_revalue(line, f"  theme: {values.pop('theme')}"))
-                continue
-            m = _PIN_KEY_RE.match(line)
-            if m and f"pin.{m.group(1)}" in values:
-                key = f"pin.{m.group(1)}"
-                out.append(_revalue(line, f"    {m.group(1)}: {values.pop(key)}"))
-                continue
-            out.append(line)
-
-        if values:
-            # Keys the form sent that the file did not have: append them at
-            # the end of the block — the end of the file when webui is the
-            # last section, as in the example config.
-            if out and not out[-1].endswith("\n"):
-                out[-1] += "\n"
-            if not in_block:
-                out.append("\nwebui:\n")
-            for path, scalar in values.items():
-                if path.startswith("pin."):
-                    if not pin_header:
-                        out.append("  pin:\n")
-                        pin_header = True
-                    out.append(f"    {path.split('.', 1)[1]}: {scalar}\n")
-                else:
-                    out.append(f"  {path}: {scalar}\n")
-
-        finished = "".join(out)
+        try:
+            finished = config_edit.edit_webui_block(text, values)
+        except ValueError as e:
+            logger.error("refused a webui save: %s", e)
+            return {"ok": False, "error": str(e)}
         try:
             fresh = yaml.safe_load(finished) or {}
         except yaml.YAMLError as e:
             return {"ok": False, "error": f"refusing to write a config that will not parse: {e}"}
         if not isinstance(fresh.get("webui"), dict):
             return {"ok": False, "error": "webui must be a mapping"}
+        # Parsing the result cannot see a duplicated block: safe_load keeps the
+        # last `webui:` and reports a perfectly good mapping, while everything
+        # in the first copy is gone. Counting is the only check that catches it,
+        # and it is cheap enough to keep here as well as in the editor.
+        if config_edit.count_blocks(finished) != max(config_edit.count_blocks(text), 1):
+            return {"ok": False, "error": (
+                "refusing to write a config whose webui: block was duplicated — "
+                "the later copy would hide your current settings")}
 
-        tmp = self.config_path.with_suffix(".yaml.tmp")
-        tmp.write_text(finished)
-        tmp.replace(self.config_path)
+        # The rename was already here; the fsync was not, so the metadata could
+        # reach disk ahead of the bytes and a power cut mid-save could leave
+        # config.yaml readable but empty — with the only copy of the user's
+        # settings in it.
+        paths.atomic_write(self.config_path, finished)
         logger.info("config saved from WebUI: webui section edited in place")
         return await self.reload()
 
@@ -2810,12 +2939,56 @@ class SessionManager:
                 "files": files, "bytes": freed}
 
     async def close(self):
+        # Stop the turns first, and wait for them. A turn in flight owns its
+        # session's history: repairing and persisting underneath it saves a
+        # half-written exchange, and the turn's own finally then persists again
+        # after us, so the save below would be the one that loses. Cancelling
+        # is also the only thing that kills a running exec — the tool kills its
+        # process group from the CancelledError handler, and nothing else does,
+        # so a shell started by the model outlives the core without this.
+        turns = [t for s in self.sessions.values()
+                 if (t := s._turn_task) is not None and not t.done()]
+        for t in turns:
+            t.cancel()
+        if turns:
+            logger.info("shutdown: stopping %d turn(s) in flight", len(turns))
+            # Bounded: a turn that will not unwind must not hold the shutdown
+            # open. Persisting over it is the lesser loss — the alternative is
+            # systemd's SIGKILL arriving in the middle of the same write.
+            _, pending = await asyncio.wait(turns, timeout=CLOSE_TURN_GRACE)
+            if pending:
+                logger.warning("shutdown: %d turn(s) still running after %ss — "
+                               "saving anyway", len(pending), CLOSE_TURN_GRACE)
+
         for s in self.sessions.values():
             s.repair_history()
             # The other half of the durability story: the per-turn save covers a
             # crash, this covers a clean stop, and between them the only thing a
             # restart can cost is a turn that was still running.
-            await s.persist()
-        for engine, _, _ in self._engines.values():
-            await engine.close()
+            try:
+                await s.persist()
+            except Exception:
+                # One unwritable session must not cost the other nine theirs,
+                # nor the engine and forward cleanup below.
+                logger.exception("shutdown: could not persist session %s", s.name)
+
+        # Every engine anything still points at, not just the manager's cache.
+        # After a reload a session can hold an older engine the cache has
+        # already forgotten, and a retired one is waiting here precisely
+        # because no earlier pass was allowed to close it — each owns a pool.
+        closing, seen = [], set()
+        for engine in (*(e for e, _, _ in self._engines.values()),
+                       *(s.engine for s in self.sessions.values()),
+                       *(b["engine"] for s in self.sessions.values()
+                         if (b := s._pending_config)),
+                       *self._retired_engines):
+            if engine is not None and id(engine) not in seen:
+                seen.add(id(engine))
+                closing.append(engine)
+        self._retired_engines = []
+        for engine in closing:
+            try:
+                await engine.close()
+            except Exception:
+                logger.debug("engine close during shutdown", exc_info=True)
         await self.forwards.close()
