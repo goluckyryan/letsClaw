@@ -30,6 +30,7 @@ from aiohttp import WSCloseCode, WSMsgType, web
 
 import config as configlib
 import core
+import logging_setup
 import paths
 
 logger = logging.getLogger("letclaw.server")
@@ -52,19 +53,7 @@ IMAGE_TYPES = {
 
 def _configure_logging(config):
     """config.yaml's logging: section was never wired up; a daemon needs it."""
-    cfg = config.get("logging", {})
-    level = getattr(logging, str(cfg.get("level", "INFO")).upper(), logging.INFO)
-    handlers = [logging.StreamHandler(sys.stderr)]
-    path = cfg.get("file")
-    if path:
-        try:
-            p = paths.resolve(path)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            handlers.append(logging.FileHandler(p))
-        except OSError as e:
-            print(f"⚠️  cannot log to {path}: {e}", file=sys.stderr)
-    logging.basicConfig(level=level, handlers=handlers,
-                        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    logging_setup.configure(config, "core")
     # Third-party chatter at the configured level would drown the app's own
     # lines: the WebUI polls /sessions every 5 s (aiohttp.access), and every
     # model call is logged by httpx. Both go to WARNING.

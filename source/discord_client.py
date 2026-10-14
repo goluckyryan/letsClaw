@@ -67,6 +67,7 @@ except ImportError:                                    # pragma: no cover
           "   .venv/bin/pip install -r requirements.txt", file=sys.stderr)
     raise SystemExit(1)
 
+import logging_setup
 import paths
 from chunker import chunk_discord_text
 from config import load_config
@@ -2058,19 +2059,7 @@ class LetsClawBot(discord.Client):
 
 
 def _configure_logging(config):
-    cfg = config.get("logging", {})
-    level = getattr(logging, str(cfg.get("level", "INFO")).upper(), logging.INFO)
-    handlers = [logging.StreamHandler(sys.stderr)]
-    path = cfg.get("file")
-    if path:
-        try:
-            p = paths.resolve(path)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            handlers.append(logging.FileHandler(p))
-        except OSError as e:
-            print(f"⚠️  cannot log to {path}: {e}", file=sys.stderr)
-    logging.basicConfig(level=level, handlers=handlers,
-                        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    logging_setup.configure(config, "discord")
     # discord.py narrates every gateway heartbeat and resume at INFO, which at
     # the configured level would bury this client's own lines.
     logging.getLogger("discord").setLevel(logging.WARNING)

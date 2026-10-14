@@ -231,9 +231,17 @@ memory:
   long_term_file: "state/memory_store/long_term.md"   # rollover handoffs are appended here
 
 # Logging
+# The writer's name is inserted before the suffix, so the core writes
+# logs/letclaw-core.log and the Discord bot logs/letclaw-discord.log. They are
+# separate processes: one file for both would interleave their lines, and
+# rotating a shared file is worse still — whichever rolls it renames the file
+# out from under the other, whose log then goes nowhere.
+# Each is capped at max_bytes with `backups` rolled copies kept.
 logging:
   level: "INFO"
   file: "logs/letclaw.log"
+  max_bytes: 10485760
+  backups: 5
 # WebUI — style of the pinned prompt (the newest user message, stuck to the top
 # of the log while a turn runs). Served to the page as /theme.css; /reload
 # re-themes it with no restart. Omit any key to keep the built-in default.

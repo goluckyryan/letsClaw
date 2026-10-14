@@ -11,7 +11,7 @@
 # reboot only if linger is on (checked below). The system unit runs as you
 # too (User= in the file) and starts at boot regardless of login.
 #
-# Logs:  journalctl [--user] -u letsClaw -f   (core also writes logs/letclaw.log)
+# Logs:  journalctl [--user] -u letsClaw -f   (also logs/letclaw-core.log)
 # State: systemctl [--user] status letsClaw
 #
 # Re-run ./install.sh after a git pull to refresh the unit (it is generated,

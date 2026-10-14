@@ -1291,7 +1291,7 @@ The **system** unit (`--system`) starts at boot regardless of login. Only the
 ```bash
 systemctl [--user] status letsClaw          # is it running
 systemctl [--user] restart letsClaw         # restart it
-journalctl [--user] -u letsClaw -f          # the log (the core also writes logs/letclaw.log)
+journalctl [--user] -u letsClaw -f          # the log (also logs/letclaw-core.log)
 ```
 
 A `--user` and a `--system` unit would fight over the core's port, so the script
