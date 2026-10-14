@@ -87,6 +87,20 @@ RECONNECT_RESET_S = 30
 SWEEP_INTERVAL_S = 60
 DENY_QUIET_S = 600              # one refusal per stranger per 10 minutes
 READY_TIMEOUT_S = 10
+# How long the link waits, once the socket is done, for the queued tail of an
+# answer to finish posting. Long enough for a handful of Discord sends at a
+# second each; short enough that a wedged handler cannot hold up a reconnect.
+DRAIN_GRACE_S = 20
+# Queue depth at which the backlog is worth a line in the log. Not a cap:
+# capping would reintroduce the blocking this queue exists to remove.
+QUEUE_WARN_AT = 50
+# Grace on top of the core's own rollover-question timeout before this side
+# stops treating a bare yes/no as an answer to it. Covers the round trip, so a
+# genuine last-second answer is not thrown away here.
+ASK_SLACK_S = 5
+# Used when the core's rollover_ask carries no timeout_s. Anything finite beats
+# the old behaviour, which was to wait for ever.
+DEFAULT_ASK_TIMEOUT_S = 120
 # Which session name each channel was last given, so a channel renamed
 # while the bot was down is still recognised as the same channel.
 NAMES_FILE = paths.resolve("state/discord_names.json")
@@ -158,6 +172,33 @@ def _hard_split(text, limit=DISCORD_LIMIT):
     if buf:
         out.append("".join(buf))
     return out
+
+
+async def _followup(interaction, text, *, file=None, filename="answer.md"):
+    """followup.send under the same wire limit say() enforces. False if refused.
+
+    chunk_discord_text measures code points; Discord counts UTF-16 units, so
+    an emoji-dense chunk can be comfortably under 2000 characters and over
+    2000 units — a 400, and the message is simply gone. say() runs every piece
+    through _hard_split for exactly that reason; the interaction paths sent
+    straight to followup.send and did not, and swallowed the refusal besides.
+
+    The file rides with the last piece, so the note explaining it is already up.
+    """
+    pieces = _hard_split(text) if text else [text]
+    sent = True
+    for i, piece in enumerate(pieces):
+        last = i == len(pieces) - 1
+        try:
+            if file is not None and last:
+                await interaction.followup.send(
+                    piece, file=discord.File(file, filename=filename))
+            else:
+                await interaction.followup.send(piece)
+        except discord.HTTPException as e:
+            logger.warning("Discord refused a followup (%s)", e)
+            sent = False
+    return sent
 
 
 def _mention_summary(settings):
@@ -458,13 +499,18 @@ class CoreLink:
     """
 
     def __init__(self, url, session, http, *, token=None, model=None,
-                 on_event=None):
+                 on_event=None, on_drop=None):
         self.url = url
         self.session = session
         self.http = http
         self.token = token
         self.model = model
         self.on_event = on_event
+        # Called with no arguments each time the socket goes away, before the
+        # reconnect. The reconnect itself costs the Discord side nothing — but
+        # any state it set from an event and clears on a later one does need
+        # to hear about the gap. See ChannelBridge.dropped.
+        self.on_drop = on_drop
         self.last_seq = 0
         self.last_used = time.monotonic()
         self.ws = None
@@ -527,6 +573,17 @@ class CoreLink:
                                self.session, type(e).__name__, e)
             self._ready.clear()
             self.ws = None
+            if self.on_drop is not None:
+                # The socket is gone; whoever is rendering this session needs
+                # to know before the reconnect, not after it. Guarded because
+                # a raise here would end the reconnect loop outright.
+                try:
+                    await self.on_drop()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("session %s: drop handler failed",
+                                     self.session)
             if self._closing:
                 break
             if time.monotonic() - started >= RECONNECT_RESET_S:
@@ -541,26 +598,84 @@ class CoreLink:
             self.ws = ws
             self._ready.set()
             logger.info("session %s: attached to the core", self.session)
-            async for msg in ws:
-                if msg.type is not aiohttp.WSMsgType.TEXT:
-                    continue
+            # Events go to a queue, not straight to on_event. Awaiting the
+            # handler inside this loop meant the socket went unread for as
+            # long as the handler ran, and posting a long answer takes about a
+            # second per Discord message. Two things follow, both measured:
+            #
+            #   * the core's Subscriber queue is bounded at 2000 and drops a
+            #     client that fills it ("dropping a client that could not keep
+            #     up", server.py), so a long enough answer gets the link closed
+            #     out from under the bot that is still posting it;
+            #   * the bot does not notice a close until the handler returns.
+            #     Live on 2026-10-14 the core logged "client left" at 12:06:56
+            #     and the bot only saw it at 12:07:04 — eight seconds deaf, and
+            #     submit()'s False return is discarded, so anything typed in
+            #     that window was dropped with no reply and no error.
+            #
+            # (The heartbeat is *not* the mechanism, despite the obvious story:
+            # under aiohttp 3.14 both ends reset their heartbeat on incoming
+            # bytes at the transport layer, so a blocked reader still pongs. A
+            # client blocked 45s through a silent link was measured surviving.)
+            # The core states this rule for its own clients at server.py:386;
+            # this is the same rule, applied on this side.
+            queue = asyncio.Queue()
+            drain = asyncio.create_task(self._drain(queue),
+                                        name=f"drain:{self.session}")
+            try:
+                async for msg in ws:
+                    if msg.type is not aiohttp.WSMsgType.TEXT:
+                        continue
+                    try:
+                        event = msg.json()
+                    except ValueError:
+                        logger.debug("session %s: malformed event ignored", self.session)
+                        continue
+                    seq = event.get("seq")
+                    if isinstance(seq, int):
+                        self.last_seq = max(self.last_seq, seq)
+                    if self.on_event is None:
+                        continue
+                    queue.put_nowait(event)
+                    if queue.qsize() == QUEUE_WARN_AT:
+                        logger.warning("session %s: %d events waiting to post — "
+                                       "Discord is slower than the core is "
+                                       "generating", self.session, QUEUE_WARN_AT)
+            finally:
+                # The reader stopping is not a reason to drop messages already
+                # in hand, so the tail of an answer gets a bounded grace to
+                # land. A cancel (close(), shutdown) skips the wait and goes
+                # straight to the inner finally, which is what a cancel means.
                 try:
-                    event = msg.json()
-                except ValueError:
-                    logger.debug("session %s: malformed event ignored", self.session)
-                    continue
-                seq = event.get("seq")
-                if isinstance(seq, int):
-                    self.last_seq = max(self.last_seq, seq)
-                if self.on_event is None:
-                    continue
-                try:
-                    await self.on_event(event)
-                except Exception:
-                    # One unrenderable event must never take down the stream.
-                    logger.exception("session %s: could not handle %r",
-                                     self.session, event.get("t"))
+                    await asyncio.wait_for(queue.join(), timeout=DRAIN_GRACE_S)
+                except asyncio.TimeoutError:
+                    logger.warning("session %s: giving up on %d queued event(s) — "
+                                   "the handler did not finish within %ss",
+                                   self.session, queue.qsize(), DRAIN_GRACE_S)
+                finally:
+                    drain.cancel()
         logger.info("session %s: the core closed the connection", self.session)
+
+    async def _drain(self, queue):
+        """Hand queued events to on_event, one at a time and in order.
+
+        A task of its own so the reader never waits on Discord. One handler
+        and one queue, so events still arrive in the order the core sent them
+        — which matters: a `turn_end` that overtook its own `message` would
+        clear the typing indicator before the answer appeared.
+        """
+        while True:
+            event = await queue.get()
+            try:
+                await self.on_event(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # One unrenderable event must never take down the stream.
+                logger.exception("session %s: could not handle %r",
+                                 self.session, event.get("t"))
+            finally:
+                queue.task_done()
 
     # -- sending --
 
@@ -612,6 +727,9 @@ class ChannelBridge:
         self.owner = owner              # the bot, for /info's "where" line
         self.answer = []
         self.pending_ask = None
+        # monotonic deadline for pending_ask, mirroring the core's own — see
+        # _ask and take_pending_ask.
+        self.pending_ask_until = 0.0
         self.busy = False
         self._typing = None
         self._warned_proto = False
@@ -643,7 +761,19 @@ class ChannelBridge:
             # A cancelled turn, or one that produced only tool calls. The notice
             # or error that explains it has already gone out on its own.
             return
+        await self._post_text(text)
 
+    async def _post_text(self, text):
+        """Post text to the channel under the channel's own limits.
+
+        Both the model's answer and a command's reply come through here, so
+        max_messages, the refused-send check and the attach-the-whole-thing
+        fallback apply to each in the same way. They did not: this path used to
+        chunk and send with no cap and no look at say()'s result, so a long
+        command reply — a /files listing, a /help on a big tool set — flooded
+        the channel past the limit the user set for exactly that, and a
+        refusal at chunk 12 of 40 dropped the remaining 28 in silence.
+        """
         chunks = chunk_discord_text(text, max_chars=DISCORD_LIMIT,
                                     max_lines=self.settings.max_lines)
         unlimited = self.settings.max_messages == MAX_MESSAGES_UNLIMITED
@@ -681,6 +811,47 @@ class ChannelBridge:
             logger.warning("session %s: could not attach the answer (%s)",
                            self.link.session, e)
             await self.say("_…the rest of the answer would not upload._")
+
+    def take_pending_ask(self):
+        """The outstanding rollover question's id, cleared as it is handed over.
+
+        None when there is none, or when the core's deadline for it has passed
+        — an expired question is not outstanding, and a yes/no arriving after
+        it should be read as what the person actually meant.
+        """
+        if not self.pending_ask:
+            return None
+        if time.monotonic() > self.pending_ask_until:
+            logger.info("session %s: the rollover question timed out; "
+                        "treating this as an ordinary message",
+                        self.link.session)
+            self.pending_ask = None
+            return None
+        request_id, self.pending_ask = self.pending_ask, None
+        return request_id
+
+    # -- the link went away --
+
+    async def dropped(self):
+        """The socket to the core is gone (CoreLink is about to reconnect).
+
+        `busy` and the typing indicator go up on `turn_start` and come down on
+        `turn_end`. A drop between the two means `turn_end` is delivered to a
+        socket that no longer exists, so without this both stayed up for good:
+        the "…is typing" animation re-poked Discord every few seconds for the
+        life of the process, and every message typed in the channel was
+        refused with "a turn is already running" — for a turn that had long
+        since finished, or had never been running here at all. Only a bot
+        restart cleared it.
+
+        The half-built answer is kept, not dropped: the core replays what this
+        client missed on reattach, and _hello is where the real state returns.
+        """
+        if self.busy or self._typing is not None:
+            logger.info("session %s: link dropped mid-turn — releasing the "
+                        "channel until it reattaches", self.link.session)
+        self.busy = False
+        self._stop_typing()
 
     # -- typing --
 
@@ -761,13 +932,35 @@ class ChannelBridge:
             await self.handle(missed)
         if event.get("gap"):
             await self.say("_(some earlier output was missed while detached)_")
+        # Authoritative in both directions, and applied after the replay above
+        # because it describes the same instant the replay ends at. Only the
+        # True half used to be here, so a reconnect could restore `busy` from
+        # a replayed turn_start whose turn_end the core had already sent — and
+        # nothing would ever clear it.
         if event.get("busy"):
             self.busy = True
             self._start_typing()
             await self.say("_⏳ a turn is already running in this session_")
+        else:
+            self.busy = False
+            self._stop_typing()
 
     async def _ask(self, event):
         self.pending_ask = event.get("request_id")
+        try:
+            timeout_s = float(event.get("timeout_s") or 0)
+        except (TypeError, ValueError):
+            timeout_s = 0.0
+        # The core stops waiting after timeout_s and keeps the session; this
+        # has to stop waiting too. It never did, so the id stayed pending for
+        # the life of the bridge, and the next bare "yes" typed in the channel
+        # — an answer to a person, or to the model — was eaten as a reply to a
+        # question the core had forgotten hours earlier, with no turn run and
+        # nothing said. The slack covers the round trip, so a genuine
+        # last-second answer is not thrown away on this side.
+        self.pending_ask_until = (time.monotonic() + timeout_s + ASK_SLACK_S
+                                  if timeout_s > 0 else
+                                  time.monotonic() + DEFAULT_ASK_TIMEOUT_S)
         await self.say(
             f"⚠️ Context at {event.get('used')}/{event.get('budget')} "
             f"({event.get('percent')}%). Roll over to a new session?\n"
@@ -917,11 +1110,6 @@ class ChannelBridge:
         finally:
             self.waiters.pop(request_id, None)
 
-    async def _post_text(self, text):
-        for chunk in chunk_discord_text(text, max_chars=DISCORD_LIMIT,
-                                        max_lines=self.settings.max_lines):
-            await self.say(chunk)
-
     async def close(self):
         self._stop_typing()
         await self.link.close()
@@ -1052,6 +1240,10 @@ class LetsClawBot(discord.Client):
         super().__init__(intents=intents)
         self.settings = settings
         self.bridges = {}
+        # Serialises bridge creation only — see _bridge. Built here rather than
+        # lazily because two coroutines racing to build the lock is the same
+        # bug one step down.
+        self._bridge_lock = asyncio.Lock()
         self._core_http = None
         self._denied_at = {}
         self._sweeper = None
@@ -1221,13 +1413,19 @@ class LetsClawBot(discord.Client):
         """
         try:
             self._names = json.loads(NAMES_FILE.read_text())
-        except (OSError, ValueError):
+        except OSError:
+            self._names = {}
+        except ValueError as e:
+            # Unparseable, not absent: say so. Falling back to {} silently
+            # looks identical to a first run, and the next save overwrites the
+            # file — so the only evidence of the damage is this line.
+            logger.warning("the channel-name map at %s is unreadable (%s); "
+                           "starting from empty", NAMES_FILE, e)
             self._names = {}
 
     def _save_names(self):
         try:
-            NAMES_FILE.parent.mkdir(parents=True, exist_ok=True)
-            NAMES_FILE.write_text(json.dumps(self._names, indent=1))
+            paths.atomic_write(NAMES_FILE, json.dumps(self._names, indent=1))
         except OSError as e:
             # Losing this costs a rename being missed, never a conversation.
             logger.warning("could not save the channel-name map: %s", e)
@@ -1236,13 +1434,19 @@ class LetsClawBot(discord.Client):
         """The explicit channel → session map, as /session last left it."""
         try:
             self._maps = json.loads(MAPS_FILE.read_text())
-        except (OSError, ValueError):
+        except OSError:
+            self._maps = {}
+        except ValueError as e:
+            # Worse to lose than the name map: every channel pointed at a
+            # session by /session silently falls back to its default one.
+            logger.warning("the session map at %s is unreadable (%s); "
+                           "every channel falls back to its default session",
+                           MAPS_FILE, e)
             self._maps = {}
 
     def _save_maps(self):
         try:
-            MAPS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            MAPS_FILE.write_text(json.dumps(self._maps, indent=1))
+            paths.atomic_write(MAPS_FILE, json.dumps(self._maps, indent=1))
         except OSError as e:
             logger.warning("could not save the session map: %s", e)
 
@@ -1353,23 +1557,39 @@ class LetsClawBot(discord.Client):
         key = channel.id
         bridge = self.bridges.get(key)
         if bridge is None:
-            name = await self._resolve_session(channel, guild, user_id)
-            link = CoreLink(self.settings.core, name, self._core_http,
-                            token=self.settings.core_token)
-            bridge = ChannelBridge(channel, link, self.settings, owner=self)
-            link.on_event = bridge.handle
-            self.bridges[key] = bridge
-            link.start()
-            logger.info("channel %s → session %s", key, name)
-        else:
-            # Already attached (the channel is no longer idle-detached), so this
-            # is where a Discord channel rename is followed: keep the session
-            # name in step with the channel. Cheap when nothing changed — only
-            # an actual rename costs a core call.
-            name = await self._resolve_session(channel, guild, user_id)
-            if name != bridge.link.session:
-                bridge.link.session = name
-                logger.info("channel %s → session %s (renamed)", key, name)
+            # Serialised, and the test repeated inside the lock. _resolve_session
+            # awaits the core, so without this two things arriving together in a
+            # cold channel — a slash command and a typed message, or two members
+            # at once — both saw no bridge and both built one. The second
+            # overwrote the first in the dict, which left the first's CoreLink
+            # started and attached with nobody holding it: two sockets on one
+            # session, every answer posted to the channel twice, and one of them
+            # unreachable by close() for the life of the process.
+            async with self._bridge_lock:
+                bridge = self.bridges.get(key)
+                if bridge is None:
+                    name = await self._resolve_session(channel, guild, user_id)
+                    link = CoreLink(self.settings.core, name, self._core_http,
+                                    token=self.settings.core_token)
+                    bridge = ChannelBridge(channel, link, self.settings, owner=self)
+                    link.on_event = bridge.handle
+                    link.on_drop = bridge.dropped
+                    # Listed last, and only once it is fully built: a
+                    # half-built bridge must never be visible under its key.
+                    self.bridges[key] = bridge
+                    link.start()
+                    logger.info("channel %s → session %s", key, name)
+                    bridge.link.touch()
+                    return bridge
+
+        # Already attached (the channel is no longer idle-detached), so this is
+        # where a Discord channel rename is followed: keep the session name in
+        # step with the channel. Cheap when nothing changed — only an actual
+        # rename costs a core call.
+        name = await self._resolve_session(channel, guild, user_id)
+        if name != bridge.link.session:
+            bridge.link.session = name
+            logger.info("channel %s → session %s (renamed)", key, name)
         bridge.link.touch()
         return bridge
 
@@ -1527,18 +1747,33 @@ class LetsClawBot(discord.Client):
             return
 
         # An outstanding rollover question takes precedence: while one is up,
-        # a bare yes/no is an answer to it rather than a new turn.
-        if bridge.pending_ask and text.strip().lower() in (YES | NO):
-            request_id, bridge.pending_ask = bridge.pending_ask, None
-            await bridge.link.rollover_reply(request_id,
-                                             text.strip().lower() in YES)
-            return
+        # a bare yes/no is an answer to it rather than a new turn. Expired
+        # questions are not outstanding — see take_pending_ask.
+        if text.strip().lower() in (YES | NO):
+            request_id = bridge.take_pending_ask()
+            if request_id is not None:
+                if not await bridge.link.rollover_reply(
+                        request_id, text.strip().lower() in YES):
+                    # Put it back: the core never heard the answer, so the
+                    # question is still open and the next yes/no belongs to
+                    # it. Dropping the id here left the user's "yes" nowhere
+                    # and the question unanswerable.
+                    bridge.pending_ask = request_id
+                    await bridge.say("⚠️ could not reach the core with that "
+                                     "answer — the question is still open.")
+                return
 
         body = _command_body(text)
         if body is not None:
             await self._command(bridge, body, message)
             return
-        await bridge.link.submit(text, origin=f"discord:{message.author.name}")
+        # The headline of this whole class of bug: a turn typed while the link
+        # was down went nowhere, with no reply and no error, and the channel
+        # looked exactly as it does when the model is thinking.
+        if not await bridge.link.submit(text,
+                                        origin=f"discord:{message.author.name}"):
+            await bridge.say("⚠️ could not reach the core — that message was "
+                             "not sent. Try again in a moment.")
 
     # -- slash commands --
 
@@ -1578,8 +1813,27 @@ class LetsClawBot(discord.Client):
             else:
                 await self.show_model_picker(interaction)
 
+        def _may_autocomplete(interaction):
+            """The allowlist check the two autocompletes were missing.
+
+            Every other interaction path checks discord.users; these did not,
+            so anyone who could see the command could read back the configured
+            model names and — worse — the session list, which carries
+            `discord-dm-<id>` entries and so discloses who has DMed the bot.
+            Returning nothing is the right refusal here: autocomplete fires on
+            every keystroke, so a spoken one would both spam the channel and
+            confirm the command exists.
+            """
+            if interaction.user.id in self.settings.users:
+                return True
+            logger.debug("autocomplete refused for %s (%s) — not on discord.users",
+                         interaction.user, interaction.user.id)
+            return False
+
         @_model.autocomplete("name")
         async def _model_autocomplete(interaction: discord.Interaction, current: str):
+            if not _may_autocomplete(interaction):
+                return []
             current = (current or "").lower()
             return [app_commands.Choice(name=n, value=n)
                     for n in await self.model_names()
@@ -1595,17 +1849,22 @@ class LetsClawBot(discord.Client):
         @_session.autocomplete("name")
         async def _session_autocomplete(interaction: discord.Interaction,
                                         current: str):
+            if not _may_autocomplete(interaction):
+                return []
             current = (current or "").lower()
             names = await self.session_names()
             if not current:
                 choices = [app_commands.Choice(name="auto (the default)", value="auto")]
             else:
                 choices = []
+            # Discord rejects a reply with more than 25 choices outright, so the
+            # cap belongs on the whole list — bound to the second comprehension
+            # alone it lets "auto" push the total to 26.
             return ([c for c in choices
                      if c.name.lower().startswith(current)
                      or c.value.lower().startswith(current)]
                     + [app_commands.Choice(name=n, value=n) for n in names
-                       if current in n.lower()][:25])
+                       if current in n.lower()])[:25]
 
         @tree.command(name="ask",
                       description="ask letsClaw something (same as just typing)")
@@ -1680,18 +1939,29 @@ class LetsClawBot(discord.Client):
         user = interaction.user
 
         if name is None:                          # /ask — an ordinary turn
-            await bridge.link.submit(args, origin=f"discord:{user.name}")
-            await interaction.followup.send(f"**{user.display_name}:** "
-                                            f"{_one_line(args)[:1500]}")
+            # Echoed only once the core has it. The echo used to go out
+            # regardless, so a /ask sent while the link was down showed the
+            # asker their own question in the channel as though it had been
+            # put to the model, and then nothing ever came back.
+            if not await bridge.link.submit(args, origin=f"discord:{user.name}"):
+                await _followup(interaction, "⚠️ the core did not take that — "
+                                             "the link is down. Nothing was sent.")
+                return
+            await _followup(interaction, f"**{user.display_name}:** "
+                                         f"{_one_line(args)[:1500]}")
             return
         if name == "stop":
-            await bridge.link.stop()
-            await interaction.followup.send("_⏹ stop sent_")
+            # Same: "stop sent" has to mean it was.
+            if not await bridge.link.stop():
+                await _followup(interaction, "⚠️ could not reach the core — "
+                                             "nothing was stopped.")
+                return
+            await _followup(interaction, "_⏹ stop sent_")
             return
 
         event = await bridge.run_command(name, args)
         if event is None:
-            await interaction.followup.send("_⚠️ the core did not answer in time._")
+            await _followup(interaction, "_⚠️ the core did not answer in time._")
             return
         # Several commands answer with a broadcast rather than a reply — the
         # channel already has the real news, so this only has to close the
@@ -1701,23 +1971,31 @@ class LetsClawBot(discord.Client):
                                     max_lines=self.settings.max_lines)
         unlimited = self.settings.max_messages == MAX_MESSAGES_UNLIMITED
         if unlimited or len(chunks) <= self.settings.max_messages:
-            for chunk in chunks:
-                await interaction.followup.send(chunk)
+            for i, chunk in enumerate(chunks):
+                if not await _followup(interaction, chunk):
+                    # The rest would go missing in silence otherwise, exactly
+                    # as _post_text guards against on the channel side.
+                    await _followup(
+                        interaction,
+                        f"_…Discord refused message {i + 1} of {len(chunks)}; "
+                        f"the full reply is attached._",
+                        file=io.BytesIO(text.encode("utf-8")))
+                    return
             return
         # Capped: send as much as fits, and attach the rest rather than drop it.
         for chunk in chunks[:self.settings.max_messages]:
-            await interaction.followup.send(chunk)
-        rest = text  # the whole thing, unchunked, so the Markdown is intact
-        data = io.BytesIO(rest.encode("utf-8"))
-        try:
-            await interaction.followup.send(
+            if not await _followup(interaction, chunk):
+                break
+        # The whole thing, unchunked, so the Markdown is intact.
+        if not await _followup(
+                interaction,
                 f"_…{len(chunks) - self.settings.max_messages} more messages "
                 f"worth — the full answer is attached._",
-                file=discord.File(data, filename="answer.md"))
-        except discord.HTTPException as e:
-            logger.warning("session %s: could not attach the command answer (%s)",
-                           bridge.link.session, e)
-            await interaction.followup.send("_…the rest of the answer would not upload._")
+                file=io.BytesIO(text.encode("utf-8"))):
+            logger.warning("session %s: could not attach the command answer",
+                           bridge.link.session)
+            await _followup(interaction,
+                            "_…the rest of the answer would not upload._")
 
     # -- text commands --
 
@@ -1738,12 +2016,18 @@ class LetsClawBot(discord.Client):
                              "shows what the turn cost._")
             return
         if name == "stop":
-            await bridge.link.stop()
+            # A `!stop` that never left the machine used to look exactly like
+            # one the core ignored: no reply either way. Say which it was.
+            if not await bridge.link.stop():
+                await bridge.say("⚠️ could not reach the core — nothing was "
+                                 "stopped.")
             return
         if name == "session":
             await self._session_text(bridge, args.strip(), message)
             return
-        await bridge.link.command(name, args.strip())
+        if not await bridge.link.command(name, args.strip()):
+            await bridge.say(f"⚠️ could not reach the core — `!{name}` was "
+                             f"not sent.")
 
     async def _session_text(self, bridge, args, message):
         """!session [name] — the text form of the slash command.
