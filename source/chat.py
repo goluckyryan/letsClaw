@@ -34,7 +34,8 @@ except ImportError:
 
 import aiohttp
 
-from core import PROTOCOL_VERSION, known_models, load_config
+from config import known_models, load_config
+from core import PROTOCOL_VERSION
 from ui import thinking_indicator
 
 PROMPT = "👤 "

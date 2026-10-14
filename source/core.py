@@ -30,7 +30,7 @@ from pathlib import Path
 import yaml
 
 import behavior
-import config
+import config as configlib
 import config_edit
 import paths
 import session as store
@@ -114,46 +114,6 @@ def api_messages(history):
     keys could surface it in the answer.
     """
     return [{k: v for k, v in m.items() if k != "at"} for m in history]
-
-
-# Moved to config_edit.py, which is where the webui-block editing now lives.
-# Re-exported under the old private names so importers and tests that reach for
-# core._yaml_scalar keep working; they are updated in a follow-up commit.
-_THEME_KEY_RE = config_edit._THEME_KEY_RE
-_PIN_KEY_RE = config_edit._PIN_KEY_RE
-_yaml_scalar = config_edit.yaml_scalar
-_comment_start = config_edit.comment_start
-_revalue = config_edit.revalue
-
-
-
-# Moved to config.py, which now owns everything between config.yaml and an
-# engine. Re-exported so `from core import load_config` and server.py's
-# core.known_models keep working; importers are updated in a follow-up commit.
-CONFIG_PATH = config.CONFIG_PATH
-DEFAULT_CONTEXT_LENGTH = config.DEFAULT_CONTEXT_LENGTH
-DEFAULT_ANSWER_TIME_RESERVE = config.DEFAULT_ANSWER_TIME_RESERVE
-PIN_KEYS = config.PIN_KEYS
-load_config = config.load_config
-known_models = config.known_models
-build_engine = config.build_engine
-build_all_engines = config.build_all_engines
-diff_config = config.diff_config
-config_theme = config.config_theme
-config_pin = config.config_pin
-valid_pin_value = config.valid_pin_value
-_int_or = config.int_or
-
-# Moved to behavior.py along with the cache that reads them.
-DEFAULT_BASE_FILE = behavior.DEFAULT_BASE_FILE
-CONCLUDE_MARKER = behavior.CONCLUDE_MARKER
-CONCLUDE_FALLBACK = behavior.CONCLUDE_FALLBACK
-CHECKPOINT_MARKER = behavior.CHECKPOINT_MARKER
-CHECKPOINT_FALLBACK = behavior.CHECKPOINT_FALLBACK
-strip_directive_sections = behavior.strip_directive_sections
-extract_directive = behavior.extract_directive
-extract_conclude_directive = behavior.extract_conclude_directive
-extract_checkpoint_directive = behavior.extract_checkpoint_directive
 
 
 class Subscriber:
@@ -271,7 +231,7 @@ class Session:
         # rollover_at_percent's documented `0 = never` — and matching what the
         # code accidentally did before, since history[-0:] is the whole list,
         # not the empty one the number literally asks for.
-        self.max_history = _int_or(conv.get("max_history_messages", 100), 100)
+        self.max_history = configlib.int_or(conv.get("max_history_messages", 100), 100)
         # Per session, never on the shared config dict: a session that disables
         # its own rollover must not disable everyone else's.
         self.rollover_pct = int(conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0)
@@ -390,8 +350,8 @@ class Session:
                   model=self.model_name,
                   budget=self.budget,
                   busy=self.busy,
-                  theme=config_theme(self.config),
-                  pin=config_pin(self.config),
+                  theme=configlib.config_theme(self.config),
+                  pin=configlib.config_pin(self.config),
                   messages=[m for m in self.history if m.get("role") != "system"],
                   rollover={"mode": self.rollover_mode, "percent": self.rollover_pct,
                             "count": self.rollover_count},
@@ -402,7 +362,7 @@ class Session:
 
     @property
     def budget(self):
-        return getattr(self.engine, "context_length", DEFAULT_CONTEXT_LENGTH)
+        return getattr(self.engine, "context_length", configlib.DEFAULT_CONTEXT_LENGTH)
 
     @property
     def busy(self):
@@ -575,8 +535,8 @@ class Session:
                          text=f"model '{self.model_name}' is no longer in the config — "
                               f"this session keeps using it, but /model cannot return to it"))
         self.emit(ev("session_state", what="reloaded", model=self.model_name,
-                     budget=self.budget, theme=config_theme(self.config),
-                     pin=config_pin(self.config), changed=blob["changed"]))
+                     budget=self.budget, theme=configlib.config_theme(self.config),
+                     pin=configlib.config_pin(self.config), changed=blob["changed"]))
 
     # ---- the journal -----------------------------------------------------
 
@@ -1341,7 +1301,7 @@ class Session:
         # Thinking must stop early enough that the closing round still fits
         # inside the turn wall that run_turn already holds us to.
         wall = self.engine.turn_timeout
-        reserve = getattr(self.engine, "answer_time_reserve", DEFAULT_ANSWER_TIME_RESERVE)
+        reserve = getattr(self.engine, "answer_time_reserve", configlib.DEFAULT_ANSWER_TIME_RESERVE)
         think_deadline = (turn_t0 + max(0, wall - reserve)) if wall else None
 
         transport = await self.engine.resume_transport()
@@ -1780,7 +1740,7 @@ class Session:
                     "session_behavior": self.session_behavior or ""}
         if name == "models":
             return {"ok": True, "current": self.model_name,
-                    "configured": known_models(self.config)}
+                    "configured": configlib.known_models(self.config)}
         if name == "reload":
             # Manager-level, and deliberately outside the turn lock: reload defers
             # any session that is busy, so taking the lock here would have it defer
@@ -1858,7 +1818,7 @@ class Session:
                 target = args.strip()
                 if not target:
                     return {"ok": True, "current": self.model_name,
-                            "configured": known_models(self.config)}
+                            "configured": configlib.known_models(self.config)}
                 try:
                     await self.use_model(target)
                 except ValueError as e:
@@ -1906,7 +1866,7 @@ class SessionManager:
         self.config = config
         # Where config came from, so /reload re-reads the file actually in use
         # rather than the default when --config pointed somewhere else.
-        self.config_path = Path(config_path or CONFIG_PATH)
+        self.config_path = Path(config_path or configlib.CONFIG_PATH)
         self.sessions = {}
         self._engines = {}
         self.behaviors = behavior.BehaviorStore(self.config)
@@ -1964,7 +1924,7 @@ class SessionManager:
                         f"model '{name}' is unreachable — {e} — the ssh path "
                         "is down (jump host or far side); the keepalive is "
                         "retrying, try again in a moment") from e
-                self._engines[name] = build_engine(self.config, name, forward=fwd)
+                self._engines[name] = configlib.build_engine(self.config, name, forward=fwd)
             return self._engines[name]
 
     def retire_engine(self, engine):
@@ -2126,7 +2086,7 @@ class SessionManager:
         # to iterate them even when plan() never ran (the file failed to parse).
         added, removed = {}, {}
         try:
-            fresh = await asyncio.to_thread(load_config, path)
+            fresh = await asyncio.to_thread(configlib.load_config, path)
             # Plan the forward diff and make the additions visible BEFORE the
             # engine validation, so a new ssh_forward model's engine is built
             # pointing at its (already port-assigned) forward. The validator
@@ -2135,7 +2095,7 @@ class SessionManager:
             # never half-changed.
             added, removed = self.forwards.plan(fresh)
             self.forwards.stage(added)
-            engines = build_all_engines(fresh, self.forwards)
+            engines = configlib.build_all_engines(fresh, self.forwards)
         except (OSError, ValueError, yaml.YAMLError, RuntimeError) as e:
             # The validator did not start the staged forwards, but the keepalive
             # may have brought one up in the meantime — close them so a refused
@@ -2147,7 +2107,7 @@ class SessionManager:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
         old_cfg = copy.deepcopy(self.config)
-        changed = diff_config(old_cfg, fresh)
+        changed = configlib.diff_config(old_cfg, fresh)
         # The behavior files are not in the config, so diff_config cannot see an
         # edited base.md or sessions/<name>.md. Refreshing the cache here is what
         # makes the edit available; it is NOT applied to any live window.
@@ -2203,8 +2163,8 @@ class SessionManager:
         scalars = [
             ("max_tool_rounds", int(old_tools.get("max_iterations", 8)),
                                 int(new_tools.get("max_iterations", 8))),
-            ("max_history", _int_or(old_conv.get("max_history_messages", 100), 100),
-                            _int_or(new_conv.get("max_history_messages", 100), 100)),
+            ("max_history", configlib.int_or(old_conv.get("max_history_messages", 100), 100),
+                            configlib.int_or(new_conv.get("max_history_messages", 100), 100)),
             ("rollover_pct", int(old_conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0),
                              int(new_conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0)),
             ("rollover_mode", str(old_conv.get("rollover_mode", DEFAULT_ROLLOVER_MODE)).lower(),
@@ -2300,12 +2260,12 @@ class SessionManager:
             return {"ok": False, "error": "webui.pin must be a mapping"}
         values = {}
         if "theme" in webui:
-            values["theme"] = _yaml_scalar(webui["theme"])
+            values["theme"] = config_edit.yaml_scalar(webui["theme"])
         if isinstance(pin, dict):
             for k, v in pin.items():
                 if isinstance(v, (dict, list)):
                     return {"ok": False, "error": f"webui.pin.{k} must be a scalar"}
-                if not valid_pin_value(v):
+                if not configlib.valid_pin_value(v):
                     # Refused here rather than sanitised: a value that needs
                     # characters this rejects is not a colour or a length, and
                     # quietly rewriting what the user typed would be worse than
@@ -2313,7 +2273,7 @@ class SessionManager:
                     return {"ok": False, "error": (
                         f"webui.pin.{k} is not a usable CSS value — letters, "
                         "digits, spaces and  # % . , ( ) + - _  only")}
-                values[f"pin.{k}"] = _yaml_scalar(v)
+                values[f"pin.{k}"] = config_edit.yaml_scalar(v)
 
         try:
             text = self.config_path.read_text()

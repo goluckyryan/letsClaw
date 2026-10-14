@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
+import config as configlib
 import core
 import paths
 
@@ -146,7 +147,7 @@ async def models(request):
     cfg = request.app["config"]
     return web.json_response({
         "default": cfg.get("models", {}).get("default_model"),
-        "configured": core.known_models(cfg),
+        "configured": configlib.known_models(cfg),
         "forwards": request.app["mgr"].forwards.status(),
     })
 
@@ -297,12 +298,12 @@ def _theme_css(config):
     (applyPin in app.js), because a browser will not re-fetch this stylesheet
     on its own.
     """
-    pin = core.config_pin(config)
+    pin = configlib.config_pin(config)
     lines = ["/* generated from config.yaml — webui.pin; /reload re-themes */", ":root {"]
-    for key in core.PIN_KEYS:
+    for key in configlib.PIN_KEYS:
         if key not in pin:
             continue
-        if not core.valid_pin_value(pin[key]):
+        if not configlib.valid_pin_value(pin[key]):
             # Hand-edited into config.yaml, or saved before save_webui checked.
             # Dropping the one property is the entire cost of refusing it;
             # serving it would put attacker-chosen CSS on an unauthenticated
@@ -662,7 +663,7 @@ def main():
     ap.add_argument("--config")
     args = ap.parse_args()
     try:
-        config = core.load_config(args.config)
+        config = configlib.load_config(args.config)
     except (FileNotFoundError, Exception) as e:
         print(f"❌ {e}")
         sys.exit(1)
@@ -686,7 +687,7 @@ def main():
     print(f"🧠 letsClaw core on ws://{bind}:{port}/ws  (proto {core.PROTOCOL_VERSION})")
     if (WEB_DIR / "index.html").exists():
         print(f"   WebUI:  http://{_webui_host(bind)}:{port}/")
-    print(f"   models: {', '.join(core.known_models(config)) or '(none)'}")
+    print(f"   models: {', '.join(configlib.known_models(config)) or '(none)'}")
     if bind not in LOOPBACK:
         print("   ⚠️  not bound to loopback — tools are unconfined, so anyone who can "
               "reach this port can run shell commands here")

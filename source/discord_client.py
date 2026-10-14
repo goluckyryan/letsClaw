@@ -69,7 +69,8 @@ except ImportError:                                    # pragma: no cover
 
 import paths
 from chunker import chunk_discord_text
-from core import PROTOCOL_VERSION, load_config
+from config import load_config
+from core import PROTOCOL_VERSION
 
 logger = logging.getLogger("letclaw.discord")
 
