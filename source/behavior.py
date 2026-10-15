@@ -104,7 +104,13 @@ def extract_directive(base_behavior, marker, fallback):
             continue
         para.append(line)
     text = "\n".join(para).strip()
-    return text or CONCLUDE_FALLBACK
+    # `fallback`, not CONCLUDE_FALLBACK: this function serves both directives,
+    # and the hard-coded name sent the *conclusion* text whenever the heading
+    # was present with an empty section under it. The two are opposites at
+    # opposite moments — "stop and answer" where "write down what you have and
+    # carry on" was meant — and the caller that was wrong about it is the one
+    # nobody watches, since pad compaction is off by default.
+    return text or fallback
 
 
 class BehaviorStore:
