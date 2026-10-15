@@ -146,9 +146,12 @@ class Subscriber:
 def settled(history):
     """A copy of `history` with any unfinished trailing turn rolled back.
 
-    What goes to disk should be a conversation someone could pick up, and the
-    process can go down at any point in a turn — the turn tasks are not joined
-    on shutdown. Three shapes mean "this turn did not finish":
+    What goes to disk should be a conversation someone could pick up, and a
+    turn can stop part-way through. close() does cancel the turn tasks and wait
+    for them, but only for CLOSE_TURN_GRACE: a turn blocked on a model that
+    stopped answering outlives that and is abandoned mid-shape. And nothing is
+    joined at all when the process does not get to run close() — a kill -9, an
+    OOM, a power cut. Three shapes mean "this turn did not finish":
 
       assistant with tool_calls   no results came back
       role="tool"                 results whose asking turn is being unwound
@@ -224,7 +227,13 @@ class Session:
         self.schemas = []
         self.tools_tok = 0
 
-        self.max_tool_rounds = int(config.get("tools", {}).get("max_iterations", 8))
+        # int_or, not int: this runs on every session creation, so a config
+        # that says `max_iterations: eight` would not fail once and loudly at
+        # startup — it would fail here, for every session anyone tries to open,
+        # for the life of the process, with /reload unable to help because the
+        # value is already committed. See reload() for the other half of this.
+        self.max_tool_rounds = configlib.int_or(
+            (config.get("tools") or {}).get("max_iterations", 8), 8)
         # int() because YAML gives a string for `max_history_messages: "50"`,
         # and `len(history) > "50"` raises on 3.x rather than comparing.
         # 0 (or a negative, or junk) means "never trim", matching
@@ -234,7 +243,7 @@ class Session:
         self.max_history = configlib.int_or(conv.get("max_history_messages", 100), 100)
         # Per session, never on the shared config dict: a session that disables
         # its own rollover must not disable everyone else's.
-        self.rollover_pct = int(conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0)
+        self.rollover_pct = self._configured_rollover_pct()
         self.rollover_mode = str(conv.get("rollover_mode", DEFAULT_ROLLOVER_MODE)).lower()
         if self.rollover_mode not in ("auto", "ask", "off"):
             logger.warning("session %s: bad rollover_mode %r, using auto",
@@ -243,7 +252,7 @@ class Session:
         # Roll over before a turn that has no room left to think in, rather than
         # after one whose thinking was squeezed out. Auto mode only.
         self.rollover_before_think = bool(conv.get("rollover_before_think", True))
-        self.prompt_timeout = int(conv.get("prompt_timeout", 60))
+        self.prompt_timeout = configlib.int_or(conv.get("prompt_timeout", 60), 60)
         self.declined_at = None
         self.warned_over = False
         # Everything this session has ever asked the model to generate. An
@@ -394,6 +403,22 @@ class Session:
         measurement of what is in the window now, or None.
         """
         return self._last_used if self._last_used is not None else self.estimate()
+
+    def _configured_rollover_pct(self):
+        """What the config says this session's rollover threshold should be.
+
+        Read back rather than remembered because rollover_pct is also a
+        runtime brake: _after_turn zeroes it when a *fresh* window already
+        exceeds the threshold, since rolling over again would archive an empty
+        conversation and hit the same wall immediately. That brake is tied to
+        the window that tripped it, so the commands that throw the window away
+        (/clear, /new) ask here for the configured value again instead of
+        leaving automatic rollover off for the life of the session.
+        """
+        conv = self.config.get("conversation", {})
+        return configlib.int_or(
+            conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0,
+            DEFAULT_ROLLOVER_PCT)
 
     def fresh_history(self, carryover=""):
         """System message: the three behavior layers, then the carryover.
@@ -626,16 +651,26 @@ class Session:
         # A file written before session_id existed has none; the one minted in
         # __init__ stands and is persisted on the next save.
         self.session_id = payload.get("session_id") or self.session_id
-        self.last_seq = int(payload.get("last_seq") or 0)
+        # int_or throughout: this is a file on disk, and a torn write or a
+        # hand-edit makes any of these a string or None. restore() walks every
+        # session in state/live, so one unparseable number raising here would
+        # cost not just its own conversation but every one after it in the
+        # directory listing. A bad field is worth a log line and a default.
+        self.last_seq = configlib.int_or(payload.get("last_seq") or 0, 0)
         self._seq = itertools.count(self.last_seq + 1)
-        self.turn_id = int(payload.get("turn_id") or 0)
+        self.turn_id = configlib.int_or(payload.get("turn_id") or 0, 0)
         if payload.get("rollover_pct") is not None:
-            self.rollover_pct = int(payload["rollover_pct"])
+            self.rollover_pct = configlib.int_or(payload["rollover_pct"],
+                                                 self.rollover_pct)
         self.declined_at = payload.get("declined_at")
         self.warned_over = bool(payload.get("warned_over"))
-        self._last_used = payload.get("last_used")
-        self.total_output = int(payload.get("total_output") or 0)
-        self.rollover_count = int(payload.get("rollover_count") or 0)
+        # None stays None — "not measured" is a real state here, distinct from
+        # zero — but anything else has to be a number, because used() hands it
+        # straight to the arithmetic behind the context gauge.
+        last_used = payload.get("last_used")
+        self._last_used = None if last_used is None else configlib.int_or(last_used, None)
+        self.total_output = configlib.int_or(payload.get("total_output") or 0, 0)
+        self.rollover_count = configlib.int_or(payload.get("rollover_count") or 0, 0)
         self._persisted = True
 
     # ---- the turn --------------------------------------------------------
@@ -885,10 +920,20 @@ class Session:
                 reason_pending.clear()
                 reason_tok = max(reason_tok, count_text("".join(reasoning_parts)))
                 push_reasoning_stat(time.monotonic())
-            out_estimated += count_text(result.text or "") + count_text(result.reasoning or "")
-            for tc in result.tool_calls or []:
-                out_estimated += (count_text(tc.get("name") or "")
-                                  + count_text(tc.get("arguments") or ""))
+            # Only for a round the server did NOT report, so the two counters
+            # partition the rounds instead of overlapping. Their sum is then
+            # the best figure available for the turn whatever the mix: exact
+            # where the server spoke, estimated only where it did not. Adding
+            # an estimate for every round — as this did — meant a turn where
+            # three rounds of five reported had to throw all three exact
+            # numbers away and estimate the lot, because the total was no
+            # longer a sum of anything.
+            if result.completion_tokens is None:
+                out_estimated += (count_text(result.text or "")
+                                  + count_text(result.reasoning or ""))
+                for tc in result.tool_calls or []:
+                    out_estimated += (count_text(tc.get("name") or "")
+                                      + count_text(tc.get("arguments") or ""))
 
         async def call_round(tools=None, overrides=None, pad=None, closing=False,
                              extra_messages=None):
@@ -1153,7 +1198,15 @@ class Session:
                     had_error = False
                 except Exception as e2:
                     self.emit(ev("error", msg=f"{type(e2).__name__}: {e2}", fatal=False))
-                    self.history.pop()  # drop the user message that never landed
+                    # repair_history(), not history.pop(): the comment this
+                    # replaces asserted the last entry is the user message, and
+                    # it need not be. A /steering that arrived while the first
+                    # attempt was in flight has already been appended, so the
+                    # pop took the steering line and left the unanswered user
+                    # message behind — the one shape settled() exists to
+                    # prevent, and the one the server 400s on. settled() unwinds
+                    # the whole unfinished turn instead of guessing its length.
+                    self.repair_history()
                     return
 
         # The closing round is the one round a /steering cannot interrupt and has no
@@ -1171,10 +1224,13 @@ class Session:
         if reason_pending:
             push_reasoning_stat(time.monotonic(), flush=True)
 
-        # The server's figure only if every round supplied one: a partial sum is
-        # worse than the estimate, because it looks exact while missing rounds.
+        # The two counters partition the rounds (see tally), so their sum is the
+        # figure however the rounds split. out_exact is about how to *label* it,
+        # not how to compute it: "measured" is a claim that every round supplied
+        # a number, and a mixed turn must not make that claim — it renders with
+        # the ~ prefix below and sets output_measured=False on the event.
         out_exact = rounds > 0 and out_reported == rounds
-        out_tok = out_measured if out_exact else out_estimated
+        out_tok = out_measured + out_estimated
         # Counted before the branches, so a turn that errored out after two good
         # rounds still records what those rounds generated. Rounds that never
         # returned never reached tally(), so they contribute nothing.
@@ -1544,6 +1600,14 @@ class Session:
             while rest and rest[0]["role"] == "tool":
                 rest = rest[1:]  # never open on an orphaned tool result
             self.history = system + rest
+            # The window just got smaller, so the measured size no longer
+            # describes it. used() documents _last_used as "the size of the
+            # *current* window, or None" and every other path that reshapes the
+            # history honours that; leaving it set here would have the next
+            # headroom check read a trimmed window as the full one it used to
+            # be, and roll over — archiving and dropping a window to relieve
+            # pressure that the trim had already relieved.
+            self._last_used = None
 
     async def _maybe_roll(self, used, trip):
         pct = used * 100 // self.budget if self.budget else 0
@@ -1608,6 +1672,10 @@ class Session:
         conversation away anyway — so the one failure the ordering exists to
         survive was the one that lost everything. Now it aborts, and the window
         it could not archive is still there to try again.
+
+        The mirror of that: once the archive *has* been written, the window is
+        replaced even if this is cancelled part-way through, so the same
+        messages are never archived twice.
         """
         self.rollover_count += 1
         used = used if used is not None else self.used_now()
@@ -1637,60 +1705,75 @@ class Session:
         # opens on the first turn of the fresh window.
         record = await self.close_journal()
 
-        # Three caps: the absolute one, a share of the window so a small model
-        # does not spend an eighth of its context on the summary for ever, and
-        # what is actually free right now.
-        summary_max = min(HANDOFF_MAX_TOKENS, self.budget // HANDOFF_WINDOW_SHARE,
-                          self.budget - used - HANDOFF_MARGIN)
+        # Past here the transcript is on disk and the journal segment is
+        # closed, so the old window has ended whether or not the rest of this
+        # runs. What is left — summarise, append, re-read the behavior file —
+        # is all optional polish on the new window, and all of it awaits. A
+        # cancellation in the middle of it (a stopped turn, a shutdown) used to
+        # leave self.history still holding the window that was just archived:
+        # the next turn tripped the same headroom check and archived the same
+        # messages again, under a second transcript. So the swap below runs on
+        # the way out of this block either way, and a cancellation costs the
+        # summary rather than duplicating the window.
         handoff = ""
-        if summary_max >= HANDOFF_MIN_TOKENS:
-            try:
-                handoff = await store.build_handoff(self.engine, self.history,
-                                                      max_tokens=summary_max,
-                                                      prior=self.carryover())
-            except Exception as e:
-                self.emit(ev("notice", level="warn",
-                             text=f"handoff failed ({e}) — carrying the last exchange only"))
-        else:
-            self.emit(ev("notice", level="warn",
-                         text="no headroom to summarise — carrying the last exchange only"))
-
         handoff_path = None
-        if handoff:
-            try:
-                handoff_path = await store.append_handoff(
-                    handoff, self.model_name, transcript, self.config, self.name,
-                    journal_path=record)
-            except OSError as e:
-                self.emit(ev("notice", level="warn", text=f"could not append handoff: {e}"))
+        try:
+            # Three caps: the absolute one, a share of the window so a small
+            # model does not spend an eighth of its context on the summary for
+            # ever, and what is actually free right now.
+            summary_max = min(HANDOFF_MAX_TOKENS,
+                              self.budget // HANDOFF_WINDOW_SHARE,
+                              self.budget - used - HANDOFF_MARGIN)
+            if summary_max >= HANDOFF_MIN_TOKENS:
+                try:
+                    handoff = await store.build_handoff(self.engine, self.history,
+                                                          max_tokens=summary_max,
+                                                          prior=self.carryover())
+                except Exception as e:
+                    self.emit(ev("notice", level="warn",
+                                 text=f"handoff failed ({e}) — carrying the last exchange only"))
+            else:
+                self.emit(ev("notice", level="warn",
+                             text="no headroom to summarise — carrying the last exchange only"))
 
-        # The prompt prefix is about to be replaced wholesale, so this is the
-        # cheap moment to pick up an edited behavior file: the KV cache the
-        # re-read would cost is being thrown away regardless.
-        await self.refresh_behavior()
+            if handoff:
+                try:
+                    handoff_path = await store.append_handoff(
+                        handoff, self.model_name, transcript, self.config, self.name,
+                        journal_path=record)
+                except OSError as e:
+                    self.emit(ev("notice", level="warn", text=f"could not append handoff: {e}"))
 
-        fresh = self.fresh_history(
-            store.format_carryover(handoff, transcript, journal_path=record))
-        tail = store.last_exchange(self.history)
-        if tail and (not trip or self.estimate(fresh + tail) < trip):
-            fresh += tail
-        elif tail:
-            self.emit(ev("notice", level="warn",
-                         text="dropped the carried exchange — it would not fit"))
-        self.history = fresh
-        # Measured against the window that just ended. Keeping it would have
-        # used_now() report a full window to the next turn's headroom check,
-        # which would roll over again at once — and again after that.
-        self._last_used = None
-        # handoff is the file's path; handoff_text is the summary itself, so a
-        # client can show the user what the compaction kept without opening it.
-        self.emit(ev("rollover_done",
-                     transcript=str(transcript) if transcript else None,
-                     record=str(record) if record else None,
-                     handoff=str(handoff_path) if handoff_path else None,
-                     handoff_text=handoff or None,
-                     used=self.estimate(), budget=self.budget,
-                     count=self.rollover_count))
+            # The prompt prefix is about to be replaced wholesale, so this is
+            # the cheap moment to pick up an edited behavior file: the KV cache
+            # the re-read would cost is being thrown away regardless.
+            await self.refresh_behavior()
+        finally:
+            fresh = self.fresh_history(
+                store.format_carryover(handoff, transcript, journal_path=record))
+            tail = store.last_exchange(self.history)
+            if tail and (not trip or self.estimate(fresh + tail) < trip):
+                fresh += tail
+            elif tail:
+                self.emit(ev("notice", level="warn",
+                             text="dropped the carried exchange — it would not fit"))
+            self.history = fresh
+            # Measured against the window that just ended. Keeping it would
+            # have used_now() report a full window to the next turn's headroom
+            # check, which would roll over again at once — and again after that.
+            self._last_used = None
+            # handoff is the file's path; handoff_text is the summary itself,
+            # so a client can show the user what the compaction kept without
+            # opening it. Emitted from the finally with the rest: a client that
+            # saw rollover_start has to see the window close even when the turn
+            # carrying it was stopped.
+            self.emit(ev("rollover_done",
+                         transcript=str(transcript) if transcript else None,
+                         record=str(record) if record else None,
+                         handoff=str(handoff_path) if handoff_path else None,
+                         handoff_text=handoff or None,
+                         used=self.estimate(), budget=self.budget,
+                         count=self.rollover_count))
         return True
 
     # ---- commands --------------------------------------------------------
@@ -1762,6 +1845,7 @@ class Session:
                 await self.refresh_behavior()
                 self.history = self.fresh_history()
                 self.declined_at, self.warned_over = None, False
+                self.rollover_pct = self._configured_rollover_pct()
                 self._last_used = None
                 # /clear starts a new window as surely as a rollover does, it
                 # just does not summarise on the way. Leaving the segment open
@@ -1803,6 +1887,7 @@ class Session:
                 self.history = self.fresh_history()
                 self.declined_at, self.warned_over = None, False
                 self.rollover_count = 0
+                self.rollover_pct = self._configured_rollover_pct()
                 self._last_used = None
                 await self.close_journal()
                 files, freed = await store.purge_archives(self.session_id,
@@ -1891,6 +1976,9 @@ class SessionManager:
         # for a second attach to the same new name to slip through and build a
         # rival Session — see get() for what that cost.
         self._create_lock = asyncio.Lock()
+        # Serialises reload() against itself — see its docstring for what two
+        # overlapping runs do to the engine set and the forward table.
+        self._reload_lock = asyncio.Lock()
         # Engines a session stopped using after reload()'s own cleanup had
         # already run — see retire_engine. Drained at the next reload and at
         # close(); an entry here is a connection pool nobody is reading from.
@@ -2080,7 +2168,21 @@ class SessionManager:
         Restart-only settings are core.bind and core.port (the socket is already
         bound; rebinding would drop every client, which is the thing being
         avoided) and logging.file. Everything else is live.
+
+        Serialised against itself. There are three ways in — POST /reload, the
+        /reload command, and the end of save_webui — and roughly a dozen awaits
+        between reading the file and committing the result. Two overlapping
+        runs interleave at every one of them: both build an engine set, both
+        swap self._engines, and the one that finishes second closes, as
+        "unreferenced", the engines the first just handed to live sessions.
+        Likewise forwards.plan/stage/commit, which is a three-step read-modify-
+        write over shared state. Taking the lock here instead of inside keeps
+        the all-or-nothing failure path below intact.
         """
+        async with self._reload_lock:
+            return await self._reload(path)
+
+    async def _reload(self, path=None):
         path = path or self.config_path
         # Dictionaries, matching plan()'s return: the except block must be able
         # to iterate them even when plan() never ran (the file failed to parse).
@@ -2096,81 +2198,131 @@ class SessionManager:
             added, removed = self.forwards.plan(fresh)
             self.forwards.stage(added)
             engines = configlib.build_all_engines(fresh, self.forwards)
-        except (OSError, ValueError, yaml.YAMLError, RuntimeError) as e:
+
+            old_cfg = copy.deepcopy(self.config)
+            changed = configlib.diff_config(old_cfg, fresh)
+            # The behavior files are not in the config, so diff_config cannot
+            # see an edited base.md or sessions/<name>.md. Refreshing the cache
+            # here is what makes the edit available; it is NOT applied to any
+            # live window.
+            #
+            # history[0] is the prompt prefix every server has already
+            # tokenised. Rewriting it mid-conversation discards the KV cache for
+            # every live session at once, to deliver a change the session did
+            # not ask for at a moment it did not choose. So a reload moves
+            # settings — engine, tools, scalars, directives — and leaves the
+            # window alone. The edited file lands at the next rollover, /clear
+            # or /new, each of which rebuilds that prefix anyway and re-reads on
+            # the way through.
+            refreshed = await self.refresh_behaviors()
+
+            # Everything below reads `fresh` and can refuse it, so all of it
+            # sits above the commit. Building the tools and reading the base
+            # file used to happen *after* self.config had been replaced, which
+            # meant a config this code choked on was already the running one:
+            # the exception escaped reload(), POST /reload answered 500, and
+            # the manager was left holding settings it had just rejected, with
+            # /reload unable to undo it because /reload is what set it.
+            base_behavior = await asyncio.to_thread(
+                self.behaviors.read,
+                (fresh.get("behavior") or {}).get("base_file")
+                or behavior.DEFAULT_BASE_FILE)
+            tools_cfg = fresh.get("tools") or {}
+            workdir = tools_cfg.get("workdir") or str(paths.REPO_ROOT)
+            from tools import build_tools
+            new_tools_list = build_tools(tools_cfg, workdir=workdir)
+            new_schemas = [t.spec for t in new_tools_list]
+            new_tools_tok = count_tools(new_schemas)
+        # TypeError/AttributeError/KeyError alongside the rest: a half-finished
+        # edit does not only mangle values, it mangles shapes. `tools:` left
+        # with nothing under it is None, `conversation:` typed as a list is a
+        # list, and either one meets a .get() somewhere above. That is a config
+        # to refuse with a message, not a traceback out of a reload.
+        except (OSError, ValueError, TypeError, AttributeError, KeyError,
+                yaml.YAMLError, RuntimeError) as e:
             # The validator did not start the staged forwards, but the keepalive
             # may have brought one up in the meantime — close them so a refused
             # reload leaves nothing running.
             for fwd in added.values():
                 await fwd.close()
-            self.forwards.unstage(added)
+            # `removed` too: on a replacement the name in `added` is covering the
+            # running forward in `removed`, and unstage() has to put that one back
+            # rather than delete the entry. See SSHForwardManager.unstage.
+            self.forwards.unstage(added, removed)
             logger.warning("config reload refused: %s", e)
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-        old_cfg = copy.deepcopy(self.config)
-        changed = configlib.diff_config(old_cfg, fresh)
-        # The behavior files are not in the config, so diff_config cannot see an
-        # edited base.md or sessions/<name>.md. Refreshing the cache here is what
-        # makes the edit available; it is NOT applied to any live window.
-        #
-        # history[0] is the prompt prefix every server has already tokenised.
-        # Rewriting it mid-conversation discards the KV cache for every live
-        # session at once, to deliver a change the session did not ask for at a
-        # moment it did not choose. So a reload moves settings — engine, tools,
-        # scalars, directives — and leaves the window alone. The edited file
-        # lands at the next rollover, /clear or /new, each of which rebuilds that
-        # prefix anyway and re-reads on the way through.
-        refreshed = await self.refresh_behaviors()
         if not changed and not refreshed:
+            # Nothing to install, so the engines just built are unreferenced the
+            # moment this returns. Closing them is not housekeeping: each one
+            # owns an httpx pool, and a page that polls /reload would otherwise
+            # leak a pool per poll.
+            await self._close_unreferenced(e for e, _, _ in engines.values())
             return {"ok": True, "changed": [], "updated": 0, "deferred": 0,
                     "note": "config and behavior files on disk are identical "
                             "to the running ones"}
         changed += [f"{key}: edited — applies at the next rollover, /clear or /new"
                     for key in refreshed]
 
-        # In place, never rebound: the manager, the aiohttp app and every session
-        # hold this same dict, so mutating it is what makes core.token, the state
-        # directories and GET /models pick the new values up with no plumbing.
-        self.config.clear()
-        self.config.update(fresh)
-
-        old_engines, self._engines = self._engines, engines
-        # From the cache refresh_behaviors has just reconciled with disk. The
-        # manager's own copy is safe to move immediately: the directives below
-        # are re-sent as user messages mid-turn, not held in the prompt prefix,
-        # so updating them costs no KV cache.
-        self.base_behavior = await asyncio.to_thread(
-            self.behaviors.read,
-            fresh.get("behavior", {}).get("base_file") or behavior.DEFAULT_BASE_FILE)
+        # Under the engine lock, because engine_for reads both of these and
+        # holds that lock across an await of its own: a session asking for an
+        # uncached model at this moment would otherwise resume after the swap
+        # and write its engine into the *new* dict, displacing the one this
+        # reload built and handed to the session blobs below. The displaced
+        # engine is in neither old_engines nor the live set, so nothing ever
+        # closes it — a leaked connection pool, and a session running on an
+        # engine the reload did not give it.
+        async with self._engine_lock:
+            # In place, never rebound: the manager, the aiohttp app and every
+            # session hold this same dict, so mutating it is what makes
+            # core.token, the state directories and GET /models pick the new
+            # values up with no plumbing.
+            self.config.clear()
+            self.config.update(fresh)
+            old_engines, self._engines = self._engines, engines
+        # Read above the commit, installed here. The manager's own copy is safe
+        # to move immediately: the directives are re-sent as user messages
+        # mid-turn, not held in the prompt prefix, so updating them costs no
+        # KV cache.
+        self.base_behavior = base_behavior
         self.conclude_directive = behavior.extract_conclude_directive(self.base_behavior)
         self.checkpoint_directive = behavior.extract_checkpoint_directive(
             self.base_behavior)
-        tools_cfg = fresh.get("tools", {})
-        workdir = tools_cfg.get("workdir") or str(paths.REPO_ROOT)
-        from tools import build_tools
-        self._tools = build_tools(tools_cfg, workdir=workdir)
-        self._schemas = [t.spec for t in self._tools]
-        self._tools_tok = count_tools(self._schemas)
+        self._tools = new_tools_list
+        self._schemas = new_schemas
+        self._tools_tok = new_tools_tok
 
-        log_cfg = fresh.get("logging", {})
+        log_cfg = fresh.get("logging") or {}
         if log_cfg.get("level"):
             logging.getLogger().setLevel(
                 getattr(logging, str(log_cfg["level"]).upper(), logging.INFO))
 
-        old_conv, new_conv = old_cfg.get("conversation", {}), fresh.get("conversation", {})
-        old_tools, new_tools = old_cfg.get("tools", {}), tools_cfg
+        # `or {}`, not a .get default: a section present but empty in the YAML
+        # is None, which a bare default never replaces.
+        old_conv = old_cfg.get("conversation") or {}
+        new_conv = fresh.get("conversation") or {}
+        old_tools, new_tools = old_cfg.get("tools") or {}, tools_cfg
         # (attribute, what the old config said, what the new one says). apply_config
         # reassigns only where the session still holds the old value.
         scalars = [
-            ("max_tool_rounds", int(old_tools.get("max_iterations", 8)),
-                                int(new_tools.get("max_iterations", 8))),
+            # int_or, not int: reload() has already committed the new config by
+            # the time this list is built, so a ValueError raised here would
+            # leave the core running the new settings with half the sessions
+            # never told about them — the one failure mode the all-or-nothing
+            # validation above exists to prevent.
+            ("max_tool_rounds", configlib.int_or(old_tools.get("max_iterations", 8), 8),
+                                configlib.int_or(new_tools.get("max_iterations", 8), 8)),
             ("max_history", configlib.int_or(old_conv.get("max_history_messages", 100), 100),
                             configlib.int_or(new_conv.get("max_history_messages", 100), 100)),
-            ("rollover_pct", int(old_conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0),
-                             int(new_conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0)),
+            ("rollover_pct",
+             configlib.int_or(old_conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0,
+                              DEFAULT_ROLLOVER_PCT),
+             configlib.int_or(new_conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0,
+                              DEFAULT_ROLLOVER_PCT)),
             ("rollover_mode", str(old_conv.get("rollover_mode", DEFAULT_ROLLOVER_MODE)).lower(),
                               str(new_conv.get("rollover_mode", DEFAULT_ROLLOVER_MODE)).lower()),
-            ("prompt_timeout", int(old_conv.get("prompt_timeout", 60)),
-                               int(new_conv.get("prompt_timeout", 60))),
+            ("prompt_timeout", configlib.int_or(old_conv.get("prompt_timeout", 60), 60),
+                               configlib.int_or(new_conv.get("prompt_timeout", 60), 60)),
             ("rollover_before_think", bool(old_conv.get("rollover_before_think", True)),
                                       bool(new_conv.get("rollover_before_think", True))),
             # Turning this off leaves the open segment where it is: it closes at
@@ -2260,6 +2412,14 @@ class SessionManager:
             return {"ok": False, "error": "webui.pin must be a mapping"}
         values = {}
         if "theme" in webui:
+            # Checked the same way pin's values are, a few lines down. theme
+            # never reaches the generated CSS — only PIN_KEYS do, and those are
+            # re-validated at render — so this is not an injection guard; it is
+            # that yaml_scalar on a dict or a list writes a line into
+            # config.yaml that means something other than what was sent, into
+            # the file holding the user's settings and the bot token.
+            if isinstance(webui["theme"], (dict, list)):
+                return {"ok": False, "error": "webui.theme must be a scalar"}
             values["theme"] = config_edit.yaml_scalar(webui["theme"])
         if isinstance(pin, dict):
             for k, v in pin.items():
