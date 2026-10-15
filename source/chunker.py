@@ -34,6 +34,11 @@ DEFAULT_MAX_LINES = 17
 # CommonMark fence rule, which is what Discord follows.
 FENCE_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
 
+# How much of a fence's info string is worth carrying onto every later chunk.
+# A language tag is a word; anything beyond that is the model having a bad day
+# and is not worth paying for once per message. See _cap_reopen.
+MAX_REOPEN_INFO = 16
+
 
 class _Fence:
     """An open code fence: what it takes to close one and to reopen it."""
@@ -61,6 +66,34 @@ def _parse_fence(line):
         return None
     marker = m.group(2)
     return _Fence(m.group(1), marker[0], len(marker), line)
+
+
+def _cap_reopen(fence, max_chars):
+    """Shorten a monstrous opening line before it is used to reopen the fence.
+
+    The opener is reprinted at the top of every chunk after the first, so its
+    length is subtracted from the room each of them has for code (`room_fresh`
+    below). Normally that is "```py" and nobody notices. But a model that puts
+    a whole paragraph in the info string — ``` followed by a couple of thousand
+    characters on one line, which happens when a prompt is echoed back — leaves
+    `room_fresh` at its floor of one character, and the answer comes out as a
+    hundred and seventy near-identical messages holding one character each.
+
+    So the reopen line keeps the marker, the first word of the info string
+    (which is where a language tag lives) and nothing much else. The info
+    string was already nonsense to Discord, which reads all of it as a language
+    name; nonsense and readable beats nonsense and 174 messages long. Only the
+    *reopen* is capped — the opener itself goes out in full as the text it is.
+    """
+    if len(fence.open_line) + 1 < max_chars:
+        return fence
+    info = FENCE_RE.match(fence.open_line).group(3)
+    # Backticks cannot appear in a backtick fence's info string, and the cut
+    # could have ended inside one — strip them rather than hand back a line
+    # that is no longer a fence.
+    word = info.strip().split(" ", 1)[0][:MAX_REOPEN_INFO].replace("`", "")
+    marker = fence.indent + fence.char * fence.length
+    return _Fence(fence.indent, fence.char, fence.length, marker + word)
 
 
 def _close_if_needed(text, fence):
@@ -153,7 +186,7 @@ def chunk_discord_text(text, max_chars=DEFAULT_MAX_CHARS, max_lines=DEFAULT_MAX_
         next_fence = fence
         if found is not None:
             if fence is None:
-                next_fence = found
+                next_fence = _cap_reopen(found, max_chars)
             elif found.char == fence.char and found.length >= fence.length:
                 # A closing marker has to match the opener's character and be at
                 # least as long — ``` does not close ````.
