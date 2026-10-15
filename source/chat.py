@@ -24,6 +24,7 @@ import asyncio
 import os
 import sys
 import threading
+import time
 import traceback
 from urllib.parse import quote
 
@@ -57,6 +58,19 @@ COMMANDS = {
 
 # Handled here, not by the core: they change this terminal, not the conversation.
 LOCAL_COMMANDS = {"/quit", "/exit", "/reasoning"}
+
+# What counts as an answer to the rollover question, and nothing else does —
+# see the pending branch in the input loop.
+YES = ("y", "yes")
+NO = ("n", "no")
+# Grace on top of the core's own timeout before this side stops treating a
+# bare yes/no as an answer. Covers the round trip, so a genuine last-second
+# answer is not thrown away here. The Discord client holds the same two
+# figures for the same reason (ASK_SLACK_S, DEFAULT_ASK_TIMEOUT_S).
+ASK_SLACK_S = 5
+# Used when the core's rollover_ask carries no timeout_s. Anything finite
+# beats the old behaviour, which was to wait for ever.
+DEFAULT_ASK_TIMEOUT_S = 120
 
 
 def _bind_tab_to_complete():
@@ -122,6 +136,8 @@ class Renderer:
         self.thought = 0        # tokens thought this turn, from the core
         self.thought_base = 0   # the total when the current run of thinking began
         self.prompt_shown = False
+        self.pending_ask = None   # an unanswered rollover question's request_id
+        self.pending_until = 0.0  # ...and the monotonic deadline it dies at
 
     # ---- low-level -------------------------------------------------------
 
@@ -449,6 +465,20 @@ async def run_client(url, session_name, render, token=""):
                     render.line(f"   Roll over to a new session? [y/N]  "
                                 f"(no answer in {e['timeout_s']}s keeps it)")
                     render.pending_ask = e["request_id"]
+                    # The core stops waiting after timeout_s and keeps the
+                    # session; this has to stop waiting too. Without the
+                    # deadline the id stayed pending for ever, and the next
+                    # thing typed — any time later, including /quit — was sent
+                    # as a reply to a request_id the core had long forgotten,
+                    # which server.py drops without a word. The message simply
+                    # vanished.
+                    try:
+                        timeout_s = float(e.get("timeout_s") or 0)
+                    except (TypeError, ValueError):
+                        timeout_s = 0.0
+                    render.pending_until = time.monotonic() + (
+                        timeout_s + ASK_SLACK_S if timeout_s > 0
+                        else DEFAULT_ASK_TIMEOUT_S)
                 else:
                     render.handle(e)
                     if e.get("t") == "hello":
@@ -475,10 +505,23 @@ async def run_client(url, session_name, render, token=""):
 
             pending = getattr(render, "pending_ask", None)
             if pending:                      # answering the rollover question
+                answer = text.lower()
+                live = time.monotonic() <= getattr(render, "pending_until", 0.0)
+                # Only an actual yes or no, and only while the core is still
+                # listening for one. Everything else is what the person meant
+                # to say: this branch sits above the command dispatch, so an
+                # unanswered question used to eat /quit, /stop and /info too —
+                # and eat them into a dead request_id, so there was not even an
+                # error to see.
+                if live and answer in YES + NO:
+                    render.pending_ask = None
+                    await ws.send_json({"t": "rollover_reply", "request_id": pending,
+                                        "yes": answer in YES})
+                    continue
                 render.pending_ask = None
-                await ws.send_json({"t": "rollover_reply", "request_id": pending,
-                                    "yes": text.lower() in ("y", "yes")})
-                continue
+                if not live:
+                    render.line("   (the rollover question timed out — the "
+                                "session was kept)")
 
             if text in ("/quit", "/exit"):
                 break
@@ -533,7 +576,6 @@ def main():
 
     install_completer(known_models(config))
     render = Renderer()
-    render.pending_ask = None
 
     print("\nletsClaw Terminal Chat")
     print(f"Connected to the core at {url}, session '{args.session}'.")
