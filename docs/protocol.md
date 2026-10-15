@@ -36,8 +36,9 @@ means everything is open. Accepts `Authorization: Bearer <tok>` **or**
 `/` is unauthenticated on purpose — the page holds no secrets and is the thing
 that *asks* for the token.
 
-> ⚠️ `/static/` serves the whole `web/` directory, so `test_md.mjs`,
-> `browser_test.py` and `shot.py` are reachable under it too.
+> `/static/` serves the whole `web/` directory. The test helpers that used to
+> sit there — `test_md.mjs`, `browser_test.py`, `shot.py` — now live in `tests/`,
+> which is not served, so the route exposes only the page and the vendored KaTeX.
 
 ---
 
