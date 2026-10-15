@@ -42,6 +42,10 @@ HEALTH_INTERVAL = 30
 # How long ensure() will wait for a freshly-spawned forward to answer.
 STARTUP_TRIES = 15
 STARTUP_DELAY = 1.0
+# How long the "is this port really our far side?" question may take. It runs
+# once, before the first spawn, against whatever already holds the port — which
+# may be something that never answers at all, so it has to be bounded.
+PROBE_TIMEOUT = 3
 
 
 def pick_free_port():
@@ -56,11 +60,14 @@ def pick_free_port():
 class SSHForward:
     """One `ssh -N -L` child, supervised.
 
-    The local port is chosen in __init__ (random free one when local_port is
-    0), so local_url() is valid before the process has even started.
+    The local port is always the core's own: a free one picked in __init__, so
+    local_url() is valid before the process has even started. There is no
+    config key for it — see _wanted() for why — and `local_port` here is for
+    the tests, which need a port they already hold.
     """
 
-    def __init__(self, name, target, remote_port, local_port=0, jump=None):
+    def __init__(self, name, target, remote_port, jump=None, model_id=None,
+                 local_port=0):
         self.name = name
         self.target = target
         # The port the service listens on at the destination, on its own
@@ -68,6 +75,10 @@ class SSHForward:
         self.remote_port = int(remote_port)
         # Optional jump host, "user@ip" or "ip". None = direct connection.
         self.jump = jump
+        # The model id the far side reports in /v1/models (models.<name>.
+        # provider_name, or the entry's own name). It is what makes "is this
+        # port ours?" answerable — see _far_side_is_ours().
+        self.model_id = model_id
         self.local_port = int(local_port) or pick_free_port()
         self._proc = None
         self._lock = asyncio.Lock()
@@ -117,34 +128,13 @@ class SSHForward:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return self._proc
 
-    async def _healthy(self) -> bool:
-        """True when the local end of the forward accepts TCP *and is ours*.
+    async def _accepts(self) -> bool:
+        """True when something accepts TCP on the local end of the forward.
 
-        A connect (not an HTTP probe) is the right test for the first half: it
-        is protocol-agnostic, and the port is listening only while the forward
-        is actually up — ssh with ExitOnForwardFailure holds the port for the
-        whole life of the child.
-
-        But a connect alone only proves *something* is listening. Once our own
-        ssh has exited, the port is free for anything on this machine to bind,
-        and the next thing to bind it inherits every request we then send down
-        it — requests that carry the model's API key in a header. So once we
-        have a child, it has to still be alive: a dead child plus an open port
-        is not a healthy forward, it is a stranger on our port. ensure() then
-        respawns, the new ssh cannot bind, and the forward reports itself down
-        rather than handing out an engine pointed at whoever is there.
-
-        Before the first spawn (_proc is None) the connect stands on its own,
-        which is what lets a forward set up by hand, or left by a previous run
-        of the core, be reused instead of fought over.
+        A connect, not an HTTP probe: it is protocol-agnostic, and the port is
+        listening only while the forward is actually up — ssh with
+        ExitOnForwardFailure holds the port for the whole life of the child.
         """
-        if self._proc is not None and self._proc.poll() is not None:
-            if self._warned_dead != self._proc.pid:
-                self._warned_dead = self._proc.pid
-                logger.warning("ssh forward %s: our ssh exited (status %s); "
-                               "not trusting 127.0.0.1:%s until we own it again",
-                               self.name, self._proc.poll(), self.local_port)
-            return False
         try:
             _, writer = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", self.local_port), timeout=3)
@@ -156,6 +146,90 @@ class SSHForward:
             return True
         except Exception:
             return False
+
+    async def _far_side_is_ours(self) -> bool:
+        """True when whoever holds the local port answers as our model server.
+
+        One hand-written HTTP/1.1 request rather than aiohttp: this module has
+        no other HTTP dependency, and the question is a small one — GET
+        /v1/models, is our model id in the answer. Anything else (a server
+        that is not HTTP, one that never replies, one serving a different
+        model) is not ours.
+
+        The path is the OpenAI-compatible one, which is what every server this
+        forwards to speaks. A server mounted under a prefix would fail the
+        probe and cost us the reuse, not the forward: we take a fresh port and
+        spawn, which is what would have happened with no port to reuse at all.
+        """
+        if not self.model_id:
+            # Nothing to compare against, so nothing can be verified, so the
+            # port is not ours. Unverifiable is the same as wrong here: the
+            # cost of being wrong is our API key going to a stranger.
+            return False
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", self.local_port),
+                timeout=PROBE_TIMEOUT)
+        except Exception:
+            return False
+        try:
+            writer.write(("GET /v1/models HTTP/1.1\r\n"
+                          f"Host: 127.0.0.1:{self.local_port}\r\n"
+                          "Accept: application/json\r\n"
+                          "Connection: close\r\n\r\n").encode())
+            await writer.drain()
+            # To EOF, which Connection: close promises us; bounded by the
+            # timeout for whoever does not keep that promise.
+            body = await asyncio.wait_for(reader.read(), timeout=PROBE_TIMEOUT)
+        except Exception:
+            return False
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+        return self.model_id.encode() in body
+
+    async def _healthy(self) -> bool:
+        """True when the local end of the forward accepts TCP *and is ours*.
+
+        A connect alone only proves *something* is listening. Once our own ssh
+        has exited, the port is free for anything on this machine to bind, and
+        the next thing to bind it inherits every request we then send down it —
+        requests that carry the model's API key in a header. So once we have a
+        child, it has to still be alive: a dead child plus an open port is not
+        a healthy forward, it is a stranger on our port. ensure() then
+        respawns, the new ssh cannot bind, and the forward reports itself down
+        rather than handing out an engine pointed at whoever is there.
+
+        Before the first spawn (_proc is None) an open port is still *allowed*
+        to be reused — a forward set up by hand, or left behind by a previous
+        run of the core, should be picked up rather than fought over — but the
+        reuse is now verified rather than assumed. The connect proved something
+        is there; _far_side_is_ours() asks it the one question only our far
+        side answers. A stranger is not killed, because it is not ours to kill
+        and it may be the very thing someone is working in: we take a different
+        local port and say so, and the spawn below puts our own ssh on it.
+        """
+        if self._proc is not None and self._proc.poll() is not None:
+            if self._warned_dead != self._proc.pid:
+                self._warned_dead = self._proc.pid
+                logger.warning("ssh forward %s: our ssh exited (status %s); "
+                               "not trusting 127.0.0.1:%s until we own it again",
+                               self.name, self._proc.poll(), self.local_port)
+            return False
+        if not await self._accepts():
+            return False
+        if self._proc is None and not await self._far_side_is_ours():
+            taken = self.local_port
+            self.local_port = pick_free_port()
+            logger.warning("ssh forward %s: 127.0.0.1:%s is held by something "
+                           "that does not answer for %r — leaving it alone and "
+                           "taking 127.0.0.1:%s instead", self.name, taken,
+                           self.model_id, self.local_port)
+            return False
+        return True
 
     async def ensure(self):
         """Bring the forward up and wait until it answers. Idempotent: a
@@ -267,11 +341,26 @@ class SSHForwardManager:
 
     @staticmethod
     def _wanted(config):
+        """{model name: the spec a forward is built from}, from the config.
+
+        The spec is exactly SSHForward's own arguments after the name, and
+        plan() compares all of it — see there. There is deliberately no key
+        for the local port: it is an implementation detail of a tunnel this
+        process owns and nothing outside the core can usefully name it. The
+        key `ssh_local_port` used to be read into the spec and then left out
+        of plan()'s comparison, so editing it reported success and changed
+        nothing until a restart. It is gone rather than honoured, and a config
+        that still carries it is told so rather than having it quietly dropped.
+        """
         want = {}
         models = config.get("models", {}) or {}
         for name, entry in models.items():
             if not isinstance(entry, dict) or "ssh_forward" not in entry:
                 continue
+            if "ssh_local_port" in entry:
+                logger.warning("models.%s.ssh_local_port is ignored and no "
+                               "longer exists — the core picks a free local "
+                               "port for every forward; remove the key", name)
             jump = str(entry.get("ssh_jump") or "").strip() or None
             # ssh_remote_port is the port on the destination. The legacy
             # ssh_remote "host:port" spelling is still read (host ignored).
@@ -280,26 +369,33 @@ class SSHForwardManager:
                 rp = str(entry.get("ssh_remote") or "").rsplit(":", 1)[-1]
             want[name] = (str(entry.get("ssh_forward")),
                           int(rp or 8888),
-                          int(entry.get("ssh_local_port") or 0),
-                          jump)
+                          jump,
+                          str(entry.get("provider_name") or name))
         return want
 
     def configure(self, config):
         """Startup: create the forwards the config wants. Synchronous, spawns
         nothing — the ssh processes start lazily (first use) or via the
         keepalive."""
-        for name, (target, rport, local, jump) in self._wanted(config).items():
+        for name, spec in self._wanted(config).items():
             if name not in self._forwards:
-                self._forwards[name] = SSHForward(name, target, rport, local,
-                                                  jump=jump)
+                self._forwards[name] = SSHForward(name, *spec)
 
     def plan(self, config):
         """Diff the config against the current set, without applying it.
 
         Returns (added, removed): added are new SSHForward objects (or a
-        replacement, when a forward's target or remote port changed — the old
-        one comes back in removed), removed are forwards the config no longer
+        replacement, when something in a forward's spec changed — the old one
+        comes back in removed), removed are forwards the config no longer
         wants or that are being replaced.
+
+        The comparison is the whole spec against the whole forward, with
+        nothing left out. It used to carry a fourth element, the local port
+        from `ssh_local_port`, that was built into the forward and then not
+        compared here — so that one key could be edited, reloaded, reported
+        applied, and have changed nothing. A spec whose elements are not all
+        compared is a key that silently does not work; the key is gone now,
+        and this stays exhaustive so the next one added cannot repeat it.
         """
         want = self._wanted(config)
         added, removed = {}, {}
@@ -307,7 +403,7 @@ class SSHForwardManager:
             cur = self._forwards.get(name)
             if cur is None:
                 added[name] = SSHForward(name, *spec)
-            elif (cur.target, cur.remote_port, cur.jump) != (spec[0], spec[1], spec[3]):
+            elif (cur.target, cur.remote_port, cur.jump, cur.model_id) != spec:
                 removed[name] = cur
                 added[name] = SSHForward(name, *spec)
         for name, fwd in self._forwards.items():
@@ -320,15 +416,45 @@ class SSHForwardManager:
         swap is committed. The caller closes them if the reload is rejected."""
         self._forwards.update(added)
 
-    def unstage(self, added):
-        """Undo a staged reload that was refused: drop the additions again."""
-        for name in added:
-            self._forwards.pop(name, None)
+    def unstage(self, added, removed=None):
+        """Undo a staged reload that was refused: drop the additions again.
+
+        By identity, and putting back what stage() displaced. Popping by name
+        deleted the *old* forward on a replacement reload — plan() reports one
+        name on both sides of a change (the running forward in `removed`, its
+        replacement in `added`), so stage() had overwritten the entry and this
+        dropped it outright. The refused reload then left the core with no
+        forward at all: the ssh child it was still serving kept running with
+        nobody able to close it, and the next engine built for that model went
+        to the raw base_url — straight at an address that is unreachable
+        without the tunnel, which is the whole thing ssh_forward exists for.
+
+        `removed` is the same plan's removals, so a replacement can be told
+        from a plain addition. It is optional: with nothing to restore, an
+        addition is simply withdrawn, which is what a pure addition is.
+        """
+        removed = removed or {}
+        for name, fwd in added.items():
+            if self._forwards.get(name) is not fwd:
+                continue        # not ours any more; whoever put it there owns it
+            prev = removed.get(name)
+            if prev is not None and prev is not fwd:
+                self._forwards[name] = prev      # put back the one stage() covered
+            else:
+                self._forwards.pop(name, None)
 
     def commit(self, removed):
-        """Drop the planned removals from the set (after a successful reload)."""
-        for name in removed:
-            self._forwards.pop(name, None)
+        """Drop the planned removals from the set (after a successful reload).
+
+        By identity, for the same reason as unstage(): on a replacement the
+        name now maps to the *new* forward, and popping it by name would delete
+        the forward this reload just built its engines on. The old one has
+        already been displaced from the dict by stage(), so there is nothing
+        here to drop — the caller closes it or parks it as a zombie.
+        """
+        for name, fwd in removed.items():
+            if self._forwards.get(name) is fwd:
+                del self._forwards[name]
 
     def set_zombies(self, zombies):
         """Track these as zombies, keeping any that were already pending.
