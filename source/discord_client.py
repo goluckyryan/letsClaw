@@ -223,13 +223,19 @@ def _one_line(text):
 class Settings:
     """The `discord:` section, parsed once and validated loudly.
 
-    Nothing here is looked up again at runtime, so a bad value is a startup
-    error rather than a surprise three hours into a conversation.
+    A bad value is a startup error rather than a surprise three hours into a
+    conversation. Almost nothing is looked up again at runtime — the exception
+    is the allowlist, which `refresh_security` re-reads on /reload because an
+    allowlist that cannot be narrowed without a restart is not an allowlist.
     """
 
     def __init__(self, config):
         blob = config.get("discord") or {}
         core_cfg = config.get("core") or {}
+        # Which file this came from, so a reload re-reads the same one rather
+        # than the default path. main() fills it in from --config; None means
+        # the default, which is what load_config() does with it anyway.
+        self.config_path = None
 
         # Absent means enabled, so a config that never had the key is
         # unaffected. serve.sh reads the same flag before launching; a bot
@@ -243,10 +249,7 @@ class Settings:
         self.core_token = str(blob.get("core_token")
                               or core_cfg.get("token") or "").strip()
 
-        self.users = self._snowflakes(blob.get("users"))
-        self.mention_only = self._mention_mode(blob.get("mention_only", True))
-        self.mention_list = [self._matcher(c) for c in
-                             (blob.get("mention_list") or [])]
+        self._read_security(blob)
         # Name sessions after the server and channel instead of the snowflake.
         # See _resolve_session for what happens when a channel is renamed under
         # a session that already exists.
@@ -275,6 +278,56 @@ class Settings:
                 n = DEFAULT_MAX_MESSAGES
             self.max_messages = MAX_MESSAGES_UNLIMITED if n == 0 else max(1, n)
         self.max_lines = max(1, int(blob.get("max_lines") or DEFAULT_MAX_LINES))
+
+    def _read_security(self, blob):
+        """Who may talk to the bot, and where it has to be addressed.
+
+        The three keys that decide access, read in one place because they are
+        also the three that have to be re-read on a reload.
+        """
+        self.users = self._snowflakes(blob.get("users"))
+        self.mention_only = self._mention_mode(blob.get("mention_only", True))
+        self.mention_list = [self._matcher(c) for c in
+                             (blob.get("mention_list") or [])]
+
+    def refresh_security(self):
+        """Re-read the allowlist from config.yaml. True if it was re-read.
+
+        /reload has to be able to take someone's access away. It could not:
+        this object is parsed once at startup and shared by every bridge, so
+        removing a snowflake from discord.users and reloading changed nothing
+        — the bot even rendered "♻️ config reloaded" — and that person kept an
+        unconfined shell on this host until the process was restarted.
+        AGENT.md lists the keys that need a restart and promises the rest
+        reload live; the allowlist is the part of that promise that matters
+        most, so if that list ever grows these three keys are not what it
+        should grow by.
+
+        Only the access keys are touched. The token, the core URL and the
+        posting limits are left exactly as they were: this runs on an event
+        from the core, and quietly re-pointing a live bot at another core on
+        the strength of one is not something a reload should do.
+
+        Fails closed. A config.yaml that will not parse — half-saved, a tab
+        where a space belongs — keeps the allowlist already in force. Widening
+        it on a syntax error would be the wrong way to be wrong.
+        """
+        before = len(self.users)
+        try:
+            config = load_config(self.config_path)
+            blob = config.get("discord") or {}
+        except Exception as e:
+            logger.warning("the allowlist was NOT reloaded (%s: %s) — keeping "
+                           "the %d user(s) already in force",
+                           type(e).__name__, e, before)
+            return False
+        self._read_security(blob)
+        logger.info("allowlist reloaded: %d user(s), was %d — %s",
+                    len(self.users), before, _mention_summary(self))
+        if not self.users:
+            logger.warning("discord.users is now empty — every message will "
+                           "be refused until it is filled in again")
+        return True
 
     @staticmethod
     def _core_url(raw, core_cfg):
@@ -513,7 +566,16 @@ class CoreLink:
         # any state it set from an event and clears on a later one does need
         # to hear about the gap. See ChannelBridge.dropped.
         self.on_drop = on_drop
+        # Two counters, because "read off the socket" and "dealt with" are not
+        # the same instant and only one of them is safe to resume from. The
+        # reader advances last_seq as frames arrive — it is what says the link
+        # is keeping up. handled_seq moves only once on_event has returned, and
+        # it alone goes on the wire: an event whose handler was cut short
+        # (DRAIN_GRACE_S expiring in the middle of a long _post_answer) has not
+        # been dealt with, and asking the core to resume past it loses the rest
+        # of an answer with no sign that anything went missing.
         self.last_seq = 0
+        self.handled_seq = 0
         self.last_used = time.monotonic()
         self.ws = None
         self._task = None
@@ -553,7 +615,8 @@ class CoreLink:
         # query value, not a path. Aliases already refuse a slash; this is what
         # makes that a policy rather than the only thing holding the URL together.
         url = (f"{self.url}/ws?session={quote(self.session, safe='')}"
-               f"&last_seq={self.last_seq}"
+               # handled_seq, not last_seq: see the two counters in __init__.
+               f"&last_seq={self.handled_seq}"
                # The thinking text is never shown in Discord, so there is no
                # reason to ship it: the core withholds it and sends only the
                # running token count, which nothing here draws either.
@@ -651,9 +714,16 @@ class CoreLink:
                 try:
                     await asyncio.wait_for(queue.join(), timeout=DRAIN_GRACE_S)
                 except asyncio.TimeoutError:
-                    logger.warning("session %s: giving up on %d queued event(s) — "
-                                   "the handler did not finish within %ss",
-                                   self.session, queue.qsize(), DRAIN_GRACE_S)
+                    # qsize() alone undercounts by one and reads as "giving up
+                    # on 0 events" in the usual case: the event the handler is
+                    # stuck inside was dequeued before it was handed over. It
+                    # is the one that matters, so say so, and say where the
+                    # reconnect will pick up — which is before it, not after.
+                    logger.warning("session %s: giving up on the event in hand "
+                                   "and %d more queued — the handler did not "
+                                   "finish within %ss; resuming from seq %d",
+                                   self.session, queue.qsize(), DRAIN_GRACE_S,
+                                   self.handled_seq)
                 finally:
                     drain.cancel()
         logger.info("session %s: the core closed the connection", self.session)
@@ -676,6 +746,14 @@ class CoreLink:
                 # One unrenderable event must never take down the stream.
                 logger.exception("session %s: could not handle %r",
                                  self.session, event.get("t"))
+            else:
+                # Only now is this event dealt with. A handler that raised is
+                # not: the answer it was posting is still half-posted, and the
+                # replay on the next attach is the only thing that can finish
+                # it. Same for a cancel, which never reaches here at all.
+                seq = event.get("seq")
+                if isinstance(seq, int):
+                    self.handled_seq = max(self.handled_seq, seq)
             finally:
                 queue.task_done()
 
@@ -735,6 +813,9 @@ class ChannelBridge:
         self.busy = False
         self._typing = None
         self._warned_proto = False
+        # Set for the length of a replay, and cleared by the first text event
+        # in it — see _hello for what that one event has to do differently.
+        self._replay_first_text = False
         # request_id → future, for a slash command awaiting its own reply.
         self.waiters = {}
 
@@ -746,13 +827,26 @@ class ChannelBridge:
         The return value matters on a long answer: without it a send that fails
         at message 40 of 65 drops the remaining 25 in silence, and the reader
         sees an answer that simply stops mid-sentence.
+
+        Which is what happened anyway while only HTTPException was caught.
+        That is Discord *answering* and saying no; a network that is simply
+        gone surfaces through discord.py as an aiohttp error or a bare OSError,
+        and a slow one as asyncio.TimeoutError. None of those are HTTPException,
+        so they went straight past here, past handle(), and into _drain's
+        catch-all — which logs and moves on. By then _post_answer has cleared
+        self.answer, so there is nothing left to retry or to attach: the answer
+        stops mid-sentence with not even an error posted. Returning False puts
+        it back on the path that already exists for a refusal, which ends in
+        the whole answer going up as a file.
         """
         for piece in _hard_split(text):
             try:
                 await self.channel.send(piece)
-            except discord.HTTPException as e:
-                logger.warning("session %s: Discord refused a message (%s)",
-                               self.link.session, e)
+            except (discord.HTTPException, aiohttp.ClientError, OSError,
+                    asyncio.TimeoutError) as e:
+                logger.warning("session %s: could not post a message "
+                               "(%s: %s)", self.link.session,
+                               type(e).__name__, e)
                 return False
         return True
 
@@ -809,9 +903,13 @@ class ChannelBridge:
         try:
             data = io.BytesIO(text.encode("utf-8"))
             await self.channel.send(note, file=discord.File(data, filename="answer.md"))
-        except discord.HTTPException as e:
-            logger.warning("session %s: could not attach the answer (%s)",
-                           self.link.session, e)
+        except (discord.HTTPException, aiohttp.ClientError, OSError,
+                asyncio.TimeoutError) as e:
+            # The same widening as say(): this is the last-resort path, and a
+            # dead socket here must leave a line in the channel, not an
+            # exception for _drain to swallow.
+            logger.warning("session %s: could not attach the answer (%s: %s)",
+                           self.link.session, type(e).__name__, e)
             await self.say("_…the rest of the answer would not upload._")
 
     def take_pending_ask(self):
@@ -885,7 +983,7 @@ class ChannelBridge:
 
     # -- events --
 
-    async def handle(self, event):
+    async def handle(self, event, replayed=False):
         t = event.get("t")
         if t == "hello":
             await self._hello(event)
@@ -894,7 +992,18 @@ class ChannelBridge:
             self.answer.clear()
             self._start_typing()
         elif t == "text":
-            self.answer.append(event.get("delta") or "")
+            if self._replay_first_text:
+                # The first text event of a replay is not a delta to add to
+                # what is already here: the core coalesces a whole run of text
+                # into one turn_events entry holding the run's full text, so
+                # this *is* everything said in that run, prefix included. Add
+                # it to the prefix already in self.answer and the answer goes
+                # out with its opening posted twice. Replace instead; later
+                # replayed entries are separate runs and append as usual.
+                self._replay_first_text = False
+                self.answer = [event.get("delta") or ""]
+            else:
+                self.answer.append(event.get("delta") or "")
         elif t == "turn_end":
             self.busy = False
             self._stop_typing()
@@ -918,7 +1027,7 @@ class ChannelBridge:
             await self.say(f"_✨ fresh window — {event.get('used')}/"
                            f"{event.get('budget')} tok_")
         elif t == "rollover_ask":
-            await self._ask(event)
+            await self._ask(event, replayed=replayed)
         elif t == "session_state":
             await self._state(event)
         elif t == "response":
@@ -929,9 +1038,18 @@ class ChannelBridge:
             self._warned_proto = True
             await self.say(f"⚠️ the core speaks protocol {event.get('proto')}, "
                            f"this client speaks {PROTOCOL_VERSION} — update one.")
-        # Anything that happened while this client was detached or reconnecting.
-        for missed in event.get("missed") or []:
-            await self.handle(missed)
+        # Anything that happened while this client was detached or
+        # reconnecting. Flagged as a replay from here down, for the two events
+        # that have to be read differently the second time around: text (see
+        # handle) and rollover_ask (see _ask).
+        self._replay_first_text = True
+        try:
+            for missed in event.get("missed") or []:
+                await self.handle(missed, replayed=True)
+        finally:
+            # A replay with no text in it leaves the flag armed otherwise, and
+            # the next live delta of the next turn would wipe the answer.
+            self._replay_first_text = False
         if event.get("gap"):
             await self.say("_(some earlier output was missed while detached)_")
         # Authoritative in both directions, and applied after the replay above
@@ -947,7 +1065,22 @@ class ChannelBridge:
             self.busy = False
             self._stop_typing()
 
-    async def _ask(self, event):
+    async def _ask(self, event, replayed=False):
+        if replayed:
+            # A question out of the replay buffer, not off the live wire. Its
+            # deadline is counted from when it is handled, so a copy arriving
+            # on a reconnect looks exactly as fresh as the real thing and
+            # re-arms pending_ask for a question the core gave up on minutes
+            # ago — after which the next bare "yes" in the channel is eaten as
+            # an answer to it and never reaches the model.
+            #
+            # It is not re-posted either, deliberately: a question this side
+            # will no longer accept an answer to is an invitation to type the
+            # "yes" that gets dropped. The core's own "no answer — keeping the
+            # session" notice is in the same replay and says how it ended.
+            logger.info("session %s: a replayed rollover question (%s) is not "
+                        "re-armed", self.link.session, event.get("request_id"))
+            return
         self.pending_ask = event.get("request_id")
         try:
             timeout_s = float(event.get("timeout_s") or 0)
@@ -984,6 +1117,13 @@ class ChannelBridge:
             await self.say(f"_🤖 now on {event.get('model')} — budget "
                            f"{event.get('budget')} tok_")
         elif what == "reloaded":
+            # The core has re-read config.yaml; this process has to as well,
+            # or the line below announces a reload that did not reach the one
+            # setting on this side worth reloading. Every attached bridge gets
+            # this event and so every bridge re-reads the file — the work is a
+            # few milliseconds and the result is the same each time, which is
+            # cheaper than teaching the bridges to elect one of their number.
+            self.settings.refresh_security()
             await self.say(f"_♻️ config reloaded — {event.get('model')}, budget "
                            f"{event.get('budget')} tok_")
         elif what == "renamed":
@@ -1518,6 +1658,34 @@ class LetsClawBot(discord.Client):
             self._save_names()
             print(f"   renamed {moved} session(s) to match their channels")
 
+    def _unclaimed(self, desired, key):
+        """`desired`, unless another channel already answers to it.
+
+        Slugging is lossy in two ways that collide in practice: runs of
+        separators collapse, so #a--b and #a-b both come out as <server>-a-b,
+        and the name is cut at 64 characters, so two long channel names that
+        differ only past the cut come out identical too. Both ended with two
+        channels driving one core session — every answer posted in both
+        places, and each channel's context quietly mixed into the other's.
+
+        So the second channel to ask for a taken name gets its own, with a
+        slice of its snowflake on the end. Logged loudly, because the name in
+        the sidebar is then not quite the name of the channel and that is
+        worth being able to find out.
+        """
+        claimed = dict(self._names)
+        claimed.update(self._maps)          # /session bindings count too
+        clash = next((cid for cid, name in claimed.items()
+                      if name == desired and cid != key), None)
+        if clash is None:
+            return desired
+        # Room for the suffix inside the core's 64-character limit.
+        unique = f"{desired[:57].rstrip('-')}-{key[-6:]}"
+        logger.warning("channel %s wants the session name %r, which channel %s "
+                       "already has — using %r instead",
+                       key, desired, clash, unique)
+        return unique
+
     async def _resolve_session(self, channel, guild, user_id):
         """The session name for this channel, following Discord renames.
 
@@ -1534,7 +1702,7 @@ class LetsClawBot(discord.Client):
         # and nothing — not a Discord rename, not auto-naming — moves it.
         if key in self._maps:
             return self._maps[key]
-        desired = auto_session_name(channel, guild)
+        desired = self._unclaimed(auto_session_name(channel, guild), key)
         # No record yet means this bot has not named the channel before, so the
         # name to migrate from is the one it would have used: the snowflake.
         previous = self._names.get(key) or f"discord-{channel.id}"
@@ -2085,6 +2253,7 @@ def main():
     _configure_logging(config)
 
     settings = Settings(config)
+    settings.config_path = args.config
     if args.core:
         settings.core = Settings._core_url(args.core, config.get("core") or {})
 
