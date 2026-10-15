@@ -20,6 +20,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+import config as config_lib
 import paths
 
 logger = logging.getLogger("letclaw.session")
@@ -434,9 +435,13 @@ class Journal:
         self.config = config or {}
         self.path = None       # opened lazily; see the class docstring
         self.blocks = 0
-        self.max_block = int((self.config.get("conversation", {})
-                              .get("journal_max_block_chars")
-                              or DEFAULT_JOURNAL_BLOCK_CHARS))
+        # int_or, not int: a journal is opened lazily, part-way through a turn
+        # that is already running tools. A `journal_max_block_chars: lots` in
+        # the config would surface as a ValueError out of the middle of that
+        # turn, losing the answer, rather than as a warning at the top.
+        self.max_block = config_lib.int_or(
+            (self.config.get("conversation") or {}).get("journal_max_block_chars")
+            or DEFAULT_JOURNAL_BLOCK_CHARS, DEFAULT_JOURNAL_BLOCK_CHARS)
         # Serialises this journal's own appends. Not the index lock: a block
         # write must not queue behind another session archiving.
         self._lock = asyncio.Lock()

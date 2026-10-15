@@ -18,6 +18,8 @@ import os
 import signal
 from pathlib import Path
 
+import config as config_lib
+
 DEFAULT_MAX_OUTPUT = 8000
 
 
@@ -87,9 +89,14 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None) -> list:
     base = str(Path(workdir).expanduser()) if workdir else "."
     if not cfg.get("enabled", False):
         return []
-    allow = set(cfg.get("allow", ["exec", "read_file", "write_file", "list_dir"]))
-    max_out = int(cfg.get("max_output_chars", DEFAULT_MAX_OUTPUT))
-    exec_timeout = int(cfg.get("exec_timeout", 120))
+    allow = cfg.get("allow", ["exec", "read_file", "write_file", "list_dir"])
+    # `allow: exec` is the natural way to write a one-item list and YAML hands
+    # it back as a string, which set() would spell out into {'e','x','c'} —
+    # four tool names that do not exist, and every real tool quietly gone.
+    allow = {allow} if isinstance(allow, str) else set(allow or ())
+    max_out = config_lib.int_or(cfg.get("max_output_chars", DEFAULT_MAX_OUTPUT),
+                                DEFAULT_MAX_OUTPUT)
+    exec_timeout = config_lib.int_or(cfg.get("exec_timeout", 120), 120)
 
     async def exec_(command: str, workdir: str | None = None, timeout: int | None = None) -> str:
         workdir = workdir or base
