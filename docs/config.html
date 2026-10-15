@@ -216,6 +216,10 @@
       <td><span class="tag live">live</span></td><td>Optional shared secret; required in practice if <code>bind</code> is not loopback. Every route needs it as
       <code>Authorization: Bearer &lt;token&gt;</code> or <code>?token=</code> — except <code>GET /health</code> (stays open for monitors) and the WebUI itself
       (served unauthenticated; the page prompts for it and keeps it in <code>localStorage</code>).</td></tr>
+    <tr><td class="key"><code>allowed_hosts</code></td><td class="type">list</td><td class="def"><code>[]</code></td>
+      <td><span class="tag live">live</span></td><td>Extra <code>Host</code> header values the core will answer to. Loopback, <code>bind</code>, this machine's hostname and FQDN and
+      the addresses those resolve to are accepted already — add a name here only when something in front (a reverse proxy) forwards one the core
+      has never heard of. Anything else gets a 403 before it routes; see the Security note below for why the check exists.</td></tr>
     <tr><td class="key"><code>ssh_health_sec</code></td><td class="type">sec</td><td class="def">30</td>
       <td><span class="tag live">live</span></td><td>How often the keepalive checks the core-owned ssh port-forwards (<code>models.*.ssh_forward</code>) and respawns a
       dropped path on the same port. <code>/models</code> reports each forward; a missing pid means the path is down.</td></tr>
@@ -223,7 +227,10 @@
   </table>
   <div class="note warn"><b>Security.</b> Tools are unconfined by design: <code>exec</code> runs shell commands and <code>read_file</code>/<code>write_file</code> reach any path
   this process can. Anyone who can open a WebSocket to the core can run commands on this machine. Keep <code>bind</code> on loopback or set <code>token</code>, and only
-  connect frontends you control. Note what the Discord bot does to that last sentence — it bridges the core to anyone who can message the bot, so
+  connect frontends you control. Loopback alone does not keep a web page out — a page you merely visit can reach <code>127.0.0.1</code> — so requests
+  must also carry an <code>Origin</code> matching the <code>Host</code>, and a <code>Host</code> that names this machine. Both halves are needed: matching
+  Origin and Host is also what a page gets when its own domain is re-pointed at <code>127.0.0.1</code>, and only the second check, against names an
+  attacker cannot add to (<code>allowed_hosts</code>), rejects that. Note what the Discord bot does to that last sentence — it bridges the core to anyone who can message the bot, so
   <code>discord.users</code>, not <code>core.bind</code>, is what stands between a stranger and a shell. See <a href="#discord">discord</a>.</div>
 </section>
 
@@ -307,7 +314,16 @@
     <tr><td class="key"><code>level</code></td><td class="type">enum</td><td class="def"><code>INFO</code></td>
       <td><span class="tag live">live</span></td><td><code>DEBUG</code> / <code>INFO</code> / <code>WARNING</code> / … . Model-call chatter (httpx) is pinned to WARNING so it does not drown the log.</td></tr>
     <tr><td class="key"><code>file</code></td><td class="type">path</td><td class="def">unset</td>
-      <td><span class="tag restart">restart</span></td><td>Where the log is written. Restart-only, like <code>core.bind</code>/<code>core.port</code>.</td></tr>
+      <td><span class="tag restart">restart</span></td><td>Where the log is written. Restart-only, like <code>core.bind</code>/<code>core.port</code>.
+      The writer's name is inserted before the suffix — the core writes <code>letclaw-core.log</code> and the Discord bot <code>letclaw-discord.log</code>,
+      because they are two processes and one file for both would interleave their lines and rotate out from under each other.</td></tr>
+    <tr><td class="key"><code>max_bytes</code></td><td class="type">int</td><td class="def"><code>10485760</code></td>
+      <td><span class="tag restart">restart</span></td><td>Size at which the file rolls, in bytes (10&nbsp;MB). <b>Floored at 1&nbsp;MB</b>: anything smaller —
+      including <code>0</code>, which the rotating handler reads as <i>never rotate</i>, the exact opposite of what the key name promises — is refused with a
+      warning on stderr and the default is used instead. A number that cannot be read is the default too.</td></tr>
+    <tr><td class="key"><code>backups</code></td><td class="type">int</td><td class="def"><code>5</code></td>
+      <td><span class="tag restart">restart</span></td><td>How many rolled copies to keep (<code>letclaw-core.log.1</code> … <code>.5</code>). With
+      <code>max_bytes</code> this is the whole ceiling: the logs occupy at most <code>max_bytes × (backups + 1)</code> per writer.</td></tr>
     </tbody>
   </table>
 </section>
@@ -345,44 +361,48 @@
   <p class="lead">The Discord bot — a client like the terminal and the WebUI, in its own process. Only ever read by the bot; the core never imports
   <code>discord.py</code> and does not know it exists. Omit the whole section if you do not want a bot. <code>./serve.sh</code> starts it alongside the core when
   <code>enabled</code> is not false and <code>token</code> is set; <code>./run_discord.sh</code> starts one on its own, for a bot on another machine.</p>
+  <p>Read <span class="tag restart">restart</span> here as <i>restart the bot</i>, not the core — this section is the bot's own process, and the core never
+  looks at it. Only the three access keys are live, and deliberately so: <code>/reload</code> has to be able to take someone's access away, because
+  that person has an unconfined shell on this host until it does. The rest arrives on an event from the core, and re-pointing a running bot at
+  another core or silently changing how it posts on the strength of one is not what a reload should do.</p>
   <div class="note warn"><b>A bot is a remote shell.</b> The tools are unconfined, so anyone who can get a message to this bot can run commands on the machine hosting the
   core. Anyone on Discord can DM a bot by default, and in a guild the only wall is Discord's own channel permissions. So <code>users</code> is a <b>required</b> allowlist of
   snowflake IDs, and an empty list refuses everybody — the safe default, not an oversight: fill it in deliberately. (Discord → Settings → Advanced → Developer Mode, then
   right-click a user → Copy User ID.)</div>
   <table>
-    <thead><tr><th>key</th><th>type</th><th>default</th><th>what it does</th></tr></thead>
+    <thead><tr><th>key</th><th>type</th><th>default</th><th>reload</th><th>what it does</th></tr></thead>
     <tbody>
     <tr><td class="key"><code>enabled</code></td><td class="type">bool</td><td class="def"><code>true</code></td>
-      <td>The off switch. <code>false</code> keeps the bot from starting and makes <code>./run_discord.sh</code> refuse to run. Absent means enabled.</td></tr>
+      <td><span class="tag restart">restart</span></td><td>The off switch. <code>false</code> keeps the bot from starting and makes <code>./run_discord.sh</code> refuse to run. Absent means enabled.</td></tr>
     <tr><td class="key"><code>token</code></td><td class="type">string</td><td class="def">—</td>
-      <td>The bot token (config.yaml is gitignored, so it stays put). <b>Switch Message Content Intent on</b> under Privileged Gateway Intents or every message arrives empty.
+      <td><span class="tag restart">restart</span></td><td>The bot token (config.yaml is gitignored, so it stays put). <b>Switch Message Content Intent on</b> under Privileged Gateway Intents or every message arrives empty.
       Invite with the <code>bot</code> scope + Send Messages + Read Message History.</td></tr>
     <tr><td class="key"><code>core</code></td><td class="type">url</td><td class="def">from <code>core.*</code></td>
-      <td>Where the core is, <code>ws://host:port</code>. Defaults to what <code>core.bind</code>/<code>core.port</code> build.</td></tr>
+      <td><span class="tag restart">restart</span></td><td>Where the core is, <code>ws://host:port</code>. Defaults to what <code>core.bind</code>/<code>core.port</code> build.</td></tr>
     <tr><td class="key"><code>core_token</code></td><td class="type">string</td><td class="def"><code>core.token</code></td>
-      <td>The core's shared secret. Set only if the bot runs on another machine from the core.</td></tr>
+      <td><span class="tag restart">restart</span></td><td>The core's shared secret. Set only if the bot runs on another machine from the core.</td></tr>
     <tr><td class="key"><code>users</code></td><td class="type">list</td><td class="def">empty</td>
-      <td><b>Required</b> allowlist of snowflake IDs. Empty = nobody gets through, including the owner — the startup default.</td></tr>
+      <td><span class="tag live">live</span></td><td><b>Required</b> allowlist of snowflake IDs. Empty = nobody gets through, including the owner — the startup default.</td></tr>
     <tr><td class="key"><code>mention_only</code></td><td class="type">enum</td><td class="def"><code>true</code></td>
-      <td>Must the bot be addressed (@mention or a reply) before it answers in a guild channel? Hygiene, not security — it keeps the bot quiet in a busy channel. DMs always
+      <td><span class="tag live">live</span></td><td>Must the bot be addressed (@mention or a reply) before it answers in a guild channel? Hygiene, not security — it keeps the bot quiet in a busy channel. DMs always
       answer. <code>true</code> = always address it; <code>false</code> = it answers everything; <code>white</code> = address it <b>only</b> in the channels in <code>mention_list</code>;
       <code>black</code> = address it <b>everywhere except</b> those. An unreadable value falls back to <code>true</code> rather than opening the bot up. The bot prints the resolved
       answer for every channel at startup. With the rule off for a channel, a bare "yes" there can also answer a pending rollover question — reason enough to leave the busy ones on.</td></tr>
     <tr><td class="key"><code>mention_list</code></td><td class="type">list</td><td class="def">unset</td>
-      <td>Channel names, <code>#name</code>, <code>server/channel</code> when two servers share a channel name, or raw snowflakes — matched as slugs, so <code>#Ptolemy-Translation</code>
+      <td><span class="tag live">live</span></td><td>Channel names, <code>#name</code>, <code>server/channel</code> when two servers share a channel name, or raw snowflakes — matched as slugs, so <code>#Ptolemy-Translation</code>
       and <code>ptolemy-translation</code> are the same entry. A bare name matches that channel in every server. Ignored when <code>mention_only</code> is <code>true</code> or <code>false</code>.</td></tr>
     <tr><td class="key"><code>idle_detach_min</code></td><td class="type">min</td><td class="def"><code>0</code></td>
-      <td><code>0</code> (the default) = never: the channel stays attached for the life of the bot, so a turn run from the WebUI still posts to Discord and there is no idle
+      <td><span class="tag restart">restart</span></td><td><code>0</code> (the default) = never: the channel stays attached for the life of the bot, so a turn run from the WebUI still posts to Discord and there is no idle
       re-attach to get a session's name wrong. A number of minutes = the old behavior: the channel's socket is dropped when it goes idle that long and re-attached on the
       next message. The conversation is on the core either way, so nothing is lost; the link reconnects on its own with backoff and resumes by <code>last_seq</code>.</td></tr>
     <tr><td class="key"><code>max_messages</code></td><td class="type">int</td><td class="def">8</td>
-      <td>How many messages one answer may become before the whole thing goes up as an <code>answer.md</code> attachment instead of flooding the channel. <code>0</code> = unlimited —
+      <td><span class="tag restart">restart</span></td><td>How many messages one answer may become before the whole thing goes up as an <code>answer.md</code> attachment instead of flooding the channel. <code>0</code> = unlimited —
       always post in full, never file it. Safe: an answer is capped by the model's <code>max_output_tokens</code> (~65 messages at 32k, ~16 at 8k), and discord.py throttles itself
       on a 429. A busy shared channel is the reason to keep a limit; a private one is the reason not to.</td></tr>
     <tr><td class="key"><code>max_lines</code></td><td class="type">int</td><td class="def">17</td>
-      <td>Soft cap per message; Discord collapses tall ones. Fences are closed and reopened so a code block never leaks into the next message.</td></tr>
+      <td><span class="tag restart">restart</span></td><td>Soft cap per message; Discord collapses tall ones. Fences are closed and reopened so a code block never leaks into the next message.</td></tr>
     <tr><td class="key"><code>auto_names</code></td><td class="type">bool</td><td class="def"><code>true</code></td>
-      <td>Name sessions after the server and channel — <code>dudus-den-solaris</code> — rather than the raw snowflake, so the WebUI sidebar reads like Discord does. The snowflake
+      <td><span class="tag restart">restart</span></td><td>Name sessions after the server and channel — <code>dudus-den-solaris</code> — rather than the raw snowflake, so the WebUI sidebar reads like Discord does. The snowflake
       is still the key: the bot records the name it gave each channel id in <code>state/discord_names.json</code>, and when Discord's name changes it <b>renames the core
       session</b> instead of starting an empty one, so a renamed channel keeps its conversation (a WebUI rename is followed too — the channel is bound to the new name, so a
       reconnect never opens an empty twin). The server prefix is not decoration: two servers each with a <code>#general</code> is the normal case, and without it their

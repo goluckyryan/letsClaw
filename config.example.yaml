@@ -120,7 +120,17 @@ core:
                         # loopback — the core refuses to start otherwise, because the
                         # tools are unconfined. The WebUI prompts for it (the page
                         # itself is served unauthenticated). Loopback with no token is
-                        # still guarded against drive-by pages by the Origin check.
+                        # still guarded against drive-by pages: a request has to carry
+                        # both an Origin that matches the Host and a Host naming
+                        # something this machine actually answers to (see
+                        # allowed_hosts). The second half is what makes the first mean
+                        # anything — on its own, Origin-matches-Host is satisfied by a
+                        # page whose own domain has been re-pointed at 127.0.0.1.
+  # allowed_hosts: []   # extra Host header values to accept, for a reverse proxy.
+                        # Loopback, the bind address, this machine's hostname and FQDN
+                        # and the addresses they resolve to are accepted already, so
+                        # you only need this when something in front forwards a name
+                        # the core has never heard of. Picked up by /reload.
                         #
                         # bind and port are the only settings here that need a restart:
                         # the socket is already bound, and rebinding it would drop every
@@ -236,7 +246,12 @@ memory:
 # separate processes: one file for both would interleave their lines, and
 # rotating a shared file is worse still — whichever rolls it renames the file
 # out from under the other, whose log then goes nowhere.
-# Each is capped at max_bytes with `backups` rolled copies kept.
+# Each is capped at max_bytes with `backups` rolled copies kept, so the most
+# the logs can ever occupy is max_bytes × (backups + 1).
+# max_bytes has a floor of 1 MB: anything below it (and that includes 0, which
+# the rotating handler reads as "never rotate" — the exact opposite of what the
+# key name promises) is refused with a warning on stderr and the 10 MB default
+# is used instead. A cap this is meant to uncap is a cap set by accident.
 logging:
   level: "INFO"
   file: "logs/letclaw.log"

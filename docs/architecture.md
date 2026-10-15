@@ -29,20 +29,28 @@ conversation state — see
 
 | file | lines | owns |
 |---|---|---|
-| `source/core.py` | ~2130 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
-| `source/session.py` | ~680 | **the disk layer.** Live store, archives, the journal, the handoff summariser, the id registry |
-| `source/server.py` | ~330 | **the transport.** aiohttp routes, the WebSocket handler, auth, backpressure |
-| `source/llm_engine.py` | | **the model.** Two transports (`chat` and `raw`), streaming, tool-call parsing, resume |
-| `source/tools.py` | | `exec`, `read_file`, `write_file`, `list_dir`, … and their JSON schemas |
-| `source/token_counter.py` | | tiktoken when present, a 4-chars-per-token estimate otherwise |
-| `source/paths.py` | | `REPO_ROOT` and `resolve()` — [principle 15](design-principles.md#15-one-definition-of-where-the-repo-is) |
-| `source/chunker.py` | | fence-aware message splitting; separate so it tests without `discord.py` |
-| `source/chat.py` | | the terminal client |
-| `source/discord_client.py` | ~1300 | the Discord client |
-| `web/` | | the browser client (`index.html`, `app.js`, `style.css`) — vanilla JS, no build step |
+| `source/core.py` | ~2720 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
+| `source/session.py` | ~700 | **the disk layer.** Live store, archives, the journal, the handoff summariser, the id registry |
+| `source/server.py` | ~850 | **the transport.** aiohttp routes, the WebSocket handler, the Host and Origin guards, auth, backpressure |
+| `source/llm_engine.py` | ~580 | **the model.** Two transports (`chat` and `raw`), streaming, tool-call parsing, resume |
+| `source/config.py` | ~480 | **config.yaml → engines.** Loading, the webui presentation keys, number coercion, `build_all_engines` (which doubles as the validator), and the reload diff. Touches no `Session`, which is why it is not in `core` |
+| `source/behavior.py` | ~300 | **the behavior layers.** `BehaviorStore`, the read-through cache behind a lock, and the two directives extracted out of `base.md` |
+| `source/config_edit.py` | ~290 | rewriting the `webui:` block of `config.yaml` **as text**, so the file's comments survive a save |
+| `source/ssh_forward.py` | ~560 | **model servers over ssh.** One supervised `ssh -N -L` child per model entry that names an `ssh_forward`, on a port the core picks itself |
+| `source/tools.py` | ~210 | `exec`, `read_file`, `write_file`, `list_dir`, … and their JSON schemas |
+| `source/logging_setup.py` | ~110 | one rotating log file **per writer** (`letclaw-core.log`, `letclaw-discord.log`), because two processes sharing one file cannot rotate it safely |
+| `source/token_counter.py` | ~90 | tiktoken when present, a 4-chars-per-token estimate otherwise |
+| `source/paths.py` | ~75 | `REPO_ROOT` and `resolve()` — [principle 15](design-principles.md#15-one-definition-of-where-the-repo-is) |
+| `source/chunker.py` | ~310 | fence-aware message splitting; separate so it tests without `discord.py` |
+| `source/chat.py` | ~610 | the terminal client |
+| `source/ui.py` | ~90 | the terminal client's spinner and TTFT line |
+| `source/discord_client.py` | ~2300 | the Discord client |
+| `source/discord_probe.py` | ~50 | **"should the bot be started?", answered once.** `serve.sh` and `install.sh` both run it and read the verdict off the exit code; they used to each carry their own copy of the question and the copies drifted |
+| `web/` | ~2170 (`app.js`) | the browser client (`index.html`, `app.js`, `style.css`) — vanilla JS, no build step |
 
-`session.py` is imported as `store` (`core.py:33`) and **never imports
-`core`** — the dependency runs one way.
+`session.py` is imported as `store` (`core.py:36`) and **never imports
+`core`** — the dependency runs one way. Neither do `config.py`, `behavior.py`
+or `paths.py`, which is what lets a test import any of them on their own.
 
 There is no package machinery. `server.py` puts `source/` on the import path,
 so modules import each other by plain name.
@@ -57,13 +65,13 @@ Holds `history`, `engine`, the three behavior layers, per-session policy, and
 the set of attached `Subscriber`s.
 
 **Policy is copied per session, never read live off the shared config dict**
-(`core.py:423`). A session that disables its own rollover must not disable
+(`core.py:245`). A session that disables its own rollover must not disable
 everyone else's.
 
 Two odometers survive `/clear` and restarts: `total_output` and
 `rollover_count`.
 
-`session_id` — 8 hex, minted once (`core.py:457`), immediately replaced by
+`session_id` — 8 hex, minted once (`core.py:278`), immediately replaced by
 `SessionManager.get` with a registry-checked one so a collision cannot happen
 silently. See [principle 5](design-principles.md#5-identity-is-the-session-id-the-name-is-a-label).
 
@@ -92,23 +100,23 @@ Notable methods: `get` (create on demand), `restore` (eager at startup),
 
 Three free functions worth knowing before you touch the turn loop:
 
-- **`settled(history)`** (`core.py:278`) — returns a copy with any unfinished
+- **`settled(history)`** (`core.py:146`) — returns a copy with any unfinished
   trailing turn popped: trailing `tool_calls`, `role="tool"`, or `role="user"`,
   back-to-front so a whole interrupted turn unwinds as a unit. Both `persist()`
   and `repair_history()` use it, so memory and disk agree on what "finished"
   means.
-- **`truncated_tool_calls(result)`** (`core.py:303`) — calls whose `arguments`
+- **`truncated_tool_calls(result)`** (`core.py:174`) — calls whose `arguments`
   are non-empty but fail `json.loads`. **These are never run**; `rm -rf
   /tmp/scratch` truncated to `rm -rf /` is the accident this prevents. Empty
   arguments are legitimate.
-- **`strip_tool_markup(text)`** (`core.py:323`) — removes `<tool_call>…` from
+- **`strip_tool_markup(text)`** (`core.py:194`) — removes `<tool_call>…` from
   prose. Only ever relevant on the raw transport.
 
 ---
 
 ## The turn, end to end
 
-`Session.run_turn` (`core.py:747`) → `Session._turn` (`core.py:809`).
+`Session.run_turn` (`core.py:743`) → `Session._turn` (`core.py:824`).
 
 ### `run_turn` — the wrapper
 
@@ -154,29 +162,29 @@ Rollover is evaluated only after the tool loop has fully drained, so no
 
 ### The four closures inside `_turn`
 
-- **`call_round(...)`** (`core.py:907`) — the single funnel for every model
+- **`call_round(...)`** (`core.py:938`) — the single funnel for every model
   call. Measures TTFT, dispatches to `chat_with_tools` or `resume_round`, then
   `tally`, then journals **every path by construction**. This is the only place
   a pad's reasoning is ever recorded, since the pad never enters history.
-- **`tally(result, history_shaped=True)`** (`core.py:873`) — folds one round's
+- **`tally(result, history_shaped=True)`** (`core.py:893`) — folds one round's
   usage in. **`history_shaped=False` for resumed rounds**: a resume's prompt
   carries the thinking pad, which never reaches history, so letting it set
   `last_prompt` would measure the window tens of thousands of tokens fuller and
   trip a spurious rollover.
-- **`run_tools(result)`** (`core.py:974`) — appends the assistant message
+- **`run_tools(result)`** (`core.py:1028`) — appends the assistant message
   (substituting `"{}"` for truncated calls so history stays server-valid),
   **reserves every result slot up front** with `"error: cancelled"` so a turn
   torn off mid-loop still leaves a well-formed history, then per call: emit
   `tool_call` *before* running, jot, run, **full output to the journal and
   clipped output to the model**, emit `tool_result`.
-- **`push_reasoning_stat(...)`** (`core.py:847`) — counts only the new slice,
+- **`push_reasoning_stat(...)`** (`core.py:868`) — counts only the new slice,
   **cutting at the last space**, because a token carries its leading space
   (`" alpha"` is one token; `"alpha"` + `" "` is two) and cutting anywhere else
   inflates the running sum.
 
 ### Token accounting
 
-`out_exact = rounds > 0 and out_reported == rounds` (`core.py:1094`) — the
+`out_exact = rounds > 0 and out_reported == rounds` (`core.py:1232`) — the
 server's sum is trusted **only if every round reported one**. A partial sum
 looks authoritative while understating.
 
@@ -192,7 +200,7 @@ numbers for one quantity reads as a bug.
 
 ## The thinking pad
 
-`core.py:1154-1427`. The most intricate subsystem; read the section in
+`core.py:1302-1580`. The most intricate subsystem; read the section in
 [principle 6](design-principles.md#6-separate-the-notepad-from-the-answer-sheet)
 first.
 
@@ -201,7 +209,7 @@ hard and say nothing. Rather than bin that work, the reasoning becomes a *pad*
 handed back unclosed, and the model continues mid-sentence.
 
 > **The pad lives only in `_think_pad`'s local variable. It never enters
-> `history`** (`core.py:1199`), so it costs nothing after the turn and cannot
+> `history`** (`core.py:1351`), so it costs nothing after the turn and cannot
 > move the rollover point. Keep it that way.
 
 | function | |
@@ -213,7 +221,7 @@ handed back unclosed, and the model continues mid-sentence.
 | `_compact_pad(...)` | replaces the pad with `<checkpoint note> + tail`. Off by default; compaction is lossy |
 | `_forced_conclusion(...)` | the fallback when `resume_mode` resolves to `off` |
 
-**The resume loop is deliberately unbounded** (`core.py:1218`) — no round
+**The resume loop is deliberately unbounded** (`core.py:1374`) — no round
 budget, because a count is not a limit the machine actually has. It exits on:
 the time deadline, the context wall, a finished answer, a non-`length` stop, or
 **the no-progress guard** — cut off at the cap having written *nothing* means
@@ -228,14 +236,14 @@ one, because there is no way to splice a tool result into an unclosed thinking
 block without forfeiting the pad.
 
 `_forced_conclusion` has one wart worth knowing: **on success it leaves the
-directive in `history`** (`core.py:1419`), so a synthetic user message
+directive in `history`** (`core.py:1572`), so a synthetic user message
 permanently joins the conversation. Only on the non-resumable path.
 
 ---
 
 ## The four-layer system prompt
 
-`Session.fresh_history()` (`core.py:539`):
+`Session.fresh_history()` (`core.py:423`):
 
 ```python
 content = self.base_behavior                                    # models/base.md
@@ -244,7 +252,7 @@ if self.session_behavior: content += SESSION_MARKER + self.session_behavior
 if carryover:             content += CARRYOVER_MARKER + carryover
 ```
 
-**The ordering is load-bearing.** `carryover()` (`core.py:573`) recovers layer 4
+**The ordering is load-bearing.** `carryover()` (`core.py:489`) recovers layer 4
 by partitioning on `CARRYOVER_MARKER` and taking everything *after* it. Anything
 appended below would be read back as part of the handoff and re-appended on the
 next rebuild — growing the prompt every turn.
@@ -252,10 +260,17 @@ next rebuild — growing the prompt every turn.
 Corollary: a session-behavior file containing the literal string
 `=== CONTINUED SESSION ===` will silently corrupt this.
 
-**Four places rebuild `history[0]`, and each must round-trip `carryover()`:**
-`reload_session_behavior` (569), `apply_config` (634), `use_model` (1686),
-`roll_over` (1548). `restore()` avoids the problem differently — by assigning
-history *after* `use_model`, which would otherwise destroy the carryover.
+**Three places rebuild `history[0]`, and each must round-trip `carryover()`:**
+`reload_session_behavior` (455), `roll_over` (1752), `use_model` (1942).
+`restore()` avoids the problem differently — by assigning history *after*
+`use_model`, which would otherwise destroy the carryover.
+
+`apply_config` used to be a fourth and no longer is: it leaves `history`
+alone on purpose, because the prefix it would rebuild is the one the server
+has already tokenised, and rebuilding it mid-conversation costs every live
+session its KV cache for a behavior edit it did not ask for. An edited file
+is picked up instead by `refresh_behavior()` at the next rollover, `/clear`
+or `/new` — the paths that were going to replace the prefix anyway.
 
 Directives are computed from the **unstripped** base, so `strip_directives`
 removes them from the prompt without removing the core's ability to send them
@@ -267,13 +282,13 @@ Full story: [decisions/2026-09-30-session-behavior-layer.md](decisions/2026-09-3
 
 ## Rollover
 
-`_after_turn` → `_maybe_roll` → `roll_over` (`core.py:1429-1562`).
+`_after_turn` → `_maybe_roll` → `roll_over` (`core.py:1582-1780`).
 
 `trip = budget * rollover_pct / 100`; `0` disables. Modes: `auto` rolls, `ask`
 prompts (and will not re-ask until usage climbs another 5% of budget), `off`
 warns once.
 
-**The loop-breaker** (`core.py:1438`): after a successful roll, if the *fresh*
+**The loop-breaker** (`core.py:1591`): after a successful roll, if the *fresh*
 window still exceeds the trip, `rollover_pct` is set to `0` with a warning.
 That setting is runtime-mutable and persisted, which is why `apply_config` uses
 a divergence test rather than blindly reapplying config values, and why
@@ -298,7 +313,7 @@ a divergence test rather than blindly reapplying config values, and why
 
 ## Config reload
 
-`SessionManager.reload` (`core.py:1855`) is the most consequential function in
+`SessionManager.reload` (`core.py:2160`) is the most consequential function in
 the file.
 
 1. **Validate before committing.** `load_config` + `build_all_engines` in a
@@ -317,13 +332,18 @@ the file.
 6. **Close only orphaned old engines.** A session mid-stream must keep its
    engine — closing the client under it aborts the read.
 
-`apply_config` (`core.py:602`) is deliberately **synchronous and
+`apply_config` (`core.py:518`) is deliberately **synchronous and
 assignment-only**: all I/O happens in `reload` beforehand, because the deferred
 path runs inside `run_turn`'s `finally` while a `CancelledError` is
 propagating, and an `await` there can be interrupted again and leave the
 session half-updated.
 
-**Restart-only settings:** `core.bind`, `core.port`, `logging.file`.
+**Restart-only settings:** `core.bind`, `core.port`, and the three keys that
+`logging_setup.configure()` reads once when it installs the handlers —
+`logging.file`, `logging.max_bytes`, `logging.backups`. `logging.level` is
+not among them: `_reload` sets it on the root logger. Nor is
+`core.allowed_hosts`, which `_host_ok` reads off the live config dict on
+every request, so the in-place mutation in step 3 is what delivers it.
 
 **A session pinned to a model that vanished from the config keeps its engine**
 rather than being silently moved — but that engine is no longer in `_engines`,
@@ -418,7 +438,7 @@ message: half of a tool-call pair in a fresh history is a 400 from the server.
 
 ## `server.py` and the protocol
 
-See [protocol.md](protocol.md) for the full reference. The two structural
+See [protocol.md](protocol.md) for the full reference. The three structural
 points:
 
 - **The writer task is the sole owner of the socket for outbound traffic**, so
@@ -426,6 +446,19 @@ points:
   code 1013 and it reconnects with `last_seq`.
 - **`submit` runs as `create_task` and is never awaited inline**, so the reader
   stays live for `stop` and `rollover_reply` during a long turn.
+- **The browser defence is two headers, not one, and the Host half is a
+  middleware.** `_same_origin` only establishes that the browser agrees with
+  itself: Host is client-supplied, so a page on a domain re-pointed at
+  127.0.0.1 sends a matching Origin and Host honestly and passes. `_host_guard`
+  is what pins the other half, refusing any request whose Host is not a name
+  this machine answers to — loopback, the bind, the hostname and FQDN and
+  what they resolve to, computed once at `build_app` because `getaddrinfo`
+  must not run per request, plus whatever `core.allowed_hosts` adds for a
+  reverse proxy. It is a middleware rather than part of `_guard` because
+  rebinding pays off on the *read* routes too: `/sessions`, `/config` and
+  `/sessions/<name>/history` are whole conversations. `/health` is the one
+  exemption, since a container probe calls it under whatever name the
+  orchestrator invented.
 
 ---
 
@@ -442,22 +475,19 @@ explaining it; this is the index.
 4. **`self.config` is mutated in place, never rebound.**
 5. **`LIVE_SCHEMA` bumps discard users' live conversations.**
 6. **`/new` is irreversible**; `/clear` is not. Do not make them more alike.
-7. **`_last_used` is only written on a successful answer** (`core.py:1110`) but
+7. **`_last_used` is only written on a successful answer** (`core.py:1249`) but
    read unconditionally by `_after_turn`. A turn that produced no answer
    evaluates rollover against the *previous* turn's figure.
 8. **`persist()` writes `settled(history)` but does not modify the live
    history** — disk and memory intentionally disagree after an interrupted turn
    until `repair_history()` runs. Don't "fix" it.
-9. **`/reload` is intentionally outside the turn lock** (`core.py:1607`).
+9. **`/reload` is intentionally outside the turn lock** (`core.py:1827`).
    Taking it deadlocks, because `reload` defers busy sessions and would defer
    the one that asked.
 10. **An unknown command issued during a turn reports "a turn is running"**,
     not "unknown command" — the lock check precedes the fall-through.
-11. **The `for/else` at `core.py:1042`/`1059`** fires only when the tool-round
+11. **The `for/else` at `core.py:1134`/`1177`** fires only when the tool-round
     budget is exhausted without a `break`. Easy to misread as an error branch.
-12. **`extract_directive` returns `CONCLUDE_FALLBACK` for an empty *checkpoint*
-    paragraph** (`core.py:397`) — the one place the two directives are
-    conflated. A latent copy-paste.
-13. **Session names are unvalidated at creation**; only `rename` validates.
+12. **Session names are unvalidated at creation**; only `rename` validates.
     `session_behavior_path` is the double guard. If you add another place where
     a session name becomes a read path, replicate it.

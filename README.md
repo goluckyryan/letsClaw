@@ -44,9 +44,9 @@ stay behind in `.venv/lib/python3.<old>` — along with every `.so` built for th
 ABI. The symptom is a bare `ModuleNotFoundError` on the first import. Delete `.venv`
 and rebuild it; nothing else is lost.
 
-`./serve.sh` also starts the **Discord bot** when `discord.token` is set, and says so
-and carries on when it is not — so it stays the right command either way. Ctrl-C stops
-both.
+`./serve.sh` also starts the **Discord bot** when `discord.enabled` is not false and
+`discord.token` is set, and says which of the two was missing and carries on when it is
+not — so it stays the right command either way. Ctrl-C stops both.
 
 They all pass their arguments straight through:
 
@@ -137,11 +137,18 @@ letsClaw/
   config.example.yaml      the documented template to copy from
   models/                  behavior Markdown: base.md + per-model
   web/                     browser client: index.html, app.js, style.css
+  tests/                   every suite and helper; run_all.py runs them
   source/                  all Python
     paths.py                 where the repo root is — one definition
     server.py  core.py       the core service and the session logic
+    config.py                config.yaml → engines; building them is the validation
+    behavior.py              the behavior-file cache and the base.md directives
+    config_edit.py           saving the webui: block back into config.yaml as text
+    logging_setup.py         one rotating log file per writer, core and bot
+    ssh_forward.py           supervised ssh -L forwards to remote model servers
     chat.py    ui.py         the terminal client
     discord_client.py        the Discord client
+    discord_probe.py         "start the bot?", asked by serve.sh and install.sh
     chunker.py               splitting an answer into messages Discord accepts
     llm_engine.py            talking to the model server
     session.py               persistence, archives, rollover handoffs
@@ -880,11 +887,16 @@ Start `./serve.sh` once; clients come and go around it.
 | | |
 |---|---|
 | `GET /health` | liveness + protocol version |
-| `GET /models` | configured models |
+| `GET /models` | configured models, and the state of any ssh forwards |
 | `GET /sessions` | live sessions: model, message count, attached clients, busy |
+| `GET /sessions/<name>/history` | the tail of one conversation, newest last — `?limit=` messages (10 by default), system message omitted. Capped on purpose: a switch digest wants the last few lines, not a slow copy of everything |
 | `POST /sessions/<name>/rename` | `{"to": "..."}` — same conversation, different name |
 | `DELETE /sessions/<name>` | forget one — the history is discarded, nothing is written |
 | `POST /reload` | re-read `config.yaml` into the running core; `400` and no change if it will not load |
+| `GET /config` | the live config for the Settings panel, with `core.token`, `discord.token` and every `models.<name>.api_key` replaced by a placeholder — redacted rather than dropped, so the panel can still tell "set" from "unset" |
+| `POST /config` | save `{"webui": {…}}` back into `config.yaml` and apply it. Only that section is accepted: it is the one a browser has any business editing, and the only one whose change needs no restart |
+| `GET /theme.css` | the `webui.pin` styling as CSS custom properties, generated from the config so `/reload` re-themes without a restart |
+| `GET /files/<name>` | an image the agent wrote into `webui.files_dir`, for the WebUI to show inline — see [WebUI](#webui) |
 | `WS /ws?session=<name>` | the live stream |
 | `GET /` , `GET /static/*` | the WebUI, from `web/` |
 
@@ -904,14 +916,33 @@ It is clamped to 64 characters and falls back to the session name.
 
 When `core.token` is set every route above needs it — as `Authorization: Bearer <token>`
 or `?token=` — **except** `GET /health`, which stays open so a monitor can check
-liveness without holding the secret, and the WebUI itself, which holds no secrets and is
-the thing that asks for the token. Each client carries it its own way: the WebUI in the
+liveness without holding the secret, and the WebUI itself (`GET /`, `/static/*` and the
+generated `/theme.css`), which holds no secrets and is the thing that asks for the
+token. `/files/<name>` is the one route that takes the token *only* by query
+parameter, because it is fetched by the browser's own `<img>` loader, which cannot be
+given a header. Each client carries it its own way: the WebUI in the
 token gate (kept in the browser's `localStorage`), the Discord bot from `core.token` in
 the config it loads (or `discord.core_token` when it runs elsewhere), and the terminal
 client from `--token`, the `CLAW_TOKEN` env var, or — when it runs on the same machine
 as its core — the `core.token` in the local `config.yaml`, so a local attach needs no
 extra step. A terminal client pointed at a core whose token it cannot see is told exactly
 that, with the two ways to pass one.
+
+A token is not what keeps a web page out, though, because on loopback there is often no
+token to keep it out with. That job belongs to two headers, and it takes both. A browser
+attaches `Origin` to every cross-origin request and to the WebSocket handshake and cannot
+forge it, so an `Origin` that does not name this very server is refused; a client that
+sends none at all — the terminal, the bot, `curl` — is unaffected, because the attack being
+closed is specifically a browser and a browser always tells us. On its own that only says
+the browser agrees with itself: it is compared against `Host`, and `Host` comes from the
+client too, so a page served from a domain whose address has been re-pointed at `127.0.0.1`
+sends a matching pair perfectly honestly. So every route except `GET /health` must also
+carry a **`Host` this machine actually answers to** — loopback, the `core.bind` address,
+the hostname and FQDN, and whatever those resolve to. A nameserver can point any name
+here; it cannot add that name to the allowlist. If something in front of the core forwards
+a name the core has never heard of — a reverse proxy — list it in **`core.allowed_hosts`**,
+which is read per request and so needs only a `/reload`. Both refusals are a `403` with
+the reason, and a line in the log saying which header it was.
 
 **Sessions** are created on demand by name — `terminal`, `discord-987654321098765432`,
 whatever a client asks for. Each has its own history, model and rollover state; `/model` in one
@@ -948,9 +979,9 @@ Three tiers:
 
 | | |
 |---|---|
-| **Live already** | `core.token`, the `state/` paths, and the model list `GET /models` serves — these are read per request, so the reload is what updates the file, not what plumbs it through |
-| **Reload picks it up** | **every setting in every model entry** — the engines are rebuilt from scratch, so `context_length`, `base_url`, `provider_name`, the sampling parameters, and all of the reasoning settings (`reasoning`, `max_tokens`, `max_output_tokens`, `max_pad_compactions`, `turn_timeout`, `answer_time_reserve`, `resume_mode`, `reasoning_effort`) come across; added and removed models; behavior files including `base.md`; the tool allowlist and `exec_timeout`; `max_iterations`; every `conversation.*` setting; `logging.level` |
-| **Restart-only** | `core.bind` and `core.port` — the socket is already bound, and rebinding drops every client, which is the thing being avoided — and `logging.file` |
+| **Live already** | `core.token`, `core.allowed_hosts`, the `state/` paths, and the model list `GET /models` serves — these are read per request, so the reload is what updates the file, not what plumbs it through |
+| **Reload picks it up** | **every setting in every model entry** — the engines are rebuilt from scratch, so `context_length`, `base_url`, `provider_name`, the sampling parameters, and all of the reasoning settings (`reasoning`, `max_tokens`, `max_output_tokens`, `max_pad_compactions`, `turn_timeout`, `answer_time_reserve`, `resume_mode`, `reasoning_effort`) come across; added and removed models; behavior files including `base.md`; the tool allowlist and `exec_timeout`; `max_iterations`; every `conversation.*` setting; `logging.level`; and, in the bot's own process, the Discord allowlist (`discord.users`, `mention_only`, `mention_list`) — see [Discord Client](#discord-client) |
+| **Restart-only** | `core.bind` and `core.port` — the socket is already bound, and rebinding drops every client, which is the thing being avoided — and the three keys that are read once when the log handlers are installed: `logging.file`, `logging.max_bytes`, `logging.backups`. On the bot's side, `discord.enabled` (`serve.sh` reads it before deciding to launch at all) and the three that say *where* the bot logs in — `discord.token`, `discord.core`, `discord.core_token` |
 
 An idle session takes the change immediately; one mid-turn takes it the moment that turn
 ends, and the reply says how many of each. **A setting a session changed for itself is
@@ -1042,10 +1073,10 @@ loop through a queue: the prompt stays editable while an answer streams in above
 plus the vendored KaTeX in `web/vendor/`, served by the core. No framework, no build
 step, no CDN: the core often sits on an isolated lab network, so everything the page
 needs comes from the core itself — which is why KaTeX is a checked-in copy rather than
-a CDN link. Note the `/static/` route serves the whole `web/` directory, so the test
-helpers (`test_md.mjs`, `browser_test.py`, `shot.py`) are also reachable under it —
-harmless while the core is loopback-bound, but something to keep in mind before
-exposing the port.
+a CDN link. The `/static/` route serves the whole `web/` directory, which used to
+mean the test helpers (`test_md.mjs`, `browser_test.py`, `shot.py`) were reachable
+under it too; they now live in `tests/`, which the core does not serve, so the
+directory holds only the three files and the vendored KaTeX.
 
 **The sidebar** on the left is the session list, rebuilt from `GET /sessions` rather
 than tracked locally, so a session someone started in another window shows up here
@@ -1111,18 +1142,25 @@ A formula KaTeX rejects is shown in the theme's error colour with its source int
 rather than taking the message down, and if KaTeX fails to load the page falls back to
 showing the TeX source in a code span.
 
-**Tests.** `node web/test_md.mjs` exercises the markdown renderer headlessly;
-`node web/test_math.mjs` does the same against the real vendored KaTeX,
-`.venv/bin/python web/math_test.py` checks the rendered maths in a real browser
-(fonts, metrics, colour, overflow) without sending a turn,
-`.venv/bin/python web/files_test.py` covers the `/files` route's confinement with
-no core or browser at all, and `.venv/bin/python web/image_test.py` checks that an
+**Tests.** Every suite and helper lives in `tests/`, whatever it tests, and
+`.venv/bin/python tests/run_all.py` runs them all: the fast tier on its own is
+hermetic — no network, no ssh, no browser, no spawned core — and `--full` adds the
+ones that need something from outside the process. `test_browser.py`,
+`test_image.py` and `test_math_render.py` stay skipped even under `--full` until
+you also set `CORE=`: they create and delete sessions on whatever core it names,
+and they will not default to your real one. Individually:
+`node tests/test_md.mjs` exercises the markdown renderer headlessly;
+`node tests/test_math.mjs` does the same against the real vendored KaTeX,
+`.venv/bin/python tests/test_math_render.py` checks the rendered maths in a real
+browser (fonts, metrics, colour, overflow) without sending a turn,
+`.venv/bin/python tests/test_files.py` covers the `/files` route's confinement with
+no core or browser at all, and `.venv/bin/python tests/test_image.py` checks that an
 image actually decodes, paints, stays inside its column and does not break the
 auto-scroll.
-`.venv/bin/python web/browser_test.py` drives real headless Chrome over the DevTools
+`.venv/bin/python tests/test_browser.py` drives real headless Chrome over the DevTools
 Protocol against a running core — no Selenium, no Playwright, nothing to install —
 and asserts against the live DOM, so a JS error that stops the render fails a check
-rather than passing quietly. `web/shot.py <session> [out.png] [dark|light]` takes a
+rather than passing quietly. `tests/shot.py <session> [out.png] [dark|light]` takes a
 screenshot; both themes follow `prefers-color-scheme`.
 
 ## Discord Client
@@ -1146,6 +1184,15 @@ the conversation.
 > Discord's own channel permissions. So `discord.users` is a **required**
 > allowlist of snowflake IDs: an empty list refuses everybody, which is the
 > startup default rather than an oversight.
+>
+> **Taking someone's access away is a `/reload`, not a restart.** `discord.users`,
+> `mention_only` and `mention_list` are re-read by every attached bridge when the
+> core announces a reload, and nothing else in the `discord:` section is touched —
+> a reload is not a reason to re-point a running bot at a different core. It fails
+> closed: a `config.yaml` that will not parse leaves the allowlist already in force
+> rather than widening it. An allowlist that needed a restart would not be one, and
+> for a while this was exactly that — removing a snowflake and reloading printed
+> "♻️ config reloaded" and changed nothing at all.
 
 **Setup.** Make a bot at <https://discord.com/developers/applications> → New
 Application → Bot. Copy its token into `config.yaml` under `discord.token`
@@ -1283,10 +1330,10 @@ if *linger* is on — the script checks and tells you; if it is off,
 sudo loginctl enable-linger <you>
 ```
 
-The **system** unit (`--system`) starts at boot regardless of login. Only the
-`core.bind`/`core.port` and `logging.file` settings need a restart to change
-(see [Reloading config](#reloading-config)); everything else is picked up by
-`/reload`.
+The **system** unit (`--system`) starts at boot regardless of login. Only
+`core.bind`/`core.port` and the `logging.file`/`max_bytes`/`backups` settings need
+a restart to change (see [Reloading config](#reloading-config)); everything else is
+picked up by `/reload`.
 
 ```bash
 systemctl [--user] status letsClaw          # is it running
@@ -1313,9 +1360,9 @@ comments, for people who would rather read the template.
 
 **Key sections:**
 - `models` — Registry of named models. Each entry is self-contained: its own `base_url` (required), `api_key`, exact server model ID (`provider_name`), behavior file, `context_length` and sampling parameters — so two models can live on two different servers with different window sizes, and reading one entry tells you everything about that model. `default_model` picks the model a new session starts on; `/model <name>` switches one session at runtime without disturbing the others.
-- `core` — The service itself: `bind` (loopback by default — see the security note above), `port` (the WebUI is on the same one), and `token`, an optional shared secret. `--bind` / `--port` / `--config` on `./serve.sh` override the first three.
+- `core` — The service itself: `bind` (loopback by default — see the security note above), `port` (the WebUI is on the same one), `token`, an optional shared secret, and `allowed_hosts`, extra `Host` header values to accept for a reverse proxy in front of the core (loopback, the bind, this machine's hostname and FQDN and the addresses they resolve to are already accepted). `--bind` / `--port` / `--config` on `./serve.sh` override the first three.
 - `tools` — Agent tools: enable flag, allowlist, `max_iterations` (tool rounds per turn before a final answer is forced), `exec_timeout`, `max_output_chars`, and `workdir` — the base directory `exec` runs in and relative paths resolve against, defaulting to the letsClaw directory.
 - `conversation` — `max_history_messages`, a backstop that trims the oldest messages (never opening on an orphaned tool result) and only applies on turns where no rollover happened — rollover is the real mechanism, this just stops an unbounded session with rollover switched off. Then rollover policy: `rollover_at_percent` (0 disables), `rollover_mode` (`auto`/`ask`/`off`), `prompt_timeout` (seconds to wait for an answer in `ask` mode before keeping the session). Two directories: `live_dir` holds the running conversations and is reloaded at startup, `sessions_dir` holds archived transcripts and the journal segments beside them. Then the journal itself: `journal` (default true — the `.md` record of every round's reasoning and every untruncated tool result, which is what stops a rolled-over window repeating work; see [The journal](#the-journal)) and `journal_max_block_chars` (default 1,000,000, the cap on one recorded block). The context window itself is per model, under `models`.
 - `discord` — the Discord bot, and only ever read by it: `enabled` (the off switch — `false` keeps the bot from starting and makes `./run_discord.sh` refuse to run; absent means enabled), `token` (the bot token), `core`/`core_token` (where the core is and its shared secret, both defaulting to the `core` section above), `users` — the **required** allowlist of snowflake IDs, empty meaning nobody — `mention_only` (`true`/`false`/`white`/`black`) with `mention_list`, `idle_detach_min` (`0` = never, the default — the channel stays attached so a WebUI turn still posts to Discord), `max_messages`/`max_lines` for how an answer is split (`max_messages: 0` = unlimited), and `auto_names` (sessions named `<server>-<channel>`, renamed to follow Discord). Omit the whole section if you do not want a bot. See [Discord Client](#discord-client) for the security note that goes with it.
 - `memory` — `long_term_file`, where rollover handoffs accumulate
-- `logging` — `level` and `file`; the core logs there and to stderr, and every session event of consequence (restore, rename, delete, rollover, a dropped tool-call turn) is one line in it.
+- `logging` — `level`, `file`, and the rotation ceiling, `max_bytes` (default 10 MB, and anything under a 1 MB floor is not believed, because `0` would mean "never rotate") with `backups` (default 5). Each process logs to stderr and to a file of its own: the writer's name goes into the stem, so `logs/letclaw.log` becomes `letclaw-core.log` and `letclaw-discord.log`. Two processes appending to one file interleave their lines, and worse, whichever one rotated it would rename the file out from under the other — one file per writer is what makes the ceiling safe, not a tidiness on top of it. Every session event of consequence (restore, rename, delete, rollover, a dropped tool-call turn) is one line in there.
