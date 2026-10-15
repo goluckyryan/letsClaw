@@ -66,6 +66,108 @@ def _configure_logging(config):
 # "loopback" means.
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
 
+
+def _split_host_port(host):
+    """The hostname out of a Host header, with any port removed.
+
+    Three shapes to get right, and the bracket one is why this is not a
+    rsplit: `example:8770`, `[::1]:8770`, and a bare `[::1]` — splitting that
+    last one on the final colon returns `:1]`, which matches nothing and would
+    refuse a legitimate IPv6 loopback.
+    """
+    host = host.strip().lower()
+    if host.startswith("["):
+        end = host.find("]")
+        return host[1:end] if end != -1 else host[1:]
+    # A bare IPv6 literal has several colons and no brackets. It is invalid in
+    # a Host header, but refusing to parse it is friendlier than lopping a
+    # group off the end and comparing the wreckage.
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+def _machine_hostnames(bind):
+    """Every name this machine legitimately answers to, for the Host check.
+
+    Deliberately generous. A name missing from here is a 403 on page load for
+    someone who did nothing wrong, so this collects loopback, the bind, the
+    machine's own hostname and FQDN, and every address those resolve to. What
+    it can never collect is a name on someone else's nameserver, which is the
+    whole point — see _host_ok.
+    """
+    names = {"localhost", "127.0.0.1", "::1"}
+    if bind and bind not in ("0.0.0.0", "::"):
+        names.add(bind.strip("[]").lower())
+    try:
+        hostname = socket.gethostname()
+        names.add(hostname.lower())
+        names.add(socket.getfqdn(hostname).lower())
+        for info in socket.getaddrinfo(hostname, None):
+            names.add(info[4][0].split("%")[0].lower())
+    except (OSError, UnicodeError):
+        # No DNS, no /etc/hosts entry for ourselves, an unresolvable hostname:
+        # all survivable. Loopback is already in the set and that is the case
+        # this check exists to keep working.
+        pass
+    lan = _lan_ip()
+    if lan:
+        names.add(lan)
+    return names
+
+
+def _host_ok(request):
+    """Whether the Host header names this server, rather than merely agreeing
+    with itself.
+
+    This is what makes the Origin check below mean anything. `_same_origin`
+    compares Origin to Host, and Host is chosen by the client — so a page on
+    a domain whose A record has been re-pointed at 127.0.0.1 (DNS rebinding)
+    sends a matching, entirely honest Origin and Host pair, and sails through.
+    The browser is not lying and nothing is forged; the name itself moved.
+
+    So the pair is only evidence once one half is pinned to something an
+    attacker cannot choose: a name this machine actually answers to. Their
+    nameserver can point any name at this address, but it cannot put that name
+    in our allowlist. `core.allowed_hosts` extends it for a reverse proxy,
+    which legitimately forwards a Host we have never heard of.
+    """
+    host = request.headers.get("Host", "")
+    if not host:
+        # HTTP/1.1 requires it and every browser and proxy sends it. Its
+        # absence is not a case to be lenient about.
+        return False
+    extra = request.app["config"].get("core", {}).get("allowed_hosts") or []
+    if isinstance(extra, str):
+        extra = [extra]
+    allowed = request.app.get("allowed_hosts", set()) | {
+        str(h).strip().lower() for h in extra}
+    return _split_host_port(host) in allowed
+
+
+@web.middleware
+async def _host_guard(request, handler):
+    """Refuse anything addressed to a name that is not ours, before it routes.
+
+    Here rather than in `_guard` because the rebinding payoff is not only the
+    write routes: once the browser believes the attacker's page is same-origin
+    with us, it can read `/sessions`, `/config` and whole conversations out of
+    `/sessions/<name>/history` too. The page itself and `/theme.css` are in
+    scope for the same reason — an unauthenticated stylesheet whose computed
+    values can be read back is a reliable "letsClaw is running here" oracle.
+
+    `/health` stays open: it is documented as needing nothing, it says only
+    that the process is up, and it is what a monitor or a container probe
+    calls — often through whatever name the orchestrator made up.
+    """
+    if request.path == "/health":
+        return await handler(request)
+    if not _host_ok(request):
+        logger.warning("refused %s %s addressed to Host %r — not a name this "
+                       "core answers to (add it to core.allowed_hosts if it "
+                       "should be)", request.method, request.path,
+                       request.headers.get("Host", ""))
+        raise web.HTTPForbidden(reason="unrecognised Host header")
+    return await handler(request)
+
 # What /config shows in place of a secret. Non-empty, so the Settings panel can
 # still tell that a token is set; nothing like a real token, so it cannot be
 # mistaken for one or accidentally saved back as one.
@@ -81,7 +183,13 @@ def _authorised(request):
     # compare_digest, not ==: string equality returns as soon as two bytes
     # differ, so its running time leaks how long a correct prefix was and a
     # patient client can recover the token one character at a time.
-    return secrets.compare_digest(sent, token)
+    #
+    # Encoded first, because compare_digest raises TypeError on a str holding
+    # anything outside ASCII. Unencoded, a token with an accent in it made
+    # every authenticated request 500 for the life of the process — including
+    # the owner's own WebUI — and let an unauthenticated client fill the log
+    # with tracebacks by sending ?token=%C3%A9.
+    return secrets.compare_digest(sent.encode("utf-8"), token.encode("utf-8"))
 
 
 def _same_origin(request):
@@ -98,6 +206,12 @@ def _same_origin(request):
     and a browser always tells us. An Origin that is present must name this very
     server, port included — another port on localhost is a different origin and
     is exactly where a hostile page would be served from.
+
+    Note what this does NOT establish on its own. Host is a client-supplied
+    header, so this equality says only that the browser is consistent with
+    itself; a rebound DNS name satisfies it honestly. `_host_guard` is what
+    pins Host to a name that is really ours, and the two together are the
+    check this docstring used to claim to be by itself.
     """
     origin = request.headers.get("Origin")
     if origin is None:
@@ -578,20 +692,44 @@ async def _on_shutdown(app):
     # ping and its pong timeout to fail and tear the connection down — and
     # longer still with the heartbeat off. With it, shutdown is immediate, and
     # clients get a close frame instead of a socket that stops answering.
-    for ws in set(app["websockets"]):
-        await ws.close(code=WSCloseCode.GOING_AWAY, message=b"core shutting down")
-    for s in app["mgr"].sessions.values():
-        for sub in list(s.subscribers):
-            s.detach(sub)
-    await app["mgr"].close()
+    #
+    # Closed concurrently rather than one at a time, because the await was the
+    # window: `set(...)` copies, so the classic mutation-during-iteration was
+    # already avoided, but suspending inside the loop let `ws_handler` add to
+    # the same WeakSet between steps — a WebUI reconnecting on its timer, or
+    # the bot reconnecting the instant its link drops, both entirely normal
+    # during a shutdown. The next step then raised RuntimeError out of
+    # on_shutdown and skipped mgr.close() below, so the core exited with every
+    # session unsaved: precisely the loss this handler exists to prevent.
+    # gather() builds its task list from one synchronous snapshot and never
+    # touches the set again.
+    closes = [ws.close(code=WSCloseCode.GOING_AWAY, message=b"core shutting down")
+              for ws in list(app["websockets"])]
+    try:
+        # return_exceptions, so one socket that cannot be closed does not take
+        # the other closes — or the persist below — down with it.
+        await asyncio.gather(*closes, return_exceptions=True)
+        for s in app["mgr"].sessions.values():
+            for sub in list(s.subscribers):
+                s.detach(sub)
+    finally:
+        # In a finally for the same reason: no amount of socket bookkeeping
+        # going wrong is worth losing the conversations.
+        await app["mgr"].close()
 
 
-def build_app(config, config_path=None):
-    app = web.Application()
+def build_app(config, config_path=None, bind=None):
+    app = web.Application(middlewares=[_host_guard])
     app["config"] = config
     app["config_path"] = config_path
     app["mgr"] = core.SessionManager(config, config_path)
     app["websockets"] = weakref.WeakSet()
+    # Resolved once: gethostname/getaddrinfo can block on a slow resolver, and
+    # this must not happen per request. `bind` defaults from the config so a
+    # caller that builds an app without going through main() — every test that
+    # does — gets the same allowlist the real core would have.
+    app["allowed_hosts"] = _machine_hostnames(
+        bind or config.get("core", {}).get("bind", "127.0.0.1"))
     app.add_routes([
         web.get("/health", health),
         web.get("/models", models),
@@ -652,14 +790,35 @@ def main():
     ap.add_argument("--config")
     args = ap.parse_args()
     try:
-        config = configlib.load_config(args.config)
+        # ensure_config, not load_config: a fresh clone has no config.yaml at all
+        # (it is gitignored), and the old behaviour was a traceback-free "❌ No
+        # config.yaml" and an exit — which left a person with nothing to edit.
+        # This writes a starter file with one model whose base_url is empty, so
+        # the core boots, the WebUI opens, and the first turn says exactly which
+        # line to fill in. A file that exists but is someone's work is never
+        # overwritten — see ensure_config for the three cases.
+        config, created = configlib.ensure_config(args.config)
     except (FileNotFoundError, Exception) as e:
         print(f"❌ {e}")
         sys.exit(1)
     _configure_logging(config)
+    if created:
+        print(f"⚠️  wrote a starter config to {args.config or configlib.CONFIG_PATH}"
+              " — no model is configured yet, so fill in models.local.base_url")
+        print("   (config.example.yaml is the fully commented template; "
+              "docs/config.html is the reference)")
     core_cfg = config.get("core", {})
     bind = args.bind or core_cfg.get("bind", "127.0.0.1")
-    port = args.port or int(core_cfg.get("port", 8770))
+    # Not int_or: silently falling back to 8770 would start a core on a port
+    # the person did not ask for and did not know about, and every client
+    # reading the same config would then fail to reach it. A bad port is worth
+    # stopping for — but with a message naming the key, not a traceback.
+    try:
+        port = args.port or int(core_cfg.get("port", 8770))
+    except (TypeError, ValueError):
+        print(f"❌ core.port is {core_cfg.get('port')!r}, which is not a port "
+              "number — fix it in config.yaml (the default is 8770)")
+        sys.exit(1)
 
     # An unconfined `exec` on an address other machines can reach, with nothing
     # asked of whoever connects, is not a warning — it is a remote shell for the
@@ -672,7 +831,7 @@ def main():
               "127.0.0.1.")
         sys.exit(1)
 
-    app = build_app(config, args.config)
+    app = build_app(config, args.config, bind)
     print(f"🧠 letsClaw core on ws://{bind}:{port}/ws  (proto {core.PROTOCOL_VERSION})")
     if (WEB_DIR / "index.html").exists():
         print(f"   WebUI:  http://{_webui_host(bind)}:{port}/")
