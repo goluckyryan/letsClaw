@@ -28,6 +28,9 @@ FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 # weeks of INFO at the rate above and still small enough to grep whole.
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 DEFAULT_BACKUPS = 5
+# The smallest ceiling that is still a ceiling. Below this the number is not
+# believed and the default is used instead; see _max_bytes().
+MIN_MAX_BYTES = 1024 * 1024
 
 
 def _int(value, default, key):
@@ -43,6 +46,31 @@ def _int(value, default, key):
         print(f"⚠️  logging.{key}: expected a number, got {value!r} — "
               f"using {default}", file=sys.stderr)
         return default
+
+
+def _max_bytes(value):
+    """logging.max_bytes, clamped to something that really is a ceiling.
+
+    RotatingFileHandler reads maxBytes=0 as "never rotate" — Python's
+    documented behaviour, and the exact opposite of what a key called
+    max_bytes promises. A zero (or a negative, or a few hundred bytes typed
+    by mistake) would put back the unbounded file this module exists to stop,
+    silently, because _int() is perfectly happy with 0 as a number.
+
+    So anything under the floor is not believed: the default is used and the
+    reason goes to stderr, the same way a non-number does. The alternative —
+    honouring 0 as "no rotation" — is honest too, but it leaves the footgun
+    loaded, and nobody who wants an unbounded log is reaching for a key named
+    max_bytes to ask for it.
+    """
+    n = _int(value, DEFAULT_MAX_BYTES, "max_bytes")
+    if n < MIN_MAX_BYTES:
+        why = "would never rotate" if n <= 0 else "is not a useful ceiling"
+        print(f"⚠️  logging.max_bytes: {n} {why} — below the "
+              f"{MIN_MAX_BYTES} byte floor, using {DEFAULT_MAX_BYTES}",
+              file=sys.stderr)
+        return DEFAULT_MAX_BYTES
+    return n
 
 
 def configure(config, stem):
@@ -65,8 +93,7 @@ def configure(config, stem):
             p.parent.mkdir(parents=True, exist_ok=True)
             handlers.append(logging.handlers.RotatingFileHandler(
                 p,
-                maxBytes=_int(cfg.get("max_bytes", DEFAULT_MAX_BYTES),
-                              DEFAULT_MAX_BYTES, "max_bytes"),
+                maxBytes=_max_bytes(cfg.get("max_bytes", DEFAULT_MAX_BYTES)),
                 backupCount=_int(cfg.get("backups", DEFAULT_BACKUPS),
                                  DEFAULT_BACKUPS, "backups"),
                 # Logs carry the emoji the clients print and whatever the model
