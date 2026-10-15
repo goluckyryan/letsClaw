@@ -56,21 +56,35 @@ setup_env() {
     .venv/bin/python -m pip install -r requirements.txt
   fi
   # The bot is a separate dependency: only required if the config will start
-  # it, mirroring serve.sh's own check (enabled + token present).
-  if .venv/bin/python -c "
-import sys
-sys.path.insert(0, 'source')
-from config import load_config
-cfg = load_config(None)
-d = cfg.get('discord') or {}
-sys.exit(0 if d.get('enabled', True) is not False and
-             str(d.get('token') or '').strip() else 1)
-" 2>/dev/null; then
-    if ! .venv/bin/python -c "import discord" 2>/dev/null; then
-      echo "→ discord is enabled in config.yaml — installing discord.py"
-      .venv/bin/python -m pip install -r requirements.txt
-    fi
-  fi
+  # it. The same question serve.sh asks, asked by the same script — this used
+  # to be a second hand-written copy of that check, and it was the copy that
+  # had not learned to tell an exception from an answer: `else 1` plus a
+  # discarded stderr meant a renamed import, a broken config, anything at all,
+  # arrived here looking exactly like "no token". discord.py then went
+  # uninstalled on a fresh install with the bot enabled, and the reason for it
+  # was thrown away. Codes: 0 install it, 2 disabled, 3 no token, 4 no config
+  # yet (setup_config has not run), anything else = the probe itself raised.
+  #
+  # Declared before the assignment rather than on it, because `local x=$(...)`
+  # reports local's own status — always 0 — and the status is the whole answer
+  # here. And `|| probe_status=$?` rather than a bare assignment, because this
+  # script runs under set -e and every verdict except 0 is a non-zero exit: an
+  # unguarded assignment would end the install on a config that simply has the
+  # bot switched off.
+  local probe_err probe_status=0
+  probe_err=$(.venv/bin/python source/discord_probe.py 2>&1 >/dev/null) \
+    || probe_status=$?
+  case "$probe_status" in
+    0) if ! .venv/bin/python -c "import discord" 2>/dev/null; then
+         echo "→ discord is enabled in config.yaml — installing discord.py"
+         .venv/bin/python -m pip install -r requirements.txt
+       fi ;;
+    2|3|4) ;;    # a real answer, and the answer is "the bot is not wanted"
+    *) echo "   ⚠️  could not read the discord config — skipping discord.py"
+       if [ -n "$probe_err" ]; then
+         printf '%s\n' "$probe_err" | sed 's/^/      /'
+       fi ;;
+  esac
 }
 
 # --- 2. config ----------------------------------------------------------------

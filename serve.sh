@@ -23,6 +23,15 @@ done
 
 core_pid=""
 bot_pid=""
+# Set when a signal, rather than the core finishing on its own, started the
+# shutdown. A signal-initiated stop is a clean stop and must exit 0:
+# `systemctl --user stop letsClaw.service` sends SIGTERM to the whole cgroup,
+# the core died of it, and `wait` handed us its status — so every ordinary
+# stop left the unit in `failed (Result: exit-code, status=2)`, a red × in
+# `systemctl status` and a page for anything watching the unit. The core's own
+# exit status still stands when it exits by itself, which is the case
+# Restart=on-failure is actually for.
+signalled=0
 
 cleanup() {
   trap - INT TERM EXIT
@@ -31,8 +40,11 @@ cleanup() {
   [ -n "$bot_pid" ] && kill "$bot_pid" 2>/dev/null
   [ -n "$core_pid" ] && kill -INT "$core_pid" 2>/dev/null
   wait 2>/dev/null
+  [ "$signalled" = 1 ] && exit 0
 }
-trap cleanup INT TERM EXIT
+on_signal() { signalled=1; cleanup; }
+trap on_signal INT TERM
+trap cleanup EXIT
 
 "$PY" source/server.py "${args[@]}" &
 core_pid=$!
@@ -42,36 +54,45 @@ if [ "$want_discord" = 1 ]; then
   # the core just read, and honouring --config if one was passed.
   cfg_arg=""
   for ((i = 0; i < ${#args[@]}; i++)); do
-    [ "${args[i]}" = "--config" ] && cfg_arg="${args[i+1]}"
+    # Both spellings: argparse accepts --config=X as readily as --config X,
+    # and the version that only looked for the separated form left cfg_arg
+    # empty for the joined one — so the probe read the *default* config while
+    # the core read the one that was asked for, and the two disagreed about
+    # whether discord was even on.
+    case "${args[i]}" in
+      --config)   cfg_arg="${args[i+1]}" ;;
+      --config=*) cfg_arg="${args[i]#--config=}" ;;
+    esac
   done
-  # The exit code is the verdict: 0 = start it, 2 = disabled, 3 = no token.
-  # Absent `enabled` means enabled, so a config that never had the key is
-  # unaffected; a token that is set but disabled is a token that does nothing.
+  # The exit code is the verdict: 0 = start it, 2 = disabled, 3 = no token,
+  # 4 = no config at all, and 1 = the probe itself raised. The table and the
+  # reasons behind it live in source/discord_probe.py, which install.sh runs
+  # too: this same question used to be asked twice, in two hand-written copies,
+  # and they drifted until install.sh was calling every exception "no token".
   #
-  # Deliberately not 1 for "no token": 1 is what Python exits with on an
-  # uncaught exception, so the two were indistinguishable — and this probe
-  # imports from the source tree, so a rename there is exactly the kind of
-  # thing that raises here. It did: `from core import load_config` outlived
-  # the move to config.py, and with stderr discarded the bot simply stopped
-  # starting, under a message saying the token was missing. An unknown status
-  # now says so and shows what Python printed.
-  probe_err=$("$PY" -c "
-import sys
-sys.path.insert(0, 'source')
-from config import load_config
-cfg = load_config(sys.argv[1] or None)
-d = cfg.get('discord') or {}
-sys.exit(2 if d.get('enabled', True) is False else
-         0 if str(d.get('token') or '').strip() else 3)
-" "$cfg_arg" 2>&1 >/dev/null)
+  # Run as a path rather than -c, so that argv[0] puts source/ on sys.path the
+  # way `"$PY" source/server.py` above does.
+  probe_err=$("$PY" source/discord_probe.py "$cfg_arg" 2>&1 >/dev/null)
   # Captured once: `[ $? -eq 2 ]` in an elif chain overwrites $? with its own
   # result, so every later test read the comparison, not the command.
   probe_status=$?
+  # "No config" only means "first run" when nobody named one. The core, started
+  # a moment ago in the background, is writing a starter config.yaml right now —
+  # true when the path is the default, and a lie when --config pointed at a file
+  # that is not there: nothing is going to appear at that path, and the message
+  # sent the reader off waiting for it. A named path that is missing is just a
+  # config that could not be read, so say that instead.
+  if [ "$probe_status" = 4 ] && [ -n "$cfg_arg" ]; then
+    probe_status=1
+    probe_err="no config file at $cfg_arg"
+  fi
   case "$probe_status" in
     0) ;;
     2) echo "   (discord.enabled is false — Discord bot not started)"
        want_discord=0 ;;
     3) echo "   (no discord.token — Discord bot not started)"
+       want_discord=0 ;;
+    4) echo "   (no config.yaml yet — the core just wrote a starter one; Discord bot not started)"
        want_discord=0 ;;
     *) echo "   ⚠️  could not read the discord config — bot not started"
        [ -n "$probe_err" ] && printf '%s\n' "$probe_err" | sed 's/^/      /'
