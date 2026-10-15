@@ -921,6 +921,10 @@ function connect() {
     // session the page had switched to by then, so an /info asked for session
     // A surfaced as a timeout against session B.
     rejectRpcs('the link to the core went away');
+    // Same reason the pending RPCs go: a submit that was in flight when the
+    // socket died has no turn_start coming either, and the flag outlives the
+    // reconnect.
+    S.weAsked = false;
     if (S.closing) return;
     if (ev.code === 1013) notice('the core dropped this client for falling behind — reconnecting', 'warn');
     setStatus('off', 'offline');
@@ -1248,6 +1252,11 @@ function handle(e) {
   case 'busy':
     clearWaiting();
     setBusy(false);
+    // We asked and were turned away, so no turn_start is coming to spend the
+    // flag. Left set, the next one — minutes later, from another tab or the
+    // Discord bot on the same session — would read it and yank this reader to
+    // the bottom.
+    S.weAsked = false;
     notice(`⏳ ${e.reason}`, 'warn');
     return;
 
