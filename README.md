@@ -1,15 +1,42 @@
 # letsClaw — Low Energy Technical Support Agent Engine
 
 A stripped-down agent: a long-lived **core service** holding the conversations, and
-thin clients — a terminal REPL and a browser UI — that attach to it over a WebSocket.
-Behavior is plain MD files — everything visible, nothing hidden.
+thin clients — a terminal REPL, a browser UI and a Discord bot — that attach to it
+over a WebSocket. Behavior is plain MD files — everything visible, nothing hidden.
 
 ## Philosophy / features
-- Simple: one config file, MD files for behavior
-- Modular: base modules always-on, feature toggles in config
-- Transparent: full source access, no black boxes
-- Low energy: minimal footprint, no bloat
-- Lean context: no hidden token injection — the context is your MD files + conversation, nothing else
+
+**The principles**
+
+- **Simple** — one config file, MD files for behavior. No DSL, no plugin registry.
+- **Modular** — base behavior always on, everything else a toggle in `config.yaml`.
+- **Transparent** — full source, no black boxes. What the model was sent is on disk,
+  and the journal keeps the reasoning and the untruncated tool output beside it.
+- **Low energy** — a small footprint on a lab machine, no bloat. The WebUI has no
+  build step, no `npm install` and no CDN, so it works on a box with no route out.
+- **Lean context** — nothing is injected behind your back. The window holds the three
+  behavior layers (base + per-model + per-session), the tool schemas, and the
+  conversation — and nothing else. `/info` accounts for all of it.
+
+**What it does**
+
+- **One core, many windows** — the core owns every conversation; the terminal, the
+  browser and the bot are thin clients on one WebSocket protocol. Several can attach
+  to the same session and all see the same stream.
+- **Sessions that outlive the clients** — named, persistent, reloaded at startup. The
+  core keeps running when you close every window onto it.
+- **Context rollover** — at a configurable mark the window is archived, summarised
+  into a handoff and reopened fresh, so a long session does not just hit the wall.
+- **A journal** — every round's reasoning and every untruncated tool result, in a `.md`
+  beside the transcript. It is what stops a rolled-over window redoing solved work.
+- **Reasoning as a notepad** — thinking room and answer room are budgeted separately,
+  so a model can think at length without crowding out the reply.
+- **Agent tools** — `exec` / `read` / `write` / `list`, allowlisted, with a timeout, an
+  output cap, and a workdir they resolve against.
+- **Control of a turn in flight** — `/stop` interrupts it; `/steering` feeds it a
+  correction without throwing away the work already done.
+- **Operable without a shell on the core's host** — `/reload` re-reads `config.yaml`
+  into the running core, and `/restart` covers the few keys reload cannot reach.
 
 ## Quick Start
 
@@ -83,7 +110,7 @@ graph TD
     end
 
     subgraph Modules
-        Cmds[Commands\n/clear /new /info /model /models\n/behavior /reasoning /stop /reload\n/restart /session]
+        Cmds[Commands\n/clear /new /info /model /models\n/behavior /reasoning /stop /steering\n/reload /restart /session]
         TokenCounter[Token Counter\ntoken_counter.py\nper-message stats]
         ThinkingUI[Thinking indicator\nui.py\nlive spinner + TTFT]
         Tools[Tool executor\ntools.py\nexec / read / write / list]
@@ -109,8 +136,6 @@ graph TD
     Engine --> Config
     Engine --> ModelFile
     Cmds --> TokenCounter
-    Engine --> Sessions
-    Engine --> Memory
 ```
 
 **Data flow:**
@@ -1076,6 +1101,7 @@ picks the token up from the local `config.yaml` on its own).
 | `/behavior` | print the loaded behavior file |
 | `/reasoning` | toggle live display of the model's thinking |
 | `/stop` | interrupt the turn in progress |
+| `/steering <text>` | send a correction *into* the turn in progress — the model picks it up at the next round, and it enters the history as the ordinary user message it is. Refused when nothing is running, rather than held over for the next turn |
 | `/reload` | re-read `config.yaml` into the running core |
 | `/restart` | restart the core process, in place and keeping its PID — the only way to apply the restart-only keys. Refused while a turn is running anywhere; `/restart force` goes ahead and loses those turns. This client has no reconnect, so it says so and exits |
 | `/quit` , `/exit` | leave — the core keeps running, and so does the turn |
@@ -1289,10 +1315,13 @@ must @mention in: #general, #novel
 answers freely in: #solaris, #caen, #esps, #ptolemy-translation, #analysis_11c
 ```
 
-An unreadable value warns and falls back to `true`, so a typo never opens the bot up. Every slash command the
-terminal has works as a plain message: `/info`, `/model [name]`, `/models`,
-`/rollover`, `/new`, `/clear`, `/behavior`, `/stop`, `/reload`, `/restart`,
-`/session [name]`, plus a local `/help`. `/restart` restarts the *core*; the bot
+An unreadable value warns and falls back to `true`, so a typo never opens the bot up. The slash commands work as
+plain messages: `/info`, `/model [name]`, `/models`, `/rollover`, `/new`,
+`/clear`, `/behavior`, `/stop`, `/reload`, `/restart`, `/session [name]`, plus a
+local `/help`. Two are not shared with the other clients, in either direction:
+`/session` is Discord-only, because it maps a *channel* to a session and the
+terminal and the browser pick their session when they attach; `/steering` is the
+other way round, terminal and WebUI only. `/restart` restarts the *core*; the bot
 is a separate process and stays up, reconnecting on its own backoff.
 `/reasoning` is answered but does nothing — this client asks the core not to
 send the thinking at all (`reasoning=0`), so none of it crosses the wire.
@@ -1386,7 +1415,7 @@ refuses to install one flavour while the other is present — uninstall first.
 ## Future Features
 
 - **Semantic search** — embed past messages/sessions and search them by meaning, not just keyword match
-- **Memory system** — read accumulated handoffs back in: rollover writes `state/memory_store/long_term.md`, but a new session is only seeded from its own predecessor, never from the whole history of the file
+- **Memory system** — nothing reads `state/memory_store/long_term.md` back. Rollover appends every handoff to it, but a new window is seeded only from the one window before it, so the accumulated file is a record for you to grep rather than something the agent recalls
 - **Discord draft streaming** — live-edited messages as the answer builds, instead of one post at `turn_end`
 - **Sub-agents** — a tool that runs a nested agent loop on a short fresh prompt and returns only its conclusion, so a big search never enters the parent's window. For context, not parallelism — see [todo.md](models/todo.md#wanted-not-built) for the measurements and the caveat about prefix-cache eviction
 
