@@ -294,6 +294,20 @@ class SSHForward:
                     await asyncio.wait_for(self._wait(), timeout=5)
                 except asyncio.TimeoutError:
                     self._proc.kill()
+                    # And reap it. A killed child that is never waited on stays
+                    # a zombie until this process exits, which used to be the
+                    # end of it — but /restart re-execs in place, and the new
+                    # image inherits the PID with no subprocess bookkeeping to
+                    # collect anything, so the zombie would outlive every
+                    # restart and one more would join it each time. SIGKILL is
+                    # not refusable, so this returns almost at once; bounded
+                    # anyway, because a process wedged in uninterruptible I/O
+                    # must not hold a shutdown open.
+                    try:
+                        await asyncio.wait_for(self._wait(), timeout=2)
+                    except asyncio.TimeoutError:
+                        logger.warning("ssh forward %s: did not die after "
+                                       "SIGKILL", self.name)
             self._proc = None
 
     async def _wait(self):

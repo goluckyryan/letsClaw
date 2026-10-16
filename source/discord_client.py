@@ -119,7 +119,8 @@ NO = {"n", "no"}
 # alternative prefix — see ALT_PREFIX.
 COMMAND_WORDS = {
     "info", "model", "models", "new", "rollover", "clear", "behavior", "stop",
-    "reload", "session", "help", "commands", "quit", "exit", "reasoning",
+    "reload", "restart", "session", "help", "commands", "quit", "exit",
+    "reasoning",
 }
 # Discord's own client captures a leading "/" into its slash-command picker, and
 # with no application commands registered the message can end up never being
@@ -139,6 +140,8 @@ HELP = (
     "`!new` **wipe everything**, archives included · `!behavior` the loaded "
     "behavior files\n"
     "`!stop` interrupt the turn in progress · `!reload` re-read config.yaml · "
+    "`!restart` restart the core process (I am a separate process and stay "
+    "up)\n"
     "`!session [name]` this channel's session — set, show, or `auto`\n"
     "`!help` this\n"
     "_`/` works too, but Discord's own command picker often eats it before it "
@@ -1973,6 +1976,9 @@ class LetsClawBot(discord.Client):
         simple("behavior", "print the loaded behavior files")
         simple("stop", "interrupt the turn in progress")
         simple("reload", "re-read config.yaml into the running core")
+        # The bot is a sibling process of the core, not a child of it: this
+        # restarts the core and the link reconnects on its own backoff.
+        simple("restart", "restart the core process (refuses while a turn runs)")
 
         @tree.command(name="model",
                       description="switch this channel's model — pick from a list")

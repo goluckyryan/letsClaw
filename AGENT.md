@@ -159,8 +159,17 @@ state/                   live conversations, archives, memory (gitignored)
 - **`ruamel.yaml` is not a dependency.** Only `PyYAML`. The core edits `config.yaml`
   line-by-line (not a YAML round-trip) specifically so it does not destroy the
   file's comments — do not "improve" a save into `yaml.safe_dump`.
-- **Restart-only keys** need a `./serve.sh` restart; everything else is picked up
-  by `/reload` live. They are `core.bind` and `core.port` (the socket is already
+- **Restart-only keys** need the core restarted — `/restart` from any client, or
+  `./serve.sh` again; everything else is picked up by `/reload` live.
+  `/restart` re-execs the core in place: same PID, conversations kept, every
+  client back in about a second. It refuses while a turn is running anywhere
+  (`/restart force` overrides, and those turns are lost) and refuses outright
+  when the config it would come back on will not load — that one is not
+  overridable, because `Restart=on-failure` with no `StartLimitBurst` turns a
+  core that exits 1 into a restart loop rather than a message. It restarts the
+  **core only**: the bot is a sibling process started by `serve.sh` and keeps
+  running, so an edit to `discord_client.py` still needs `serve.sh` itself.
+  The keys are `core.bind` and `core.port` (the socket is already
   bound, and rebinding it drops every client); `logging.file`, `logging.max_bytes`
   and `logging.backups`, which `logging_setup.configure()` reads once when it
   installs the handlers — `logging.level` is *not* restart-only; and on the bot's

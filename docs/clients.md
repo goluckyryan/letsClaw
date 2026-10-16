@@ -27,8 +27,14 @@ one exits.
 
 **It is the least robust of the three, deliberately-by-omission rather than by
 design:** no reconnect, no `last_seq`, no auth handling beyond reading the
-token. If the core restarts, you restart the client. This is fine for a local
-REPL and is the first thing to fix if it ever becomes more than that.
+token. If the core restarts, you restart the client — this one only, since the
+WebUI and the bot both reconnect on their own. It does at least say so: a close
+with code 1012 (`SERVICE_RESTART`, which the core sends only from `/restart`)
+prints that the core is coming back and that the conversation is kept, rather
+than the generic "the core closed the connection" it printed when a restart
+issued from the WebUI silently killed every terminal attached to it. That is
+fine for a local REPL and is the first thing to fix if it ever becomes more
+than that.
 
 ## Browser — `web/`
 

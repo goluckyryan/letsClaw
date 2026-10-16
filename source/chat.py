@@ -54,6 +54,7 @@ COMMANDS = {
     "/stop": "interrupt the turn in progress",
     "/steering": "send a correction to the turn in progress",
     "/reload": "re-read config.yaml into the running core",
+    "/restart": "restart the core process (/restart force cancels running turns)",
 }
 
 # Handled here, not by the core: they change this terminal, not the conversation.
@@ -433,7 +434,17 @@ async def run_client(url, session_name, render, token=""):
                     # which is exactly what a bare create_task() would do.
                     render.line(f"⚠️  could not render {e.get('t')!r}: "
                                 f"{type(exc).__name__}: {exc}")
-            render.line("\n⚠️  The core closed the connection.")
+            # 1012 is SERVICE_RESTART, which the core sends only from its
+            # /restart path. This client has no reconnect, so without keying on
+            # it a restart someone triggered from the WebUI read here as an
+            # unexplained drop — and the advice ("the core is down") was the
+            # opposite of true, since the core is back a moment later.
+            if ws.close_code == 1012:
+                render.line("\n♻️  The core is restarting — it will be back in "
+                            "a moment. Run ./terminalUI.sh again to reattach; "
+                            "the conversation is kept.")
+            else:
+                render.line("\n⚠️  The core closed the connection.")
             await lines.put(None)
 
         def _dispatch(e, render, ws):
@@ -579,8 +590,9 @@ def main():
 
     print("\nletsClaw Terminal Chat")
     print(f"Connected to the core at {url}, session '{args.session}'.")
-    print("Commands: /quit, /clear, /rollover, /new, /model [name], /info, "
-          "/behavior, /reasoning, /stop")
+    # Kept in step with COMMANDS above by hand, which it had not been: /reload
+    # and /steering shipped without ever reaching this line.
+    print("Commands: " + ", ".join(sorted(COMMANDS)))
     print("(Tab completes commands and model names)")
 
     code = 0

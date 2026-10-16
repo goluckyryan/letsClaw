@@ -28,6 +28,7 @@ const COMMANDS = {
   '/stop':      'interrupt the turn in progress',
   '/steering':       'send a correction to the turn in progress',
   '/reload':    're-read config.yaml into the running core',
+  '/restart':   'restart the core process (/restart force cancels running turns)',
   '/help':      'this list',
 };
 
@@ -927,6 +928,11 @@ function connect() {
     S.weAsked = false;
     if (S.closing) return;
     if (ev.code === 1013) notice('the core dropped this client for falling behind — reconnecting', 'warn');
+    // 1012 is SERVICE_RESTART, and the core sends it from one place only. The
+    // reconnect below would have brought the page back either way, but with no
+    // word on why it went — and a restart someone else triggered is otherwise
+    // indistinguishable here from the core dying.
+    if (ev.code === 1012) notice('♻️ the core is restarting — reconnecting', 'warn');
     setStatus('off', 'offline');
     scheduleReconnect();
   };
@@ -1633,6 +1639,23 @@ $('#btn-reload').onclick = () => {
   // Errors come back as ok:false, which response() already renders — a rejected
   // reload has changed nothing, so there is nothing to undo here.
   rpc('reload').catch((err) => notice(`/reload: ${err.message}`, 'warn'));
+};
+// Asks, like #btn-new does, because it takes everyone's socket down and not
+// just this page's — a terminal client attached to the same core has no
+// reconnect and will have to be started again.
+$('#btn-restart').onclick = () => {
+  if (!confirm('Restart the core?\n\nEvery client is disconnected for about a second. Conversations are saved and restored; the Discord bot is a separate process and keeps running.')) return;
+  // Not .then-chained onto a second rpc blindly: the core refuses while a turn
+  // is running and says which sessions, and that refusal is the one worth
+  // putting back to the person rather than overriding for them. A rejection
+  // (socket gone) is something else entirely and is reported as itself.
+  rpc('restart', '', true).then((reply) => {
+    if (reply.ok) return;
+    if (!reply.busy) { slab('notice err', `❌ ${esc(reply.error)}`); return; }
+    if (confirm(`A turn is running in ${reply.busy.join(', ')}.\n\nRestart anyway? Those turns are lost.`)) {
+      rpc('restart', 'force').catch((err) => notice(`/restart: ${err.message}`, 'warn'));
+    }
+  }).catch((err) => notice(`/restart: ${err.message}`, 'warn'));
 };
 
 /* The core is what decides: the dropdown shows the session's model, and only a

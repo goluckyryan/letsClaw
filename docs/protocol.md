@@ -92,12 +92,23 @@ non-fatal `error`; non-text frames are ignored.
 awaited inline**, so the reader stays live for `stop` and `rollover_reply`
 during a long turn.
 
-**Commands** (`Session.command`, `core.py:1566`), name lowercased and a leading
-`/` stripped:
+**Commands** (`Session.command`, `core.py:1781`), name lowercased and a leading
+`/` stripped. Three groups, not two, and the third is the one that was being
+filed under the first:
 
-- read-only, reply to the asker: `info`, `behavior`, `models`, `reload`
-- take the turn lock: `clear`, `rollover`, `new`, `model` — these return
+- **read-only**, reply to the asker: `info`, `behavior`, `models`
+- **manager-level**, above the busy guard and outside the turn lock: `reload`,
+  `restart`. They act on the whole core rather than one session, and taking the
+  turn lock here would deadlock — `reload` defers busy sessions, including the
+  one that asked. Each does its own refusing instead: `reload` defers, `restart`
+  reports every busy session by name and takes `force` to override
+- **turn-lock-taking**: `clear`, `rollover`, `new`, `model` — these return
   `{"ok": false, "error": "a turn is running…"}` when busy
+
+`restart` has to sit above the busy guard for a second reason of its own: the
+whole content of its refusal is *which* sessions are busy, and below the guard a
+`/restart` typed into a busy session would never get past "a turn is running in
+this session".
 
 ### Core → client
 

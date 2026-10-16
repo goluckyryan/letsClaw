@@ -408,6 +408,38 @@ def check_section_shapes(config):
                 f"indentation under {name}:")
 
 
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def boot_blockers(config):
+    """Why a core starting on this config would exit, or "" if it would not.
+
+    The two refusals in server.main() that happen *after* the file has parsed:
+    a core.port that is not a port number, and a non-loopback bind with no
+    core.token (which is an unauthenticated shell for the network, and the core
+    declines rather than warning). Both are checked there against argv as well,
+    so main() keeps its own copies — this is the config-only half.
+
+    It exists for /restart, which has to answer "would the core that comes back
+    actually come back?" before it arms anything. A restart onto a config that
+    fails either test is not a failed restart: serve.sh hands the exit status
+    up to a unit with Restart=on-failure and no StartLimitBurst, so the core
+    disappears into a loop instead of coming back with a message.
+    """
+    core = config.get("core") or {}
+    try:
+        int(core.get("port", 8770))
+    except (TypeError, ValueError):
+        return (f"core.port is {core.get('port')!r}, which is not a port "
+                "number (the default is 8770)")
+    bind = core.get("bind", "127.0.0.1")
+    if bind not in LOOPBACK and not (core.get("token") or ""):
+        return (f"core.bind is {bind!r}, which is not loopback, and core.token "
+                "is empty — the core refuses that combination, because the "
+                "tools are unconfined")
+    return ""
+
+
 def build_all_engines(config, forwards=None):
     """One engine per configured model, or raise.
 

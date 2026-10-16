@@ -74,13 +74,26 @@ only ([principle 16](design-principles.md#16-clients-render-nothing-optimistical
 Everything that mutates goes after it, and returns
 `{"ok": false, "error": "a turn is running…"}` when busy.
 
-`/reload` is deliberately in the read-only group even though it changes
-everything — taking the turn lock there deadlocks, because `reload` defers busy
-sessions and would defer the one that asked.
+`/reload` and `/restart` sit above that check even though they change
+everything — they are manager-level, not session-level, and taking the turn lock
+there deadlocks because `reload` defers busy sessions and would defer the one
+that asked. See [protocol.md](protocol.md) for the three groups.
 
-**The trap:** there are **three command tables** — `chat.py`, `web/app.js`,
-`discord_client.py` — and they have already drifted. Nothing tells you if you
-miss one. See [clients.md](clients.md#what-is-shared-and-what-is-not).
+**The trap:** a command is not one listing but **eight**, and they have already
+drifted. Nothing tells you if you miss one:
+
+| | |
+|---|---|
+| `source/core.py` | the branch in `Session.command` — the only one that does anything |
+| `source/chat.py` | `COMMANDS` (the help line and tab completion both read it) |
+| `web/app.js` | `COMMANDS`, and a toolbar handler if it gets a button |
+| `web/index.html` | that button |
+| `source/discord_client.py` | `COMMAND_WORDS` — **miss this one and `!cmd` is sent to the model as chat** — `HELP`, and `_register_commands` for the native slash picker |
+| `README.md` | the terminal command table, the Mermaid `Cmds` node, the Discord prose list |
+
+`tests/test_discord.py` pins the slash tree, so Discord's three are the only
+ones a test will catch for you. See
+[clients.md](clients.md#what-is-shared-and-what-is-not).
 
 If the command mutates session state that other attached clients should see,
 emit a `session_state` event as well as returning the reply.

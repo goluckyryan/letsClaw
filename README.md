@@ -83,7 +83,7 @@ graph TD
     end
 
     subgraph Modules
-        Cmds[Commands\n/clear /new /info /model /models\n/behavior /reasoning /stop /reload\n/session]
+        Cmds[Commands\n/clear /new /info /model /models\n/behavior /reasoning /stop /reload\n/restart /session]
         TokenCounter[Token Counter\ntoken_counter.py\nper-message stats]
         ThinkingUI[Thinking indicator\nui.py\nlive spinner + TTFT]
         Tools[Tool executor\ntools.py\nexec / read / write / list]
@@ -981,7 +981,7 @@ Three tiers:
 |---|---|
 | **Live already** | `core.token`, `core.allowed_hosts`, the `state/` paths, and the model list `GET /models` serves — these are read per request, so the reload is what updates the file, not what plumbs it through |
 | **Reload picks it up** | **every setting in every model entry** — the engines are rebuilt from scratch, so `context_length`, `base_url`, `provider_name`, the sampling parameters, and all of the reasoning settings (`reasoning`, `max_tokens`, `max_output_tokens`, `max_pad_compactions`, `turn_timeout`, `answer_time_reserve`, `resume_mode`, `reasoning_effort`) come across; added and removed models; behavior files including `base.md`; the tool allowlist and `exec_timeout`; `max_iterations`; every `conversation.*` setting; `logging.level`; and, in the bot's own process, the Discord allowlist (`discord.users`, `mention_only`, `mention_list`) — see [Discord Client](#discord-client) |
-| **Restart-only** | `core.bind` and `core.port` — the socket is already bound, and rebinding drops every client, which is the thing being avoided — and the three keys that are read once when the log handlers are installed: `logging.file`, `logging.max_bytes`, `logging.backups`. On the bot's side, `discord.enabled` (`serve.sh` reads it before deciding to launch at all) and the three that say *where* the bot logs in — `discord.token`, `discord.core`, `discord.core_token` |
+| **Restart-only** | `core.bind` and `core.port` — the socket is already bound, and rebinding drops every client, which is the thing being avoided — and the three keys that are read once when the log handlers are installed: `logging.file`, `logging.max_bytes`, `logging.backups`. **`/restart` applies these from any client** (see below); it is no longer a trip to the core's host. On the bot's side, `discord.enabled` (`serve.sh` reads it before deciding to launch at all) and the three that say *where* the bot logs in — `discord.token`, `discord.core`, `discord.core_token`. Those four restart the *bot*, which `/restart` does not touch |
 
 An idle session takes the change immediately; one mid-turn takes it the moment that turn
 ends, and the reply says how many of each. **A setting a session changed for itself is
@@ -994,6 +994,38 @@ to it.
 The reply names what moved, key by key
 (`models.qwen38-local.context_length: 100000 -> 128000`), so a reload says what it did
 rather than just that it happened.
+
+### `/restart` — for the keys reload cannot reach
+
+`/restart` restarts the core process itself, from any client, which is what the
+restart-only tier needs and used to mean a shell on the core's host.
+
+It is **the same process afterwards**: the core `execv`s over itself, so the PID
+does not change, `serve.sh`'s `wait` keeps waiting and systemd never sees a
+service that stopped. Conversations are persisted on the way down and restored
+on the way up. Every client is disconnected for roughly a second; the WebUI and
+the Discord bot reconnect on their own, and the terminal client does not — it
+prints that the core is restarting and exits, so run it again.
+
+**The Discord bot is not restarted.** It is a sibling process started by
+`serve.sh`, not a child of the core, and it survives the whole thing. Editing
+`discord_client.py` and typing `/restart` runs none of what you just wrote; that
+needs `serve.sh` itself restarted.
+
+Two refusals, both before anything is armed:
+
+- **A turn is running**, anywhere, not just where you typed it. The reply names
+  the sessions. `/restart force` goes ahead and those turns are lost.
+- **`config.yaml` would not load, or would stop the core booting** — a port that
+  is not a number, or a non-loopback `bind` with no `core.token`. This matters
+  more than it looks: `serve.sh` hands the core's exit status to a unit with
+  `Restart=on-failure` and no `StartLimitBurst`, so a restart onto a broken
+  config is not a failed restart but a core in a loop. And `/restart` is exactly
+  what you reach for just after editing the config.
+
+A `systemctl stop` or a Ctrl-C arriving in the fraction of a second between the
+reply and the exit wins: the core stays stopped rather than coming back from a
+stop nobody could then undo.
 
 **Because the core outlives its clients**, closing the terminal mid-answer does not
 stop the turn. Reattach and the output you missed is replayed, then the conversation
@@ -1045,6 +1077,7 @@ picks the token up from the local `config.yaml` on its own).
 | `/reasoning` | toggle live display of the model's thinking |
 | `/stop` | interrupt the turn in progress |
 | `/reload` | re-read `config.yaml` into the running core |
+| `/restart` | restart the core process, in place and keeping its PID — the only way to apply the restart-only keys. Refused while a turn is running anywhere; `/restart force` goes ahead and loses those turns. This client has no reconnect, so it says so and exits |
 | `/quit` , `/exit` | leave — the core keeps running, and so does the turn |
 
 **Three ways to end a window**, and the difference is how much of the past goes
@@ -1258,8 +1291,9 @@ answers freely in: #solaris, #caen, #esps, #ptolemy-translation, #analysis_11c
 
 An unreadable value warns and falls back to `true`, so a typo never opens the bot up. Every slash command the
 terminal has works as a plain message: `/info`, `/model [name]`, `/models`,
-`/rollover`, `/new`, `/clear`, `/behavior`, `/stop`, `/reload`, `/session
-[name]`, plus a local `/help`.
+`/rollover`, `/new`, `/clear`, `/behavior`, `/stop`, `/reload`, `/restart`,
+`/session [name]`, plus a local `/help`. `/restart` restarts the *core*; the bot
+is a separate process and stays up, reconnecting on its own backoff.
 `/reasoning` is answered but does nothing — this client asks the core not to
 send the thinking at all (`reasoning=0`), so none of it crosses the wire.
 
@@ -1340,6 +1374,11 @@ systemctl [--user] status letsClaw          # is it running
 systemctl [--user] restart letsClaw         # restart it
 journalctl [--user] -u letsClaw -f          # the log (also logs/letclaw-core.log)
 ```
+
+`/restart` from any client does the core half of that `systemctl restart` without
+a shell here, and keeps the PID — see [`/restart`](#restart--for-the-keys-reload-cannot-reach).
+Use `systemctl restart` when you need the *bot* restarted too, or when the core
+is too wedged to answer a command.
 
 A `--user` and a `--system` unit would fight over the core's port, so the script
 refuses to install one flavour while the other is present — uninstall first.

@@ -1829,6 +1829,15 @@ class Session:
             # any session that is busy, so taking the lock here would have it defer
             # the very session that asked, or deadlock waiting on itself.
             return await self.manager.reload()
+        if name == "restart":
+            # Also manager-level, and above the busy guard for the same reason
+            # plus one of its own: the whole point of the refusal below is to
+            # name which sessions are busy, and from inside a busy session the
+            # guard would answer "a turn is running in this session" and never
+            # get there. request_restart does its own busy check across every
+            # session, which is the one that matters here.
+            force = any(a.lstrip("-").lower() == "force" for a in args.split())
+            return await self.manager.request_restart(force=force)
 
         # self.busy, not lock.locked(): a turn created by start_turn does not
         # reach `async with self.lock` until the loop next runs it, so a /clear
@@ -1954,6 +1963,16 @@ class SessionManager:
         self.config_path = Path(config_path or configlib.CONFIG_PATH)
         self.sessions = {}
         self._engines = {}
+        # Set by server.build_app to the thing that can actually re-exec this
+        # process. None when nobody installed one — a manager built by a test or
+        # an embedder has no process to restart, and request_restart says so
+        # rather than raising AttributeError at whoever asked.
+        self.restart_hook = None
+        # A restart is armed and the process is on its way out. Read by the
+        # server to turn new submits away: the busy check in request_restart is
+        # a snapshot, and without this a turn can start inside the grace window
+        # and be cancelled by the very restart that just reported none running.
+        self.restarting = False
         self.behaviors = behavior.BehaviorStore(self.config)
         # ssh port-forwards the core owns (models with an ssh_forward entry).
         # configure() is synchronous and spawns nothing; the keepalive loop
@@ -2156,6 +2175,94 @@ class SessionManager:
             logger.info("session %s created on model %s (id %s)",
                         name, s.model_name, s.session_id)
             return s
+
+    async def request_restart(self, force=False):
+        """Arm a restart of the core process. Returns before anything happens.
+
+        The counterpart to reload(): where that one re-reads config.yaml into a
+        running core, this one brings the core back, which is the only way to
+        move the handful of keys reload cannot touch — core.bind, core.port and
+        the three the log handlers read once when they are installed.
+
+        Returning early is the point. The caller's reply has to reach its client
+        before the sockets close under it, so all this does is validate, say so,
+        and hand off to the hook; the hook arms a timer and the process leaves
+        on its own a moment later. See server._arm_restart for the other half.
+
+        Only the *core* restarts. The Discord bot is a sibling process started
+        by serve.sh, untouched by the re-exec and reconnecting on its own — so
+        someone who edited discord_client.py and typed /restart has not yet run
+        the code they just wrote, and the reply says so.
+        """
+        if self.restart_hook is None:
+            return {"ok": False,
+                    "error": "this core cannot restart itself — it was not "
+                             "started through server.main(), so nothing here "
+                             "owns the process"}
+        if self.restarting:
+            # A double-click, or two clients racing. Not an error — the thing
+            # asked for is already happening — but it must not broadcast a
+            # second notice or arm a second timer.
+            return {"ok": True, "already": True,
+                    "note": "a restart is already under way"}
+
+        # reload() is a three-step read-modify-write over the engine set and the
+        # forward table, and _on_shutdown does not cancel the handler parked in
+        # `await session.command(...)` — it closes sockets, which that handler
+        # is not reading from. So a restart landing mid-reload runs close()
+        # concurrently with plan/stage/commit: engines closed as the reload is
+        # about to hand them to sessions, forwards torn down half-committed.
+        # Cheaper to refuse for the second it takes than to make close() safe
+        # against it.
+        if self._reload_lock.locked():
+            return {"ok": False,
+                    "error": "a config reload is in progress — try again in a "
+                             "moment"}
+
+        # The config is validated BEFORE anything is armed, because the new
+        # image reads it with no one to tell. main() exits 1 on a file that will
+        # not parse, on a bad core.port and on a non-loopback bind with no
+        # token; serve.sh hands that status up; and the unit is Restart=on-
+        # failure with RestartSec=3 and no StartLimitBurst. So a /restart over a
+        # broken config is not a failed restart, it is a core that disappears
+        # into a restart loop — and /restart is exactly what someone reaches for
+        # just after editing config.yaml. Refusing here costs one file read.
+        try:
+            fresh = await asyncio.to_thread(configlib.load_config, self.config_path)
+        except (OSError, ValueError, TypeError, AttributeError, KeyError,
+                yaml.YAMLError, RuntimeError) as e:
+            return {"ok": False,
+                    "error": f"not restarting: {self.config_path} would not "
+                             f"load, and the core that came back would exit on "
+                             f"it — {type(e).__name__}: {e}"}
+        bad = configlib.boot_blockers(fresh)
+        if bad:
+            return {"ok": False,
+                    "error": f"not restarting: the core that came back would "
+                             f"exit — {bad}"}
+
+        # s.busy, not the lock, for the reason the property documents: a turn
+        # created by start_turn has not reached the lock yet.
+        busy = sorted(s.name for s in self.sessions.values() if s.busy)
+        if busy and not force:
+            return {"ok": False, "busy": busy,
+                    "error": "a turn is running in " + ", ".join(busy) +
+                             " — /restart force restarts anyway, and those "
+                             "turns are lost"}
+
+        self.restarting = True
+        logger.warning("restart requested%s%s", " (forced)" if force else "",
+                       f", cancelling turns in {', '.join(busy)}" if busy else "")
+        # Every attached client in every session, not just the asker's: the
+        # terminal windows are about to be closed on people who did not type
+        # this. They all render `notice` already, so this needs no new event.
+        for s in self.sessions.values():
+            s.emit(ev("notice", level="warn",
+                      text="♻️ the core is restarting — it will be back in a "
+                           "moment (the Discord bot is a separate process and "
+                           "is not restarted)"))
+        self.restart_hook()
+        return {"ok": True, "restarting": True, "forced": bool(busy)}
 
     async def reload(self, path=None):
         """Re-read config.yaml and apply it to everything already running.

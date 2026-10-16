@@ -18,8 +18,10 @@ import argparse
 import asyncio
 import copy
 import logging
+import os
 import secrets
 import shutil
+import signal
 import socket
 import sys
 import weakref
@@ -61,10 +63,38 @@ def _configure_logging(config):
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-# Addresses that are not reachable from another machine. Used both by the
-# startup check and by the banner, so the two cannot disagree about what
-# "loopback" means.
-LOOPBACK = ("127.0.0.1", "localhost", "::1")
+# Addresses that are not reachable from another machine. Used by the startup
+# check, by the banner, and by configlib.boot_blockers — which is what /restart
+# asks whether the core that comes back would survive its own startup check. It
+# lives in config.py so those three cannot disagree about what "loopback" means.
+LOOPBACK = configlib.LOOPBACK
+
+class _RestartState:
+    """Where a restart stands, for the four places that have to agree.
+
+    `armed`     /restart was accepted and the timer is set.
+    `exec`      the timer actually fired — the one thing main() consults.
+    `stopping`  a signal, not the timer, started the shutdown.
+    `timer`     the pending call_later, so a shutdown can disarm it.
+
+    `armed` and `exec` are deliberately not one flag: see _arm_restart.
+    """
+    __slots__ = ("armed", "exec", "stopping", "timer")
+
+    def __init__(self):
+        self.armed = False
+        self.exec = False
+        self.stopping = False
+        self.timer = None
+
+
+# Between arming a restart and leaving. Short, because the only thing waiting on
+# it is the broadcast notice working its way out through the per-socket writers,
+# and _on_shutdown drains those properly before it closes anything.
+RESTART_GRACE = 0.1
+# A ceiling on that drain. A client that cannot take its last few events must
+# not hold the restart open.
+DRAIN_GRACE = 2.0
 
 
 def _split_host_port(host):
@@ -240,8 +270,12 @@ def _guard(request):
 
 async def health(request):
     mgr = request.app["mgr"]
+    # `restarting` is true only inside the grace window, which is a tenth of a
+    # second — but a poller that catches it there would otherwise see a healthy
+    # core and then a refused connection, with nothing to connect the two.
     return web.json_response({"ok": True, "proto": core.PROTOCOL_VERSION,
-                              "sessions": len(mgr.sessions)})
+                              "sessions": len(mgr.sessions),
+                              "restarting": bool(mgr.restarting)})
 
 
 async def models(request):
@@ -607,6 +641,15 @@ async def ws_handler(request):
                 if session.busy:
                     await ws.send_json(core.ev("busy", reason="a turn is already running"))
                     continue
+                if mgr.restarting:
+                    # The busy check inside request_restart is a snapshot. Without
+                    # this gate a turn can start inside the grace window and be
+                    # cancelled a tenth of a second later by the very restart that
+                    # just reported nothing running. Reported as `busy` because
+                    # that is the one "not now" every client already renders.
+                    await ws.send_json(core.ev(
+                        "busy", reason="the core is restarting — try again in a moment"))
+                    continue
                 # Who is speaking, when the client knows something the session
                 # name does not — the Discord bot sends "discord:<username>" so
                 # one channel's session still shows who typed. Clamped because
@@ -659,6 +702,7 @@ async def _on_startup(app):
     Before the first request is served, so GET /sessions — and therefore the
     WebUI sidebar — is right on its very first paint.
     """
+    _install_stop_guard(app)
     try:
         n = await app["mgr"].restore()
     except Exception:
@@ -683,6 +727,82 @@ async def _on_startup(app):
     sys.stdout.flush()
 
 
+def _arm_restart(app):
+    """Start the core on its way out, so that main() can exec it back in.
+
+    Installed as SessionManager.restart_hook. Called from inside the /restart
+    command handler, which still has a reply to send, so nothing may happen
+    synchronously here: a timer fires the actual exit a moment later and this
+    returns at once.
+
+    Deliberately NOT a signal. aiohttp installs one handler for SIGINT and
+    SIGTERM alike, and serve.sh's trap sends SIGINT too, so a self-signal makes
+    /restart indistinguishable from `systemctl stop` and from Ctrl-C — and a
+    stop arriving inside the grace window would re-exec a core that was meant
+    to stay down. Raising GracefulExit straight out of a loop callback keeps
+    the two paths separate: it is a SystemExit subclass, and Handle._run
+    re-raises those instead of handing them to the exception handler.
+
+    `st.exec` is set *inside* the callback rather than here, and that is the
+    whole of the fix: an external signal during the grace raises its own
+    GracefulExit first, the timer never runs, the flag is still False, and
+    main() exits for good.
+    """
+    st = app["restart_state"]
+    if st.armed:
+        return
+    st.armed = True
+
+    def fire():
+        # Someone asked us to stop for real while the grace was running. They
+        # win: a stop has to mean stopped, and coming back up would be the one
+        # outcome nobody can correct from the keyboard they just used. See
+        # _install_stop_guard for how that is known.
+        if st.stopping:
+            logger.warning("restart abandoned: the core was asked to stop")
+            return
+        st.exec = True
+        raise web.GracefulExit()
+
+    # Kept so _on_shutdown can cancel it. A timer left armed through someone
+    # else's shutdown raises GracefulExit out of aiohttp's own cleanup, which
+    # is not expecting it.
+    st.timer = asyncio.get_running_loop().call_later(RESTART_GRACE, fire)
+
+
+def _install_stop_guard(app):
+    """Replace aiohttp's SIGINT/SIGTERM handlers with ones that leave a note.
+
+    aiohttp installs `_raise_graceful_exit` for both signals, and serve.sh's own
+    trap sends SIGINT, so from inside the process `systemctl stop`, Ctrl-C and
+    the restart timer all arrive as the same bare GracefulExit. /restart has to
+    tell them apart, because the consequence of guessing wrong is a core that
+    comes back from a stop — and nobody can correct that from the keyboard they
+    just pressed Ctrl-C on.
+
+    Cancelling the timer in _on_shutdown covers most of it, but not a
+    cancellation that takes longer than the grace to reach _on_shutdown. This
+    does, by recording the cause at the only place it is known.
+
+    Installed from on_startup, which BaseRunner.setup() runs *after* it adds
+    aiohttp's handlers — so these replace them rather than the other way round.
+    If that order ever changes, the note is never left and the timer cancel is
+    what is left; hence both.
+    """
+    st = app["restart_state"]
+    loop = asyncio.get_running_loop()
+
+    def stop():
+        st.stopping = True
+        raise web.GracefulExit()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop)
+        except (NotImplementedError, RuntimeError):
+            logger.debug("no signal handler for %s", sig, exc_info=True)
+
+
 async def _on_shutdown(app):
     # Close the sockets first, and actually close them. Detaching only stops
     # events reaching a client; the handler stays parked in `async for msg in
@@ -703,7 +823,52 @@ async def _on_shutdown(app):
     # session unsaved: precisely the loss this handler exists to prevent.
     # gather() builds its task list from one synchronous snapshot and never
     # touches the set again.
-    closes = [ws.close(code=WSCloseCode.GOING_AWAY, message=b"core shutting down")
+    #
+    # A restart says so in the close frame. 1012 is the difference between a
+    # client that tells someone the core is coming back and one that reports a
+    # connection it cannot explain — the WebUI keys a notice off it and the
+    # terminal keys its parting line off it, neither of which can be inferred
+    # from 1001.
+    # Before anything that awaits: this handler can run while the grace timer
+    # is still pending — an external stop during the window is exactly that
+    # case — and a timer that fires from in here raises GracefulExit out of
+    # aiohttp's cleanup. Cancelling an already-fired handle is a no-op, so the
+    # genuine restart path is unaffected.
+    st = app["restart_state"]
+    if st.timer is not None:
+        st.timer.cancel()
+
+    # st.exec, not st.armed: the first is armed, the second is decided. A stop
+    # that landed inside the grace window leaves the core armed and not coming
+    # back, and telling those clients "restarting" would be a promise nothing
+    # is going to keep.
+    restarting = st.exec
+    if restarting:
+        code, why = WSCloseCode.SERVICE_RESTART, b"core restarting"
+    else:
+        code, why = WSCloseCode.GOING_AWAY, b"core shutting down"
+
+    if restarting:
+        # The restart's own broadcast notice is sitting in the per-socket
+        # queues, and _writer is the only thing that moves it onto the wire.
+        # Closing now would throw away the one message explaining why the
+        # socket is closing. The unicast reply to whoever typed /restart needs
+        # none of this — ws_handler sends that inline — so this loop is purely
+        # for the broadcast, and it is a postcondition (the queues are empty)
+        # rather than a guess at how long a flush takes. Bounded, because a
+        # client that cannot take its last few events must not hold the
+        # restart open.
+        deadline = asyncio.get_running_loop().time() + DRAIN_GRACE
+        while asyncio.get_running_loop().time() < deadline:
+            if not any(sub.queue for s in app["mgr"].sessions.values()
+                       for sub in list(s.subscribers)):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            logger.warning("restart: a client did not drain in %.1fs; "
+                           "closing anyway", DRAIN_GRACE)
+
+    closes = [ws.close(code=code, message=why)
               for ws in list(app["websockets"])]
     try:
         # return_exceptions, so one socket that cannot be closed does not take
@@ -724,6 +889,15 @@ def build_app(config, config_path=None, bind=None):
     app["config_path"] = config_path
     app["mgr"] = core.SessionManager(config, config_path)
     app["websockets"] = weakref.WeakSet()
+    # Two flags, not one. "restarting" is armed the moment /restart is accepted
+    # and is what the close code and the submit gate read; "restart" is set only
+    # when the timer actually fires, and is the single thing main() consults
+    # before exec'ing. See _arm_restart for why they cannot be the same flag.
+    # A mutable holder rather than four app keys: aiohttp freezes the app at
+    # startup and writing app[...] after that is deprecated, and three of these
+    # four are only ever written while it is running.
+    app["restart_state"] = _RestartState()
+    app["mgr"].restart_hook = lambda: _arm_restart(app)
     # Resolved once: gethostname/getaddrinfo can block on a slow resolver, and
     # this must not happen per request. `bind` defaults from the config so a
     # caller that builds an app without going through main() — every test that
@@ -842,7 +1016,71 @@ def main():
     # This is a daemon; its stdout is a log file far more often than a tty, and block
     # buffering would hold the banner back until something else filled the buffer.
     sys.stdout.flush()
-    web.run_app(app, host=bind, port=port, print=None)
+    try:
+        web.run_app(app, host=bind, port=port, print=None)
+    finally:
+        # In a finally, not after: run_app suppresses only CancelledError out of
+        # runner.cleanup(), so anything else raised on the way down — out of
+        # mgr.close(), say — would otherwise skip the re-exec and leave a core
+        # that was asked to restart simply gone.
+        if app["restart_state"].exec:
+            _exec_self()
+
+
+def _exec_self():
+    """Replace this process with a fresh core. Does not return.
+
+    Same PID, which is the point: the core is a background child of serve.sh,
+    which ends in `wait "$core_pid"`, under a systemd unit whose ExecStart is
+    serve.sh itself. execv keeps the PID, so the wait keeps waiting and systemd
+    never sees a service that stopped.
+    """
+    logger.warning("re-exec: the core is restarting now")
+    # execv does not flush anything. The log handlers hold buffered writes and
+    # file descriptors that are FD_CLOEXEC, so without this the last lines
+    # before a restart are lost — and stdout is a pipe under serve.sh, which
+    # means block buffering and the whole banner going with them.
+    logging.shutdown()
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    # A dead ssh forward killed on the way out is still a child of this PID, and
+    # the new image has no subprocess bookkeeping to reap it with — so it would
+    # stay a zombie for as long as the core runs, one more per restart.
+    # ssh_forward now waits for the ones it kills; this is the backstop for any
+    # it could not, and it never blocks.
+    try:
+        while os.waitpid(-1, os.WNOHANG)[0]:
+            pass
+    except ChildProcessError:
+        pass                                      # nothing left to reap
+    except OSError:
+        logger.debug("reap before re-exec", exc_info=True)
+    # orig_argv, so that a core started with -X or -W comes back with it. It is
+    # the whole command line — [executable, *interpreter options, script,
+    # *script args] — and sys.argv is the tail of it from the script on, so the
+    # options are what the two differ by. Slicing orig_argv[1:] instead would
+    # have put the script path in twice.
+    #
+    # argv[0] is resolved because it is relative today ("source/server.py", from
+    # serve.sh) and that only works as long as nothing ever chdir'd.
+    opts = []
+    if len(sys.orig_argv) > len(sys.argv):
+        opts = sys.orig_argv[1:len(sys.orig_argv) - len(sys.argv)]
+    argv = [sys.executable, *opts,
+            str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]
+    try:
+        os.execv(sys.executable, argv)
+    except OSError as e:
+        # Non-zero, always. Restart=on-failure brings the core back from a
+        # failure; an exit 0 here reads as a deliberate stop and leaves it down
+        # — the worst possible outcome for a command whose entire promise is
+        # that the core comes back.
+        print(f"❌ could not re-exec the core: {e}", file=sys.stderr)
+        sys.stderr.flush()
+        sys.exit(70)
 
 
 if __name__ == "__main__":
