@@ -13,27 +13,38 @@ recipes are short because a principle already decided the hard part.
 ```
 
 **They are standalone scripts, not a pytest suite** — pytest is not installed.
-Each file runs its own cases and reports. None need network or a bot token
-except `test_discord_live.py`, which starts a real core on a temp config
+Each file runs its own cases and reports, and
+`.venv/bin/python tests/run_all.py` runs the lot. None need network or a bot
+token except `test_discord_live.py`, which starts a real core on a temp config
 (still no Discord).
+
+A selection, not the whole directory — there are around 45 files:
 
 | file | covers |
 |---|---|
+| `run_all.py` | the runner: every file above, with the environment-gated ones skipped and named |
+| `test_answer_reserve.py` | the answer reserve, swept across every configured model — the gate's verdict must match the wall's at every point |
 | `test_chunk.py` | the fence-aware chunker, incl. CJK and the real 2000 boundary |
 | `test_clear_new.py` | `/clear` vs `/new` — what each destroys |
 | `test_discord.py` | gate, routing, rendering, all on fakes |
 | `test_discord_live.py` | a real core over the real protocol |
+| `test_doc_pointers.py` | **these docs against the source** — every function, class and constant named in them must still exist, and raw file:line pointers are budgeted at zero |
+| `test_inline_think.py` | `InlineThinkSplitter`, at every chunk boundary |
 | `test_journal.py` | the journal |
+| `test_server_caps.py` | the server probe — reasoning channel, window, usage |
 | `test_session_behavior.py` | the four-layer prompt, path safety, rename |
 | `test_session_index.py` | `index.jsonl` and the id registry |
 | `test_think_pad.py` | the notepad loop |
 | `test_tool_markup.py` | raw-transport tool-call recovery |
+| `test_turn_digest.py` | the per-turn digest, and every path that refuses it |
 
 > ⚠️ **`tests/` is in `.gitignore`.** A fresh clone has no test suite. If you
 > are picking this up from a clone and `tests/` is missing, that is why — ask
 > for it rather than assuming there was never one.
 
-There is no CI. Run the affected files by hand before committing.
+There is no CI. Run the affected files by hand before committing — and
+`test_doc_pointers.py` after touching anything in `docs/`, since it is the
+only test that fails because of a *rename* rather than a behaviour change.
 
 ---
 
@@ -65,7 +76,7 @@ by every session, every turn.
 
 ## Add a command
 
-**`Session.command`** (`core.py:1566`), plus a renderer in each client that
+**`Session.command()`**, plus a renderer in each client that
 should show it.
 
 Decide first whether it is **read-only**. Read-only commands go *before* the
@@ -125,12 +136,12 @@ why `models/sessions/` works for all three
 **`config.yaml` only** — no code. Add an entry under `models:`; the keys are
 documented in `config.example.yaml`. Then `POST /reload` or `/reload`.
 
-`build_engine` (`core.py:137`) monkey-patches nine policy attributes onto the
+`build_engine()` monkey-patches eight policy attributes onto the
 engine instance after construction: `context_length`, `max_output`,
 `turn_timeout`, `reasoning`, `answer_time_reserve`, `max_pad_compactions`,
 `resume_mode`, `reasoning_effort`. **They are not `LLMEngine.__init__`
 parameters**, so grepping `llm_engine.py` for `max_pad_compactions` finds
-nothing. That is where to add a tenth.
+nothing. That is where to add a ninth.
 
 Schema quirk: `default_model` is a **sibling** of the model entries, not a
 top-level key, and `known_models` filters it out by name.
@@ -156,21 +167,21 @@ built-in string.
 
 ## Change the protocol
 
-Bump `PROTOCOL_VERSION` in `core.py:39` **and** `web/app.js:37`. The two Python
+Bump `PROTOCOL_VERSION` in `core.py` **and** `web/app.js`. The two Python
 clients import it; the browser hard-codes it.
 
 New event types are cheap — clients ignore what they do not know. Changing an
 existing event's shape is not: three renderers, no test that they agree.
 
 If you add an event that should survive a reconnect, check
-`Session.emit`'s buffering rules (`core.py:488`): `reasoning` and
+`Session.emit()`'s buffering rules: `reasoning` and
 `reasoning_stat` are excluded entirely, and consecutive `text` deltas are
 coalesced.
 
 ## Change what is persisted
 
-Adding a field to the live-file payload: add it in `persist()` (`core.py:692`)
-and read it in `load_state()` (`core.py:728`) with a default.
+Adding a field to the live-file payload: add it in `persist()`
+and read it in `load_state()` with a default.
 
 > ⚠️ **Do not bump `LIVE_SCHEMA` to do this.** `load_live` skips every file at
 > a different version, so a bump silently discards every user's live

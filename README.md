@@ -224,8 +224,8 @@ All of these are rounds. They differ in what the model is being asked for:
 | **first round** | the opening request of a turn | `max_tokens` |
 | **tool round** | a round that came back asking to run a tool | `max_tokens` |
 | **resume round** | *continues* a thought that ran out of room — the notepad handed back, still open | `max_tokens` |
-| **checkpoint round** | condenses a full notepad so thinking can continue | `max_output_tokens` |
-| **closing round** | the last one: the thought is shut and the model writes the reply | `max_output_tokens` |
+| **checkpoint round** | condenses a full notepad so thinking can continue | the answer reserve |
+| **closing round** | the last one: the thought is shut and the model writes the reply | the answer reserve |
 
 There is **no budget on resume rounds.** The model may take as many as it needs;
 what stops it is time, context, or having nothing more to say. See
@@ -245,7 +245,7 @@ indicator, not a countdown.
 | word | means |
 |---|---|
 | **notepad** (or **pad**) | everything the model has thought so far this turn, accumulated across resume rounds. Lives in memory for one turn, never joins the conversation. |
-| **answer sheet** | the separate allowance for the final reply — `max_output_tokens`. |
+| **answer sheet** | the separate allowance for the final reply, worked out when the thinking stops: 10% of what is still free, at least 4,096, never more than `max_output_tokens`, and never more than the room actually left. |
 | **checkpoint** | the model's own note of what it has established, written when the notepad fills up, replacing the older reasoning. |
 
 ### Limits
@@ -436,6 +436,66 @@ reasoning squeezed out exactly where a hard question needs it (see
 `rollover_before_think` the core rolls over *before* such a turn rather than after
 one that was already degraded. Auto mode only: `ask` must not put a question before
 the turn has even started, and `off` means off.
+
+### Collapsing a finished turn (`digest_turns`)
+
+Rolling over is a last resort — it costs a round, and the fresh window knows
+only what the handoff says. The cheaper move is not to fill the window in the
+first place.
+
+Measured across four real sessions, the tool calls, their arguments and their
+results were **91–95%** of the context. The answers anyone actually reads were
+2–8%, and the questions asked were under half a percent. So with
+`digest_turns: true`, at the end of each turn the part in between is replaced
+by one short model-written digest:
+
+```
+before:   system │ user │ ⟨call ▸ result ▸ call ▸ result ▸ …⟩ │ answer
+after:    system │ user │ answer │ DID / FOUND / CHANGED / RULED OUT
+```
+
+The question and the answer stay word for word; the working-out becomes
+~300–500 tokens. On a 21-turn session that is roughly 173k → 24k, which is the
+difference between rolling over routinely and rarely.
+
+**Nothing is lost, and that is checked rather than claimed.** Every tool call,
+every full result and every round of reasoning is already in the journal,
+written *as the turn runs* — so the collapse only removes a second copy. But
+`jot` never raises, which means a journal that filled the disk on the turn's
+first call looks exactly like one that recorded it perfectly. The digest
+therefore requires the journal to be switched on, healthy, *and* demonstrably
+larger than when the turn started. Failing any of those, the turn is kept in
+full and a warning says so. The same is true if the summariser errors, returns
+nothing, or there is no room for the call.
+
+Each digest ends with the line that reaches what it replaced:
+
+```
+[full record: grep -n '^## turn 7 ' state/sessions/a3f91c2e_letsClaw_….md]
+```
+
+and `models/base.md` tells the model to run it rather than re-derive — the
+same instruction a rolled-over window already gets, pointed at the segment it
+is still inside instead of a closed one.
+
+Three caps bound the digest, smallest wins, mirroring the handoff's: 600
+tokens absolute, `context_length / 50`, and what is free in the call itself.
+That last one is measured against **the turn being summarised**, not the
+session's current usage — the handoff summarises the whole history, so there
+`context_length − used` is the room in its own prompt, but this call sends
+only one turn. Budgeting it against `used` made the digest decline on exactly
+the turns big enough to be worth digesting.
+
+It is not free on every turn. A digest costs its own round and ~200–500
+tokens that every later turn then carries, so a turn whose tool output was a
+handful of lines comes out slightly *bigger* collapsed than left alone —
+measured on a three-turn session with small tool results, 3,134 tokens against
+the control's 2,719. It pays when tool output dominates, which is the common
+case and the one the 91–95% was measured on: the same three turns reading
+whole files instead came out at 3,115 against the control's 35,441.
+
+It ships **off**. It is the first feature that discards context by design, so
+it is opt-in until a model has run clean with it.
 
 Two directories under `state/`, easily confused: **`state/live/` is the conversation
 you are having** — rewritten as you go and reloaded at startup — while
@@ -655,20 +715,28 @@ These are the two budgets, and they are completely separate. That separation is
 the whole reason the core closes the thought itself before asking for a reply.
 
 ```
-thinking room  =  context_length − conversation − answer sheet − margin
-                  (everything left over in the window)
-
-answer room    =  max_output_tokens
+answer room    =  10% of what is still free,
+                  but at least 4,096 and never more than max_output_tokens
                   (a fresh sheet, after the thinking is shut)
+
+thinking room  =  context_length − conversation − answer room − margin
+                  (everything left over in the window)
 ```
 
-Note what is **not** in the first line: no setting caps the thinking directly.
-The notepad simply grows into whatever the window has spare.
+Note what is **not** in the second line: no setting caps the thinking
+directly. The notepad simply grows into whatever the window has spare.
+
+The answer sheet is sized from the room that is left rather than fixed at
+`max_output_tokens`, and the difference is large. A fixed 32,768 on a 100k
+window is a third of the context held back on *every* turn, including the
+empty ones — which put the pre-turn rollover at 61% of the window while the
+UI drew its first warning at 80% and the rollover tick at 90%. The rollover
+that actually fired did so 29 points before anything said it would.
 
 | setting | it is | it is **not** |
 |---|---|---|
 | `max_tokens` | how much one request may generate — a **chunk size** | a limit on how much the model may think in total |
-| `max_output_tokens` | the size of the **answer sheet** | anything to do with thinking |
+| `max_output_tokens` | the **ceiling** on the answer sheet — what the server will actually emit | the size of the sheet, nor a reservation taken on every turn |
 | `context_length` | the real ceiling on everything | per-request |
 
 Worked through with your `qwen38-local` settings, on a short conversation:
@@ -677,9 +745,29 @@ Worked through with your `qwen38-local` settings, on a short conversation:
 |---|---|
 | `context_length: 100000` | the whole window |
 | − conversation (say ~2,000) | question, history, tool results |
-| − `max_output_tokens: 32768` | the answer sheet, held back |
+| − answer room (9,800) | 10% of the 98,000 free; under the 32,768 ceiling |
 | − margin (2,000) | slack, since the token count runs low |
-| **= thinking room** | **~63,000 tokens** |
+| **= thinking room** | **~86,000 tokens** |
+
+Late in the same window the shares invert: at 95% full, 10% of what is free is
+500 tokens, the 4,096 floor takes over, and what is left after the margin is
+the answer sheet's real limit. By then the pre-turn gate is closing and the
+session rolls over.
+
+That gate trips on an **absolute** amount of free window — about 10,100 tokens
+— not on a percentage, so where it lands depends on how big the window is:
+
+| `context_length` | gate trips at about |
+|---|---|
+| 1,000,000 | 99% |
+| 262,144 | 96% |
+| 100,000 | 90% |
+| 32,768 | 69% |
+| 12,000 | 16% |
+
+On a 100k window it coincides with `rollover_at_percent: 90`, so the headroom
+wall and the rollover tick stop being two different walls — they used to sit 29
+points apart. On a small window it is still a much earlier second wall.
 
 At `max_tokens: 8192` that is roughly **eight** resume rounds — but eight is an
 outcome, not a setting. Shrink the conversation and it rises; fill history with
@@ -687,9 +775,12 @@ tool results and it falls.
 
 Three things this catches people out with:
 
-- **Raising `max_output_tokens` does not buy more thinking** — it buys less.
-  The answer sheet is subtracted from the window before the notepad gets any,
-  so a bigger answer sheet means a smaller notepad.
+- **Raising `max_output_tokens` mostly buys nothing.** It is a ceiling, and
+  the ceiling only binds where 10% of the free window is above it — on a 1M
+  context that share is ~100k tokens, so a model that emits at most 8,192
+  stays pinned there however the number is set. Lower it below ~10% of your
+  window and it does start costing thinking room, because then it is what the
+  answer sheet is sized to.
 - **`max_tokens` does not change how much the model can think**, only how many
   round-trips it takes to get there. Smaller chunks are not cheaper: the pad is
   re-sent every round, so halving `max_tokens` roughly **quadruples** the prompt
@@ -714,7 +805,7 @@ graph TD
     LapFin -->|"more thinking,\ncap hit again"| Grow["Add it to the notepad"] --> Wall
     LapFin -->|"it finished and answered"| Answer
     LapFin -->|"nothing written —\nno progress"| Close
-    Wall -->|"no: out of time\nor out of space"| Close["Close the thought, then ask\nfor the answer on a fresh sheet\n= max_output_tokens"]
+    Wall -->|"no: out of time\nor out of space"| Close["Close the thought, then ask\nfor the answer on a fresh sheet\n= the answer reserve"]
     Close --> CFin{"The conclusion is..."}
     CFin -->|"an answer"| Answer
     CFin -->|"an action"| Act["Run the tool\nnotepad has served its purpose"]
@@ -796,16 +887,24 @@ reasoning gets condensed and the sentence it is actually in the middle of is
 left alone.
 
 Turn this on and thinking is limited by **time alone** — which is what the space
-limit was really standing in for.
+limit was really standing in for. Set it to any **negative** number and there is
+no compaction budget at all; `0` already meant "never", so there was no spelling
+for "always" until there was. It is still bounded, just not by a count: the turn
+clock stops it, and a cycle that fails to make the notepad smaller stops it too.
 
 **It is off by default (`0`), on purpose.** Condensing loses detail, and for a
 calculation that carries exact numbers through many steps, finishing from a
 complete notepad usually beats carrying on from a summarised one — a lost
 intermediate value gives you a wrong answer that looks perfectly reasonable.
 Turn it up for work long enough that running out of room is the bigger risk.
-Either way two guards apply: a checkpoint that comes back empty, or one that
-fails to make the notepad any smaller, finishes from the notepad it already has
-rather than looping. The wording is yours to edit, under `## Checkpoint` in
+
+A checkpoint the model cannot write does not end the turn's thinking. The core
+keeps the last ~2,000 tokens and carries on — cruder than a real checkpoint,
+since the older reasoning is simply dropped rather than distilled, but the kept
+part is the sentence being carried on mid-stream, which is the part that had to
+survive word for word anyway. Only when even that cannot make the notepad
+smaller does it stop, and it stops by finishing from the whole notepad rather
+than losing it. The wording is yours to edit, under `## Checkpoint` in
 `models/base.md`.
 
 ### What the notepad costs afterwards
@@ -831,19 +930,23 @@ never interrupted before a turn starts.)
 |---|---|---|
 | `max_tokens` | — | **one instalment** — how much the model may write in a single request. A chunk size, not a thinking budget |
 | `reasoning` | `true` | whether a cut-off thought is resumed at all (`false` turns the notepad off entirely) |
-| `max_output_tokens` | `32768` | **the answer sheet** — the separate allowance for the final reply |
-| `max_pad_compactions` | `0` | how many times a full notepad may be condensed so thinking can go on (`0` = stop and answer) |
+| `max_output_tokens` | `32768` | the **ceiling** on the answer sheet — the most this server will write. Not a reservation; it only binds while 10% of the free window would exceed it |
+| `max_pad_compactions` | `0` | how many times a full notepad may be condensed so thinking can go on (`0` = stop and answer; **negative = no limit**) |
 | `turn_timeout` | `36000` | seconds one whole turn may take, thinking included (`0` = no limit) |
 | `answer_time_reserve` | `120` | seconds of that held back so the answer still gets written |
 | `resume_mode` | `auto` | how to resume a thought on this server — normally leave it alone |
 | `reasoning_effort` | unset | how hard to tell the model to think, if its template supports it |
 
 Rules of thumb: for **more thinking**, give the window more room — a shorter
-conversation, a smaller `max_output_tokens`, or a bigger `context_length`. For
-**fewer round-trips** covering the same thinking, raise `max_tokens`. For a
-**longer final answer**, raise `max_output_tokens` (and accept slightly less
-thinking room). For a **faster, shorter-thinking** model, lower
-`reasoning_effort`.
+conversation, `digest_turns`, or a bigger `context_length`. For **fewer
+round-trips** covering the same thinking, raise `max_tokens`. For a **longer
+final answer**, raise `max_output_tokens`. For a **faster, shorter-thinking**
+model, lower `reasoning_effort`.
+
+`max_output_tokens` only does anything while 10% of the free window would
+exceed it. Below that threshold, lowering it buys thinking room and raising it
+buys answer; above it, the answer sheet is pinned at the 10%/4,096 figure and
+neither does a thing. See [reasoning.md](docs/reasoning.md) for the arithmetic.
 
 > Worth checking on llama.cpp: `reasoning_effort` defaults to **`xhigh`** there,
 > which quietly adds *"think carefully… validate key assumptions, consider
@@ -882,6 +985,19 @@ different questions:
 | `out N tok` | **everything the model generated** this turn — the answer, the thinking, and the arguments of every tool call, summed across all rounds of the agent loop. This is what a metered endpoint bills |
 | `context N/N` | how full the window is, i.e. what the *next* prompt will cost |
 
+`context` measures the message list that is sent to the model, plus the tool
+schemas — not what has been written to disk. That is why a long thinking round
+does not move it (reasoning never enters the message list) while one verbose
+tool result does, and why `/info` and `docs/design-principles.md` call that
+list `history` even though the durable record is somewhere else entirely.
+
+That also makes `context` the one number that can go *down* at the end of a
+turn, which it does when
+[`digest_turns`](#collapsing-a-finished-turn-digest_turns) is on: the turn's
+tool traffic leaves the message list while staying on disk in full. The digest
+that replaces it is counted like any other message — the collapse is visible
+in the conversation and in this figure, never a silent subtraction.
+
 `out` is read from the server's `usage.completion_tokens`, and only when **every**
 round of the turn reported one — a partial sum would look exact while missing rounds.
 Otherwise it is a local estimate and carries a `~`, independently of the `~` on the
@@ -897,6 +1013,17 @@ thinking-headroom check works from, so spending the pad when the real number is 
 rolls sessions over on context that was never there. A window rebuild (`/rollover`,
 `/clear`, `/new`) discards the measurement along with the window, so the `~` comes
 back until the next turn.
+
+Which of the two you are getting is not a guess. `/info` carries a `🛰️` line
+reporting what the server was **probed** to do rather than what the config
+assumes of it: whether thinking comes back in its own field or inline in the
+answer, the window the server was actually started with, and whether usage is
+reported at all. Anything that disagrees with the config is also said once, as
+a warning, on the session's first turn — a `context_length` larger than the
+server's real window, or a server returning thinking as answer text, are both
+otherwise silent and both corrupt the figures above. The probe costs one tiny
+completion per model, once, and a server that cannot answer it is reported as
+unknown rather than allowed to fail a turn.
 
 Beside it, `(N this session)` is a running total, also shown by `/info`. It is an
 odometer, not a gauge: it counts what the session has ever generated, so `/clear` does

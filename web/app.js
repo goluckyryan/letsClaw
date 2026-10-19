@@ -1448,6 +1448,19 @@ function rolloverCount(ro) {
   const n = ro.count || 0;
   return ` · ${n} rollover${n !== 1 ? 's' : ''}`;
 }
+// What the server was probed to actually do, against what the config assumes.
+// Shown even when the two agree: a line that only appears when something is
+// wrong is a line nobody learns to read.
+function serverLine(s) {
+  if (!s) return '';
+  const bits = [`thinking=${esc(s.reasoning_channel)}`];
+  if (s.server_ctx) bits.push(`window ${s.server_ctx}`);
+  if (s.usage_reported != null)
+    bits.push(s.usage_reported ? 'usage reported' : 'usage withheld');
+  return `🛰️ ${bits.join(' · ')}<br>` +
+    (s.warnings || []).map((w) => `<b>⚠️ ${esc(w)}</b><br>`).join('');
+}
+
 function showInfo(i) {
   const pct = i.budget ? Math.round((i.used * 100) / i.budget) : 0;
   const rows = i.recent.map((m) => {
@@ -1472,6 +1485,7 @@ function showInfo(i) {
     (i.rollover.percent
       ? `🔄 rollover ${esc(i.rollover.mode)} at ${i.rollover.percent}% (${i.rollover.trip} tok)${rolloverCount(i.rollover)}<br>`
       : `🔄 rollover disabled (/rollover still works)${rolloverCount(i.rollover)}<br>`) +
+    serverLine(i.server) +
     `<br>📜 recent:<br>${rows}`);
   setGauge(i.used, i.budget, false);
 }

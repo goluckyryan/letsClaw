@@ -53,9 +53,12 @@ models:
     # Smaller is not cheaper: the pad is re-sent every round, so halving this
     # roughly quadruples the prompt tokens processed for the same thinking.
     max_tokens: 4096
-    # The answer sheet. Once thinking has been closed with </think>, the closing
-    # round runs under this cap and every token of it buys answer, not
-    # reasoning. 0 = the closing round keeps max_tokens.
+    # The *ceiling* on the answer sheet, not the sheet itself. Once thinking has
+    # been closed with </think>, the closing round runs under
+    #     min(max(10% of the free window, 4096), this)
+    # further clamped by the room actually left. So this caps the answer, it
+    # does not reserve it: raising it buys nothing unless 10% of your free
+    # window is already above it. 0 = max_tokens becomes the ceiling instead.
     max_output_tokens: 32768
     # Whether a cut-off round is resumed at all. There is deliberately no budget
     # on how many times it may resume: the pad grows until time or context stops
@@ -88,6 +91,9 @@ models:
     # usually better concluded from a whole pad than continued from a summary —
     # raise this only for analyses long enough that running out of room is the
     # worse outcome. The note comes from "## Checkpoint" in the base file.
+    # Any negative number = no limit, for the one setting a thought that must
+    # not be cut short actually wants. It is still bounded: by the turn clock,
+    # and by the pad having to shrink on every cycle to continue at all.
     max_pad_compactions: 0
     # How a cut-off round is resumed:
     #   auto - probe the server once and pick (default)
@@ -233,6 +239,17 @@ conversation:
   # Cap on one recorded block, so a runaway `cat` costs a megabyte and not the
   # volume. Nothing you would deliberately run comes close.
   journal_max_block_chars: 1000000
+  # Collapse each finished turn to a digest of what it did. The question and
+  # the answer stay word for word; what goes is the working-out between them —
+  # the tool calls, their arguments and their results — which measures 91-95%
+  # of a typical window. The next turn sees DID / FOUND / CHANGED / RULED OUT
+  # and a grep line pointing at the journal block holding the full record.
+  # false (default) = keep every turn in full. This is the only setting that
+  # discards context deliberately, so it ships off: turn it on once you have
+  # watched a few turns and confirmed the model greps the journal rather than
+  # redoing the work. It requires `journal: true` and silently declines on any
+  # turn the journal did not record — the context must never be the only copy.
+  digest_turns: false
   live_dir: "state/live"        # live conversations; reloaded when the core restarts
   prompt_timeout: 60            # seconds to wait for a rollover answer before keeping the session
 

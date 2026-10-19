@@ -5,15 +5,15 @@ Everything a client needs. The core is `source/server.py` (transport) over
 parse JSON. There are three today — see [clients.md](clients.md) — and the
 protocol is the only thing they share.
 
-**Protocol version** is `core.PROTOCOL_VERSION` (`core.py:39`), currently `1`.
-`chat.py:35` and `discord_client.py:72` import it; **`web/app.js:37` hard-codes
+**Protocol version** is `core.PROTOCOL_VERSION`, currently `1`.
+`chat.py` and `discord_client.py` import it; **`web/app.js` hard-codes
 it** and must be kept in sync by hand. Bumping it means editing two places.
 
 ---
 
 ## HTTP
 
-Routes registered at `server.py:309-319`.
+Routes registered in `build_app()`.
 
 | Method + path | Auth | Returns |
 |---|---|---|
@@ -29,7 +29,7 @@ Routes registered at `server.py:309-319`.
 | `GET /` , `GET /static/*` | **no** | the WebUI from `web/` — registered only if `web/index.html` exists |
 | `GET /theme.css` | **no** | generated CSS from `webui.pin` in config.yaml — the style of the pinned prompt; `/reload` re-themes it |
 
-**Auth** (`_authorised`, `server.py:56-62`): the token is `core.token`; empty
+**Auth** (`_authorised()`): the token is `core.token`; empty
 means everything is open. Accepts `Authorization: Bearer <tok>` **or**
 `?token=<tok>`. Rejection is a 401.
 
@@ -60,7 +60,7 @@ job.
 
 `?session=` is **not validated** — a session named `../../etc/passwd` can
 exist. The guard is at the point the name becomes a path that is read
-(`core.py:1781`).
+(`Session.roll_over()`).
 
 ### Attaching is a connection, not a handshake
 
@@ -68,7 +68,7 @@ There is no attach message. The name is a query parameter and `hello` — the
 first event on every connection — carries the snapshot back. **So reconnecting
 is the same operation as connecting.**
 
-The order in `ws_handler` (`server.py:197-204`) is load-bearing:
+The order in `ws_handler()` is load-bearing:
 
 1. `session.attach(sub)` — so nothing emitted during the greeting is lost
 2. send `session.snapshot(last_seq)` — the `hello` event
@@ -92,7 +92,7 @@ non-fatal `error`; non-text frames are ignored.
 awaited inline**, so the reader stays live for `stop` and `rollover_reply`
 during a long turn.
 
-**Commands** (`Session.command`, `core.py:1781`), name lowercased and a leading
+**Commands** (`Session.command()`), name lowercased and a leading
 `/` stripped. Three groups, not two, and the third is the one that was being
 filed under the first:
 
@@ -113,7 +113,7 @@ this session".
 ### Core → client
 
 Every event carries `seq` and `session`, stamped by `Session.emit`
-(`core.py:483`).
+(`Session.emit()`).
 
 | `t` | payload | |
 |---|---|---|
@@ -137,7 +137,7 @@ Every event carries `seq` and `session`, stamped by `Session.emit`
 
 ### Replay semantics
 
-`Session.emit` (`core.py:488-500`) buffers into `turn_events` for the current
+`Session.emit()` buffers into `turn_events` for the current
 turn:
 
 - consecutive `text` deltas are **coalesced** (append-only, so lossless — and
@@ -149,18 +149,18 @@ A fresh attach is served from history; `missed` covers a reconnect.
 
 ### Backpressure
 
-The writer task (`server.py:149-169`) is the **sole owner of the socket for
+The writer task (`_writer()`) is the **sole owner of the socket for
 outbound traffic** — the turn never touches it, so a stalled peer cannot stall
 generation.
 
-A subscriber's queue has `maxlen=2000` (`core.py:260`). On overflow the client
+A subscriber's queue has `maxlen=2000` (`Subscriber`). On overflow the client
 is **dropped**: close code `TRY_AGAIN_LATER` (1013) with
 `b"too slow; reconnect and replay"`. A client that sees 1013 should reconnect
 with its `last_seq`.
 
 ### Session re-homing
 
-If a session is deleted while you are attached (`server.py:221-230`), your
+If a session is deleted while you are attached (`session.dead`, handled in `ws_handler()`), your
 socket stays open. You get a notice, and your next `submit` or `command`
 transparently lands on a **fresh, empty session of the same name** — the
 handler detaches, calls `mgr.get(session.name)`, re-attaches and sends a new

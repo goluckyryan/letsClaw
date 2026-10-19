@@ -29,7 +29,7 @@ conversation state — see
 
 | file | lines | owns |
 |---|---|---|
-| `source/core.py` | ~2720 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
+| `source/core.py` | ~3100 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
 | `source/session.py` | ~700 | **the disk layer.** Live store, archives, the journal, the handoff summariser, the id registry |
 | `source/server.py` | ~850 | **the transport.** aiohttp routes, the WebSocket handler, the Host and Origin guards, auth, backpressure |
 | `source/llm_engine.py` | ~580 | **the model.** Two transports (`chat` and `raw`), streaming, tool-call parsing, resume |
@@ -48,7 +48,7 @@ conversation state — see
 | `source/discord_probe.py` | ~50 | **"should the bot be started?", answered once.** `serve.sh` and `install.sh` both run it and read the verdict off the exit code; they used to each carry their own copy of the question and the copies drifted |
 | `web/` | ~2170 (`app.js`) | the browser client (`index.html`, `app.js`, `style.css`) — vanilla JS, no build step |
 
-`session.py` is imported as `store` (`core.py:36`) and **never imports
+`session.py` is imported as `store` and **never imports
 `core`** — the dependency runs one way. Neither do `config.py`, `behavior.py`
 or `paths.py`, which is what lets a test import any of them on their own.
 
@@ -65,13 +65,13 @@ Holds `history`, `engine`, the three behavior layers, per-session policy, and
 the set of attached `Subscriber`s.
 
 **Policy is copied per session, never read live off the shared config dict**
-(`core.py:245`). A session that disables its own rollover must not disable
+(`Session.__init__()`). A session that disables its own rollover must not disable
 everyone else's.
 
 Two odometers survive `/clear` and restarts: `total_output` and
 `rollover_count`.
 
-`session_id` — 8 hex, minted once (`core.py:278`), immediately replaced by
+`session_id` — 8 hex, minted once in `Session.__init__()`, immediately replaced by
 `SessionManager.get` with a registry-checked one so a collision cannot happen
 silently. See [principle 5](design-principles.md#5-identity-is-the-session-id-the-name-is-a-label).
 
@@ -100,23 +100,23 @@ Notable methods: `get` (create on demand), `restore` (eager at startup),
 
 Three free functions worth knowing before you touch the turn loop:
 
-- **`settled(history)`** (`core.py:146`) — returns a copy with any unfinished
+- **`settled(history)`** — returns a copy with any unfinished
   trailing turn popped: trailing `tool_calls`, `role="tool"`, or `role="user"`,
   back-to-front so a whole interrupted turn unwinds as a unit. Both `persist()`
   and `repair_history()` use it, so memory and disk agree on what "finished"
   means.
-- **`truncated_tool_calls(result)`** (`core.py:174`) — calls whose `arguments`
+- **`truncated_tool_calls(result)`** — calls whose `arguments`
   are non-empty but fail `json.loads`. **These are never run**; `rm -rf
   /tmp/scratch` truncated to `rm -rf /` is the accident this prevents. Empty
   arguments are legitimate.
-- **`strip_tool_markup(text)`** (`core.py:194`) — removes `<tool_call>…` from
+- **`strip_tool_markup(text)`** — removes `<tool_call>…` from
   prose. Only ever relevant on the raw transport.
 
 ---
 
 ## The turn, end to end
 
-`Session.run_turn` (`core.py:743`) → `Session._turn` (`core.py:824`).
+`Session.run_turn()` → `Session._turn()`.
 
 ### `run_turn` — the wrapper
 
@@ -154,37 +154,47 @@ else:                                        # rounds exhausted
 
 history.append(assistant)
 emit(stats)
+_digest_turn(user_msg, reasoning, blocks_before)   ← collapses this turn's
+                                               working set, BEFORE rollover
 _after_turn(used)                            ← rollover evaluated ONLY here
 ```
+
+**That order is load-bearing too.** Digesting after `_after_turn` would let
+rollover throw the un-collapsed window away first, and the digest would be
+doing nothing.
 
 Rollover is evaluated only after the tool loop has fully drained, so no
 `tool_call`/`tool_result` pair can be split across a window boundary.
 
 ### The four closures inside `_turn`
 
-- **`call_round(...)`** (`core.py:938`) — the single funnel for every model
+- **`call_round(...)`** — the single funnel for every model
   call. Measures TTFT, dispatches to `chat_with_tools` or `resume_round`, then
   `tally`, then journals **every path by construction**. This is the only place
   a pad's reasoning is ever recorded, since the pad never enters history.
-- **`tally(result, history_shaped=True)`** (`core.py:893`) — folds one round's
+- **`tally(result, history_shaped=True)`** — folds one round's
   usage in. **`history_shaped=False` for resumed rounds**: a resume's prompt
   carries the thinking pad, which never reaches history, so letting it set
   `last_prompt` would measure the window tens of thousands of tokens fuller and
-  trip a spurious rollover.
-- **`run_tools(result)`** (`core.py:1028`) — appends the assistant message
+  trip a spurious rollover. When `history_shaped=True` it does the converse and
+  **publishes `_last_used` immediately**, not just at turn end: the prompt just
+  sent *was* the current history, so it is a live measurement, and the pad wall
+  reads it on every round. That is what lets a tool result landing mid-turn move
+  the wall. See trap 7 for the obligation this creates.
+- **`run_tools(result)`** — appends the assistant message
   (substituting `"{}"` for truncated calls so history stays server-valid),
   **reserves every result slot up front** with `"error: cancelled"` so a turn
   torn off mid-loop still leaves a well-formed history, then per call: emit
   `tool_call` *before* running, jot, run, **full output to the journal and
   clipped output to the model**, emit `tool_result`.
-- **`push_reasoning_stat(...)`** (`core.py:868`) — counts only the new slice,
+- **`push_reasoning_stat(...)`** — counts only the new slice,
   **cutting at the last space**, because a token carries its leading space
   (`" alpha"` is one token; `"alpha"` + `" "` is two) and cutting anywhere else
   inflates the running sum.
 
 ### Token accounting
 
-`out_exact = rounds > 0 and out_reported == rounds` (`core.py:1232`) — the
+`out_exact = rounds > 0 and out_reported == rounds` (in `tally()`) — the
 server's sum is trusted **only if every round reported one**. A partial sum
 looks authoritative while understating.
 
@@ -200,7 +210,8 @@ numbers for one quantity reads as a bug.
 
 ## The thinking pad
 
-`core.py:1302-1580`. The most intricate subsystem; read the section in
+`_headroom_check()` through `_think_pad()` and `_compact_pad()`. The most
+intricate subsystem; read the section in
 [principle 6](design-principles.md#6-separate-the-notepad-from-the-answer-sheet)
 first.
 
@@ -209,19 +220,20 @@ hard and say nothing. Rather than bin that work, the reasoning becomes a *pad*
 handed back unclosed, and the model continues mid-sentence.
 
 > **The pad lives only in `_think_pad`'s local variable. It never enters
-> `history`** (`core.py:1351`), so it costs nothing after the turn and cannot
+> `history`**, so it costs nothing after the turn and cannot
 > move the rollover point. Keep it that way.
 
 | function | |
 |---|---|
-| `_pad_headroom()` | `budget - estimate() - answer_cap - 2000` |
-| `_headroom_check()` | pre-turn rollover when headroom < `MIN_THINK_HEADROOM` (4000) |
+| `_answer_reserve()` | `clamp(10% of free, 4096, max_output_tokens)`, then clamped to `free - 2000`, floored at 256 |
+| `_pad_headroom()` | `budget - used_now() - _answer_reserve() - PAD_CONTEXT_MARGIN (2000)`. `used_now()`, not `estimate()` — it prefers the server's measurement |
+| `_headroom_check()` | pre-turn rollover when headroom < `MIN_THINK_HEADROOM` (4000). Reads the *same* `_pad_headroom()` as the wall, and must keep doing so |
 | `_think_pad(...)` | the resume loop |
 | `_pad_tail(pad)` | the last ~2000 tokens **verbatim** — never summarised, because the model must resume *mid-sentence* |
 | `_compact_pad(...)` | replaces the pad with `<checkpoint note> + tail`. Off by default; compaction is lossy |
 | `_forced_conclusion(...)` | the fallback when `resume_mode` resolves to `off` |
 
-**The resume loop is deliberately unbounded** (`core.py:1374`) — no round
+**The resume loop is deliberately unbounded** (`_think_pad()`) — no round
 budget, because a count is not a limit the machine actually has. It exits on:
 the time deadline, the context wall, a finished answer, a non-`length` stop, or
 **the no-progress guard** — cut off at the cap having written *nothing* means
@@ -236,14 +248,14 @@ one, because there is no way to splice a tool result into an unclosed thinking
 block without forfeiting the pad.
 
 `_forced_conclusion` has one wart worth knowing: **on success it leaves the
-directive in `history`** (`core.py:1572`), so a synthetic user message
+directive in `history`**, so a synthetic user message
 permanently joins the conversation. Only on the non-resumable path.
 
 ---
 
 ## The four-layer system prompt
 
-`Session.fresh_history()` (`core.py:423`):
+`Session.fresh_history()`:
 
 ```python
 content = self.base_behavior                                    # models/base.md
@@ -252,7 +264,7 @@ if self.session_behavior: content += SESSION_MARKER + self.session_behavior
 if carryover:             content += CARRYOVER_MARKER + carryover
 ```
 
-**The ordering is load-bearing.** `carryover()` (`core.py:489`) recovers layer 4
+**The ordering is load-bearing.** `carryover()` recovers layer 4
 by partitioning on `CARRYOVER_MARKER` and taking everything *after* it. Anything
 appended below would be read back as part of the handoff and re-appended on the
 next rebuild — growing the prompt every turn.
@@ -282,13 +294,13 @@ Full story: [decisions/2026-09-30-session-behavior-layer.md](decisions/2026-09-3
 
 ## Rollover
 
-`_after_turn` → `_maybe_roll` → `roll_over` (`core.py:1582-1780`).
+`_after_turn()` → `_maybe_roll()` → `roll_over()`.
 
 `trip = budget * rollover_pct / 100`; `0` disables. Modes: `auto` rolls, `ask`
 prompts (and will not re-ask until usage climbs another 5% of budget), `off`
 warns once.
 
-**The loop-breaker** (`core.py:1591`): after a successful roll, if the *fresh*
+**The loop-breaker** (in `_after_turn()`): after a successful roll, if the *fresh*
 window still exceeds the trip, `rollover_pct` is set to `0` with a warning.
 That setting is runtime-mutable and persisted, which is why `apply_config` uses
 a divergence test rather than blindly reapplying config values, and why
@@ -313,7 +325,7 @@ a divergence test rather than blindly reapplying config values, and why
 
 ## Config reload
 
-`SessionManager.reload` (`core.py:2160`) is the most consequential function in
+`SessionManager.reload()` is the most consequential function in
 the file.
 
 1. **Validate before committing.** `load_config` + `build_all_engines` in a
@@ -332,7 +344,7 @@ the file.
 6. **Close only orphaned old engines.** A session mid-stream must keep its
    engine — closing the client under it aborts the read.
 
-`apply_config` (`core.py:518`) is deliberately **synchronous and
+`apply_config()` is deliberately **synchronous and
 assignment-only**: all I/O happens in `reload` beforehand, because the deferred
 path runs inside `run_turn`'s `finally` while a `CancelledError` is
 propagating, and an `await` there can be interrupted again and leave the
@@ -475,18 +487,22 @@ explaining it; this is the index.
 4. **`self.config` is mutated in place, never rebound.**
 5. **`LIVE_SCHEMA` bumps discard users' live conversations.**
 6. **`/new` is irreversible**; `/clear` is not. Do not make them more alike.
-7. **`_last_used` is only written on a successful answer** (`core.py:1249`) but
-   read unconditionally by `_after_turn`. A turn that produced no answer
-   evaluates rollover against the *previous* turn's figure.
+7. **`_last_used` is published mid-turn** by `tally` on every round where
+   `history_shaped=True`, so the pad wall tracks the window as tool results
+   land. The corollary: **every path that reshapes `history` must clear it** —
+   `repair_history`, `_digest_turn`, the `max_history` trim, `roll_over`,
+   `use_model`, `/clear`. Leave it set and the next headroom check reads a
+   window that no longer exists, then rolls over to relieve pressure that call
+   had already relieved.
 8. **`persist()` writes `settled(history)` but does not modify the live
    history** — disk and memory intentionally disagree after an interrupted turn
    until `repair_history()` runs. Don't "fix" it.
-9. **`/reload` is intentionally outside the turn lock** (`core.py:1827`).
+9. **`/reload` is intentionally outside the turn lock** (`Session.command()`).
    Taking it deadlocks, because `reload` defers busy sessions and would defer
    the one that asked.
 10. **An unknown command issued during a turn reports "a turn is running"**,
     not "unknown command" — the lock check precedes the fall-through.
-11. **The `for/else` at `core.py:1134`/`1177`** fires only when the tool-round
+11. **The `for/else` in `record_partial()`** fires only when the tool-round
     budget is exhausted without a `break`. Easy to misread as an error branch.
 12. **Session names are unvalidated at creation**; only `rename` validates.
     `session_behavior_path` is the double guard. If you add another place where

@@ -65,9 +65,20 @@ _SUMMARISER_SYSTEM = (
 # The same reasoning is why base.md's checkpoint asks for "every approach you
 # ruled out and why" — this is that rule applied one level up.
 _HANDOFF_FORMAT = """OBJECTIVE: the user's current goal, one sentence
-ESTABLISHED: bullet list of decisions and facts already settled
+ESTABLISHED: bullet list of decisions and facts already settled, including anything written, edited or created, with paths
 RULED OUT: bullet list of approaches tried and rejected, each with why — so they are not tried again
 OPEN: bullet list of what still needs doing"""
+
+# The same four-part shape one rung down. A handoff compresses a whole window
+# and is written for a reader who was not there; a digest compresses one turn's
+# working-out for the same conversation, which already has the question and the
+# answer verbatim either side of it. So it says what was *done* rather than what
+# the goal is, and CHANGED is split out from FOUND because an edit to the world
+# is the one thing a later turn must not be allowed to forget it already did.
+_DIGEST_FORMAT = """DID: bullet list of what was actually run or inspected — commands, paths, searches
+FOUND: bullet list of what that established, with the concrete values
+CHANGED: bullet list of anything written, edited or created — paths — or "nothing"
+RULED OUT: bullet list of approaches tried and rejected, each with why — so they are not tried again"""
 
 
 def _resolve(path, default):
@@ -477,6 +488,20 @@ class Journal:
             encoding="utf-8")
         return path
 
+    @property
+    def healthy(self):
+        """Whether this segment is still being written to.
+
+        `write` swallows its errors by design, so "the call returned" says
+        nothing about whether anything reached the disk. Anyone about to drop
+        something from the context because the journal has it must ask this
+        first: the moment the journal is the only copy, a broken segment turns
+        a log line into silent, total loss. `blocks` is the other half of the
+        question — healthy says the file is still open to us, blocks says how
+        much of the session actually landed in it.
+        """
+        return not self._broken
+
     async def write(self, header, body=""):
         """Append one block. Never raises."""
         if self._broken:
@@ -694,3 +719,55 @@ async def build_handoff(engine, history, max_tokens=1500, prior=""):
         logger.warning(f"no-thinking hint rejected ({e}); retrying without it")
         text = await engine.chat(messages, max_tokens=max_tokens, temperature=0.2)
     return (text or "").strip()
+
+
+async def build_turn_digest(engine, turn_slice, pad="", max_tokens=600,
+                            record=""):
+    """Compress one turn's working-out. Returns "" if it produced nothing.
+
+    The third rung of the same ladder: `## Checkpoint` in base.md compacts a
+    thinking pad *within* a turn, build_handoff compacts a window *across* a
+    rollover, and this compacts one turn so the next one does not have to carry
+    it. What it replaces is 90-95% of a typical window — the tool calls and
+    their results — against a user prompt and an answer that are 2-8% between
+    them.
+
+    `pad` is the turn's final thinking, which is nowhere in `turn_slice`:
+    reasoning never enters history. It is the half of the turn that says *why*
+    a command was run, so a digest written without it can describe what
+    happened and not what it was for.
+
+    `record` is the grep line pointing at the journal block this digest stands
+    in for. It is appended rather than asked for, because the model writing the
+    digest cannot be trusted to copy a path accurately and does not need to:
+    the caller knows it exactly.
+
+    Runs on its own message list, like build_handoff — the real history is
+    never touched and this request never becomes part of the conversation.
+    """
+    body = render_transcript(turn_slice)
+    if pad.strip():
+        body = (f"{body}\n\n--- the assistant's own reasoning during this turn ---"
+                f"\n\n{pad.strip()}")
+    if not body.strip():
+        return ""
+    messages = [
+        {"role": "system", "content": _SUMMARISER_SYSTEM},
+        {"role": "user", "content": (
+            f"One turn of a conversation:\n\n{body}\n\n"
+            f"Write a digest of the work in that turn using exactly these four "
+            f"sections:\n\n{_DIGEST_FORMAT}")},
+    ]
+    # Same hint and same fallback as build_handoff: a thinking model spends the
+    # whole budget reasoning and returns an empty string otherwise.
+    try:
+        text = await engine.chat(
+            messages, max_tokens=max_tokens, temperature=0.2,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+    except Exception as e:
+        logger.warning(f"no-thinking hint rejected ({e}); retrying without it")
+        text = await engine.chat(messages, max_tokens=max_tokens, temperature=0.2)
+    text = (text or "").strip()
+    if not text:
+        return ""
+    return f"{text}\n\n{record}".strip() if record else text

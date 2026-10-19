@@ -369,6 +369,11 @@ def build_engine(config, model_name=None, forward=None):
     # checkpoint and carry on. Off by default: compaction is lossy, and for a
     # derivation that carries exact values through many steps, concluding from a
     # complete pad usually beats continuing from a summarised one.
+    #
+    # Negative means no limit. `0` already means "never compact", so there was
+    # no spelling for "always" — the one setting a thought that must not be cut
+    # short actually wants. Thinking is still bounded: by the turn clock, and by
+    # the pad having to shrink on every cycle to continue at all.
     engine.max_pad_compactions = int(entry.get("max_pad_compactions", 0) or 0)
     mode = str(entry.get("resume_mode", "auto")).lower()
     if mode not in ("auto", "chat", "raw", "off"):

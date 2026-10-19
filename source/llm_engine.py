@@ -41,6 +41,129 @@ THINK_OPEN = "<think>\n"
 THINK_CLOSE = "\n</think>\n\n"
 
 
+class InlineThinkSplitter:
+    """Separate an inline thinking block from the answer that follows it.
+
+    Reasoning is supposed to arrive in `reasoning_content`, apart from the
+    answer, so that letsClaw can keep it out of history: the whole notepad
+    design rests on thinking being free because it never joins the
+    conversation. Two llama.cpp settings break that — `--reasoning-format
+    none` sends the trace in `message.content`, and `deepseek-legacy` sends it
+    in both — and on that path an unseparated blob is appended to history as
+    answer text and re-sent on every later turn. A 20k-token thought then
+    costs 20k tokens of context forever instead of nothing.
+
+    `_raw_complete` has always split this; the chat transport never did, and
+    the chat transport is the one that carries ordinary rounds. Both go
+    through here now, because two implementations of one tag-scanner is two
+    places for the boundary cases to disagree — and they already did: the
+    copy in `_raw_complete` leaked the tag's own trailing newlines into the
+    answer whenever the tag ended exactly on a chunk boundary.
+
+    `start` says where the stream begins, which is not the same question on
+    the two transports:
+
+    | start | used by | meaning |
+    |---|---|---|
+    | `deciding` | chat | an opening tag *might* be first; look for one |
+    | `reasoning` | raw, growing pad | already inside the block — the prefill wrote the opening tag |
+    | `passthrough` | raw, closing round | already past `</think>`; everything is answer |
+
+    In `deciding` it engages only when the stream *opens* with the tag — that
+    is what the template emits — so an answer that merely mentions it is
+    passed through untouched. Costs nothing on a correctly configured server:
+    there is no opening tag, the first chunk decides that, and everything
+    after is forwarded unexamined.
+    """
+
+    OPEN, CLOSE = "<think>", "</think>"
+
+    def __init__(self, start="deciding"):
+        # deciding -> reasoning -> after_close -> done, or deciding -> passthrough
+        assert start in ("deciding", "reasoning", "passthrough"), start
+        self._state = start
+        self._buf = ""
+        # The newline after an opening tag belongs to the tag. It may arrive
+        # in a later chunk than the tag did, so this outlives one feed().
+        self._eat_open_newlines = False
+
+    def feed(self, chunk):
+        """One chunk in; `(text, reasoning)` out, either possibly empty."""
+        if self._state in ("passthrough", "done"):
+            return chunk, ""
+        if self._state == "after_close":
+            # The close tag ended exactly on a chunk boundary, so the newlines
+            # that belong to the tag arrive in the next one. Drop them, then
+            # stop looking.
+            chunk = chunk.lstrip("\n")
+            if not chunk:
+                return "", ""
+            self._state = "done"
+            return chunk, ""
+        if self._state == "deciding":
+            self._buf += chunk
+            head = self._buf.lstrip()
+            if not head:
+                return "", ""                      # whitespace only so far
+            if head.startswith(self.OPEN):
+                self._state, self._buf = "reasoning", ""
+                self._eat_open_newlines = True
+                return self._consume(head[len(self.OPEN):])
+            if self.OPEN.startswith(head):
+                return "", ""                      # still could become the tag
+            self._state, out, self._buf = "passthrough", self._buf, ""
+            return out, ""
+        return self._consume(chunk)
+
+    def _consume(self, chunk):
+        """In the thinking block: emit reasoning, watch for the close tag."""
+        if self._eat_open_newlines:
+            # Mirror of `after_close`, at the other end of the block: the
+            # thought does not begin with the tag's own line break.
+            chunk = chunk.lstrip("\n")
+            if not chunk:
+                return "", ""
+            self._eat_open_newlines = False
+        self._buf += chunk
+        if self.CLOSE in self._buf:
+            head, _, tail = self._buf.partition(self.CLOSE)
+            self._buf = ""
+            # The newlines around the tag are the tag's, not the thought's and
+            # not the answer's. When the tail is empty they are still coming.
+            tail = tail.lstrip("\n")
+            self._state = "done" if tail else "after_close"
+            return tail, head.rstrip("\n")
+        if len(self._buf) > len(self.CLOSE):
+            # Hold back as much as a split close tag could still occupy — and
+            # the newlines in front of it, which are the tag's if the tag is
+            # what follows. Emitting those eagerly is how a thought ends up
+            # with a trailing blank line that belongs to the markup.
+            cut = len(self._buf) - len(self.CLOSE)
+            while cut and self._buf[cut - 1] == "\n":
+                cut -= 1
+            if cut:
+                out, self._buf = self._buf[:cut], self._buf[cut:]
+                return "", out
+        return "", ""
+
+    def finish(self):
+        """Flush whatever is held back. `(text, reasoning)`."""
+        buf, self._buf = self._buf, ""
+        if self._state == "reasoning":
+            return "", buf        # ended mid-thought; the remainder is thinking
+        if self._state == "after_close":
+            return "", ""         # only the tag's own trailing newlines left
+        return buf, ""            # never saw an opening tag; it was always text
+
+
+def _split_inline_think(content):
+    """`InlineThinkSplitter` over one complete string. `(text, reasoning)`."""
+    s = InlineThinkSplitter()
+    t1, r1 = s.feed(content)
+    t2, r2 = s.finish()
+    return t1 + t2, r1 + r2
+
+
 class RoundInterrupted(Exception):
     """A /steering arrived while this round was streaming: stop the round now.
 
@@ -208,6 +331,18 @@ class LLMEngine:
         #   auto - probe once, lazily, and cache the answer in _resume_probed
         self.resume_mode = "auto"
         self._resume_probed = None
+        # What the server actually does, as opposed to what config assumes.
+        # Probed once, lazily; see capabilities().
+        self._caps = None
+        # Whether the chat transport looks for an inline thinking block in
+        # message.content. True until the probe says otherwise, because the
+        # failure it guards against — a whole trace appended to history as the
+        # answer — is far worse than its own failure mode, which is an answer
+        # that genuinely opens with the markup being read as a thought.
+        # capabilities() turns it off once it has seen the server use the
+        # dedicated channel, which is the only proof that the markup in an
+        # answer is the answer's.
+        self.split_inline_think = True
         # Passed through as chat_template_kwargs. Qwen3 templates turn this into
         # a system directive; llama.cpp defaults to xhigh, which is a large part
         # of why rounds run out of budget mid-reasoning. None = leave it alone.
@@ -275,6 +410,112 @@ class LLMEngine:
         self._resume_probed = mode
         logger.info(f"resume transport for {self.default_model}: {mode}")
         return mode
+
+    async def capabilities(self) -> dict:
+        """What this server actually does, against what the config assumes.
+
+        Three of letsClaw's load-bearing assumptions are the server's to keep,
+        and none of them were checked:
+
+        - **reasoning lands in `reasoning_content`.** Under llama.cpp's
+          `--reasoning-format none` it lands in `message.content` instead, and
+          `chat_with_tools` does no <think> stripping on that path — so the
+          whole trace streams as answer text and is appended to history. The
+          context fills with thinking that was supposed to never be there, and
+          nothing says so.
+        - **`context_length` fits inside the server's window.** Configure more
+          than the server was started with and every overflow is the server's
+          to handle: a 400, or, with --context-shift, silent truncation.
+        - **usage is reported.** When it is withheld every context figure is a
+          local estimate carrying a deliberate +60% pad, which is a very
+          different number to act on.
+
+        Resolved once and cached, like resume_transport(): a diagnostic may
+        not cost a round per turn. Every failure degrades to "unknown" rather
+        than raising — this reports on a turn, it does not gate one.
+        """
+        if self._caps is not None:
+            return self._caps
+        caps = {"reasoning_channel": "unknown", "server_ctx": None,
+                "usage_reported": None, "warnings": []}
+
+        # llama.cpp's /props. default_generation_settings.n_ctx is the per-slot
+        # window — ctx-size divided by --parallel — which is what one request
+        # actually gets, so it beats any total reported alongside it. Anything
+        # that is not llama.cpp simply has no such endpoint, and says nothing.
+        try:
+            session = await self._http()
+            async with session.get(f"{self.base_url.removesuffix('/v1')}/props",
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    props = await r.json()
+                    gen = props.get("default_generation_settings") or {}
+                    caps["server_ctx"] = gen.get("n_ctx") or props.get("n_ctx")
+        except Exception as e:
+            logger.debug(f"/props probe failed for {self.default_model}: {e}")
+
+        configured = getattr(self, "context_length", 0)
+        if caps["server_ctx"] and configured > caps["server_ctx"]:
+            caps["warnings"].append(
+                f"context_length {configured:,} exceeds the server's window "
+                f"({caps['server_ctx']:,}) — prompts past it are the server's "
+                f"to drop, not ours")
+
+        # One tiny completion, to see which field the thinking comes back in.
+        # Skipped when the model is not a thinking model: there is no reasoning
+        # channel to get wrong, and a round spent proving it is a round wasted.
+        if self.reasoning:
+            try:
+                params = self.get_model_params()
+                params.update(max_tokens=64, temperature=0)
+                # Its own timeout: the client's is turn_timeout, which can be
+                # hours, and a diagnostic that hangs /info is worse than one
+                # that gives up.
+                r = await self.client.with_options(timeout=30).chat.completions.create(
+                    messages=[{"role": "user", "content": "In one word: 2+2?"}],
+                    **params)
+                msg = r.choices[0].message
+                content = msg.content or ""
+                thinking = getattr(msg, "reasoning_content", None) or ""
+                inline = THINK_OPEN.strip() in content
+                caps["reasoning_channel"] = (
+                    "both" if thinking and inline else
+                    "separate" if thinking else
+                    "inline" if inline else "silent")
+                usage = getattr(r, "usage", None)
+                caps["usage_reported"] = bool(usage and usage.prompt_tokens)
+            except Exception as e:
+                logger.debug(f"reasoning probe failed for {self.default_model}: {e}")
+
+        # The probe acts on what it found rather than only reporting it. The
+        # splitter defaults on, so "inline"/"both" only confirms it; the useful
+        # verdict is the other one. A server that put this model's thinking in
+        # the dedicated field will not also inline it, so markup arriving in
+        # content from here on is the answer's own and must be left alone —
+        # which matters most in a session about software that writes about
+        # these tags. "unknown" and "silent" keep the guard: neither is proof.
+        if caps["reasoning_channel"] in ("separate",):
+            self.split_inline_think = False
+        if caps["reasoning_channel"] in ("inline", "both"):
+            caps["warnings"].append(
+                f"this server returns thinking in message.content "
+                f"({caps['reasoning_channel']}) — letsClaw is separating it so "
+                f"it stays out of the context, but fix it at the source: on "
+                f"llama.cpp that is --reasoning-format, and it wants auto or "
+                f"deepseek, not none or deepseek-legacy")
+        if caps["usage_reported"] is False:
+            caps["warnings"].append(
+                "this server withholds token usage — every context figure is "
+                f"a local estimate carrying the +60% pad, shown with a ~")
+
+        self._caps = caps
+        for w in caps["warnings"]:
+            logger.warning(f"{self.default_model}: {w}")
+        logger.info(f"capabilities for {self.default_model}: "
+                    f"reasoning={caps['reasoning_channel']} "
+                    f"server_ctx={caps['server_ctx']} "
+                    f"usage={caps['usage_reported']}")
+        return caps
 
     async def chat(self, messages: list, model: str | None = None, **overrides) -> str:
         """Send a chat completion request. Returns the assistant message text.
@@ -355,8 +596,18 @@ class LLMEngine:
                         "arguments": tc.function.arguments or "",
                     })
                 usage = getattr(response, "usage", None)
-                return ChatResult(msg.content or "", tool_calls, choice.finish_reason,
-                                  reasoning=getattr(msg, "reasoning_content", None) or "",
+                reasoning = getattr(msg, "reasoning_content", None) or ""
+                # Defensive: a server configured to inline its thinking sends
+                # the whole trace here, and letsClaw would append it to history
+                # as the answer. No-op when the content has no opening tag, and
+                # off entirely once capabilities() has seen a dedicated channel.
+                text = msg.content or ""
+                if self.split_inline_think:
+                    text, inline = _split_inline_think(text)
+                    if inline:
+                        reasoning = f"{reasoning}{inline}" if reasoning else inline
+                return ChatResult(text, tool_calls, choice.finish_reason,
+                                  reasoning=reasoning,
                                   prompt_tokens=getattr(usage, "prompt_tokens", None),
                                   completion_tokens=getattr(usage, "completion_tokens", None))
 
@@ -378,6 +629,10 @@ class LLMEngine:
             pending = {}  # index -> accumulated tool call
             finish = None
             usage = None
+            # Same guard as the non-streaming path above, applied per delta so
+            # a close tag split across two chunks is still found. None once the
+            # probe has proved the server has a channel of its own for this.
+            splitter = InlineThinkSplitter() if self.split_inline_think else None
             try:
                 async for chunk in response:
                     if getattr(chunk, "usage", None):
@@ -394,8 +649,15 @@ class LLMEngine:
                         if on_reasoning:
                             on_reasoning(rchunk)
                     if delta.content:
-                        text_parts.append(delta.content)
-                        on_text(delta.content)
+                        dtext, dreason = (splitter.feed(delta.content)
+                                          if splitter else (delta.content, ""))
+                        if dreason:
+                            reason_parts.append(dreason)
+                            if on_reasoning:
+                                on_reasoning(dreason)
+                        if dtext:
+                            text_parts.append(dtext)
+                            on_text(dtext)
                     for tc in (delta.tool_calls or []):
                         slot = pending.setdefault(
                             tc.index, {"id": None, "name": None, "arguments": ""})
@@ -412,6 +674,15 @@ class LLMEngine:
                     await response.close()
                 except Exception:
                     pass
+            # Flush anything held back against a close tag that never came.
+            ftext, freason = splitter.finish() if splitter else ("", "")
+            if freason:
+                reason_parts.append(freason)
+                if on_reasoning:
+                    on_reasoning(freason)
+            if ftext:
+                text_parts.append(ftext)
+                on_text(ftext)
             tool_calls = [pending[i] for i in sorted(pending)]
             return ChatResult("".join(text_parts), tool_calls, finish,
                               reasoning="".join(reason_parts),
@@ -447,10 +718,11 @@ class LLMEngine:
         """Stream llama.cpp /completion from a raw prompt.
 
         /completion has no tool calling and no reasoning_content — it returns one
-        text stream with `</think>` inline — so chunks are split on that tag:
-        before it is reasoning, after it is the answer. in_reasoning says which
-        side of the tag the prompt left us on: a growing pad opens inside the
-        block, a closing round has already written `</think>` and is pure answer.
+        text stream with `</think>` inline — so chunks are split on that tag by
+        the same InlineThinkSplitter the chat transport uses. in_reasoning says
+        which side of the tag the prompt left us on: a growing pad opens inside
+        the block, a closing round has already written `</think>` and is pure
+        answer, so it looks for nothing at all.
         """
         session = await self._http()
         body = {"prompt": prompt, "stream": True, "cache_prompt": True}
@@ -460,9 +732,9 @@ class LLMEngine:
             body["chat_template_kwargs"] = kw
 
         reason_parts, text_parts = [], []
-        buf = ""           # holds back a partial `</think>` split across chunks
         finish, usage = None, {}
-        close_tag = "</think>"
+        splitter = InlineThinkSplitter(
+            start="reasoning" if in_reasoning else "passthrough")
         # Does for tool calls what the chat endpoint's parser would: takes them
         # out of the text on the way past, so they can be run instead of read.
         markup = ToolMarkupFilter()
@@ -473,6 +745,11 @@ class LLMEngine:
                 text_parts.append(visible)
                 if on_text:
                     on_text(visible)
+
+        def emit_reasoning(part):
+            reason_parts.append(part)
+            if on_reasoning:
+                on_reasoning(part)
 
         async with session.post(f"{self.base_url.removesuffix('/v1')}/completion",
                                 json=body) as r:
@@ -495,32 +772,18 @@ class LLMEngine:
                 chunk = d.get("content") or ""
                 if not chunk:
                     continue
-                if not in_reasoning:
-                    emit_text(chunk)
-                    continue
-                buf += chunk
-                if close_tag in buf:
-                    head, _, tail = buf.partition(close_tag)
-                    # The newline before the tag is the tag's, not the pad's.
-                    head = head.rstrip("\n")
-                    if head:
-                        reason_parts.append(head)
-                        if on_reasoning:
-                            on_reasoning(head)
-                    in_reasoning, buf = False, ""
-                    tail = tail.lstrip("\n")
-                    if tail:
-                        emit_text(tail)
-                elif len(buf) > len(close_tag):
-                    # Keep back only as much as a split tag could still occupy.
-                    emit, buf = buf[:-len(close_tag)], buf[-len(close_tag):]
-                    reason_parts.append(emit)
-                    if on_reasoning:
-                        on_reasoning(emit)
-        if buf:  # stream ended mid-thought; the tail is reasoning
-            reason_parts.append(buf)
-            if on_reasoning:
-                on_reasoning(buf)
+                dtext, dreason = splitter.feed(chunk)
+                if dreason:
+                    emit_reasoning(dreason)
+                if dtext:
+                    emit_text(dtext)
+        # Flush what was held back against a close tag that never arrived. The
+        # splitter decides which side it falls on: mid-thought it is reasoning.
+        ftext, freason = splitter.finish()
+        if freason:
+            emit_reasoning(freason)
+        if ftext:
+            emit_text(ftext)
         tail = markup.finish()
         if tail:
             text_parts.append(tail)

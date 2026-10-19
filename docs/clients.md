@@ -64,7 +64,7 @@ The token is entered in the page and kept in `localStorage`; it goes out as
 `?token=` because a browser cannot set a WebSocket header.
 
 > ⚠️ **`PROTOCOL_VERSION` is hard-coded as `1` in `app.js:37`** while the two
-> Python clients import it from `core.py:39`. Bumping the protocol means
+> Python clients import it from `core.py`. Bumping the protocol means
 > editing this line by hand.
 
 ## Discord — `source/discord_client.py`
@@ -84,7 +84,7 @@ complete client, which is the useful thing to know if you are writing a fourth.
 **Answers are chunked** by `source/chunker.py` (fence-aware, so a code block is
 never split mid-fence). Past `max_messages` chunks the opening chunks go out
 and the whole answer follows as an `answer.md` attachment
-(`discord_client.py:606`).
+(`_attach_answer()`).
 
 **Authorisation is a hard-required allowlist.** `discord.users` empty — the
 default — refuses everybody, everywhere, including guild channels. A bot is a
@@ -96,7 +96,7 @@ addressing it gets silence.
 `mention_list`), resolved and printed per channel at startup.
 
 Slash commands are registered as a real `app_commands.CommandTree`
-(`discord_client.py:1266`), synced per guild (immediate) and globally (needed
+(`_format_info()`), synced per guild (immediate) and globally (needed
 for DMs, up to an hour to propagate), guarded to run once per process rather
 than per reconnect.
 

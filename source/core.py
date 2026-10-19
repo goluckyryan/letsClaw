@@ -56,6 +56,19 @@ HANDOFF_MARGIN = 200
 # cap binds first and this does nothing; on a small model it is what stops the
 # summary becoming a permanent tax on the context it was meant to save.
 HANDOFF_WINDOW_SHARE = 20
+# A turn digest replaces one turn's working-out, not a whole window, and the
+# conversation keeps the question and the answer verbatim either side of it —
+# so it needs far less room than a handoff, and unlike a handoff there is one
+# per turn, so every token is paid for again on every later turn.
+DIGEST_MAX_TOKENS = 600
+DIGEST_MIN_TOKENS = 128
+DIGEST_MARGIN = 200
+DIGEST_WINDOW_SHARE = 50
+# How much of a turn's reasoning is shown to the digester. The pad is the only
+# unbounded input here — a long turn's thinking can exceed the whole window —
+# and it is already on disk in full, so the tail is taken: the reasoning that
+# led to the answer, rather than the exploring that preceded it.
+DIGEST_PAD_TAIL_CHARS = 20_000
 # cl100k plus our framing under-counts this stack by ~30% (chat-template markers
 # and the server's own tool rendering are invisible to us). Only used when the
 # server withholds usage: rolling over early costs a summary, late costs a 400.
@@ -76,6 +89,17 @@ FORCED_CONCLUSION_TRIES = 3
 # Below this much free context there is no room to think in, so the pad is not
 # worth starting — the pre-turn check rolls over instead where it may.
 MIN_THINK_HEADROOM = 4000
+# The answer reserve, as a share of the context still free. See
+# Session._answer_reserve: a share rather than a fixed block, floored so a
+# nearly-full window still has room for a real answer and ceilinged by what
+# the server will actually emit.
+ANSWER_RESERVE_SHARE = 0.10
+MIN_ANSWER_ROOM = 4096
+# What is asked for when even the room clamp has run out. Past this point the
+# window is full and the request will be refused whatever we send — which,
+# with context shift off, is the loud failure we want rather than a silent
+# truncation. Never 0: that reads as "no limit" to some servers.
+ABSOLUTE_ANSWER_FLOOR = 256
 # How much of a compacted pad stays word-for-word. A checkpoint replaces the
 # distant past, but the model must still resume *mid-sentence*, so the tail it
 # left off in is never summarised.
@@ -111,9 +135,13 @@ def api_messages(history):
 
     The `at` stamp is for the clients' clocks, not the prompt: it would ride
     in every request as invisible overhead, and a server that echoes unknown
-    keys could surface it in the answer.
+    keys could surface it in the answer. `digest` marks a message as a turn
+    summary rather than something the assistant said, which the clients draw
+    differently and the model has no use for. Anything added here must be
+    added to this filter too — the default is to send it.
     """
-    return [{k: v for k, v in m.items() if k != "at"} for m in history]
+    drop = ("at", "digest")
+    return [{k: v for k, v in m.items() if k not in drop} for m in history]
 
 
 class Subscriber:
@@ -252,9 +280,21 @@ class Session:
         # Roll over before a turn that has no room left to think in, rather than
         # after one whose thinking was squeezed out. Auto mode only.
         self.rollover_before_think = bool(conv.get("rollover_before_think", True))
+        # Collapse each finished turn's tool traffic to a digest, leaving the
+        # question and the answer verbatim. Off by default: it is the first
+        # thing here that discards context on purpose, and it is only safe
+        # while the journal is keeping up — see _digest_turn.
+        self.digest_turns = bool(conv.get("digest_turns", False))
         self.prompt_timeout = configlib.int_or(conv.get("prompt_timeout", 60), 60)
         self.declined_at = None
         self.warned_over = False
+        # Said once per window when the pre-turn gate declines to act on a
+        # window with no thinking room left. See _headroom_check.
+        self._no_room_warned = False
+        # Whether this session has already said what the server probe found.
+        # Once is the point: the findings are about the engine, not the turn,
+        # and repeating them every turn is how a warning becomes wallpaper.
+        self._server_warned = False
         # Everything this session has ever asked the model to generate. An
         # odometer, not a gauge: /clear empties the conversation but does not
         # rewind what it cost, and it carries across a restart with the session.
@@ -512,6 +552,15 @@ class Session:
         if len(self.history) < before:
             logger.warning("session %s: rolled back %d unfinished turn message(s)",
                            self.name, before - len(self.history))
+            # The window just shrank, so the measured prompt size describes a
+            # history that no longer exists — the same reset roll_over, the
+            # max_history trim and _digest_turn all do after reshaping. It
+            # matters here because tally() now publishes a measurement mid-turn:
+            # a turn that died after its tool calls would otherwise leave the
+            # next headroom check reading a window several thousand tokens
+            # fuller than the one it just rolled back to, and roll over to
+            # relieve pressure this call had already relieved.
+            self._last_used = None
 
     # ---- config reload ---------------------------------------------------
 
@@ -578,6 +627,23 @@ class Session:
             self._journal = store.Journal(self.session_id, self.name,
                                           self.model_name, self.config)
         await self._journal.write(header, body)
+
+    def journal_ok(self):
+        """Whether the journal is actually recording this session right now.
+
+        The gate for anything that drops context on the grounds that the
+        journal holds it. Three ways the answer is no, and only the first is
+        obvious: journalling is switched off, no segment has been opened yet,
+        or a write failed earlier and closed the segment early. `jot` reports
+        none of these — it never raises, which is right for a redundant second
+        copy and dangerous for a sole one.
+        """
+        return bool(self.journal_on and self._journal is not None
+                    and self._journal.healthy)
+
+    def journal_blocks(self):
+        """How many blocks have reached this segment. 0 when there is none."""
+        return self._journal.blocks if self._journal else 0
 
     async def close_journal(self):
         """End the current segment. Returns its path, or None if it is empty."""
@@ -822,11 +888,19 @@ class Session:
                                          self.name)
 
     async def _turn(self, text):
+        await self._warn_about_server()
         # Before the user message lands, so a roll starts the fresh session with
         # this turn's question in it rather than one turn late.
         await self._headroom_check()
-        self.history.append({"role": "user", "content": text,
-                             "at": getattr(self, "_turn_at", None) or now_stamp()})
+        # Held by identity, not by index: _digest_turn needs to find where this
+        # turn begins after the tool loop and repair_history have both reshaped
+        # the list around it.
+        user_msg = {"role": "user", "content": text,
+                    "at": getattr(self, "_turn_at", None) or now_stamp()}
+        self.history.append(user_msg)
+        # The journal's high-water mark before this turn wrote anything, so the
+        # digest can tell "recorded" from "the write failed silently".
+        blocks_before = self.journal_blocks()
         user_tok = count_text(text)
         # After the headroom check, so the question opens the segment it is
         # actually answered in rather than the one that just rolled away.
@@ -905,6 +979,15 @@ class Session:
             rounds += 1
             if history_shaped and result.prompt_tokens is not None:
                 last_prompt = result.prompt_tokens
+                # Publish it immediately, not only at turn end. history_shaped
+                # means the prompt just sent *was* the current history, so this
+                # is a measurement of the window as it stands. The pad wall
+                # reads used_now() on every round and a tool result can land
+                # between two of them; without this it spends the whole turn
+                # reading the previous turn's figure and allows a pad sized for
+                # a window that no longer exists. The comment on answer_cap in
+                # _think_pad already assumed this was happening.
+                self._last_used = last_prompt
             if result.completion_tokens is not None:
                 out_reported += 1
                 out_measured += result.completion_tokens
@@ -1285,8 +1368,9 @@ class Session:
                 # the useful one; with it on, the loop said what it did already.
                 self.emit(ev("notice", level="warn",
                              text="the answer hit the output cap mid-reasoning — "
-                                  "raise max_output_tokens (or the model's "
-                                  "max_tokens) and try again"))
+                                  "raise max_tokens and try again, or turn "
+                                  "reasoning on so the round is resumed "
+                                  "instead of lost"))
             else:
                 self.emit(ev("notice", level="info",
                              text=f"no answer — the model likely spent its budget on "
@@ -1297,12 +1381,93 @@ class Session:
         # history — only the answer does — so a long think cannot drag the
         # rollover trip point forward. Keep it that way.
         if not had_error:
+            # Before _after_turn, not after: _after_turn is where rollover is
+            # evaluated, so digesting afterwards would roll the un-collapsed
+            # window away and leave this doing nothing at all.
+            await self._digest_turn(user_msg, "".join(reasoning_parts), blocks_before)
             await self._after_turn(getattr(self, "_last_used", None))
 
+    def _answer_reserve(self):
+        """Context tokens held back so the closing round can still be written.
+
+        A share of what is actually free, not a fixed block. The fixed block
+        was `max_output_tokens`, and on a 100k window with a 32,768 cap that
+        reserved a third of the context permanently: the pre-turn gate fired
+        at 61% while the UI drew its first warning at 80% and the rollover
+        tick at 90%, so the rollover that actually happened happened 29 points
+        before anything said it would. That is the "it rolled over at 60%"
+        report this replaces.
+
+        `max_output_tokens` keeps a job here, but a different one. It stops
+        being the reservation and becomes the ceiling — a real property of the
+        server rather than a policy knob. On a 1M window 10% of free is
+        ~100k tokens, and a model that emits at most 8,192 will not write
+        them: you cannot reserve room for an answer the server will not
+        produce.
+        """
+        free = max(0, self.budget - self.used_now())
+        ceiling = self.engine.max_output or (
+            self.engine.extra_params.get("max_tokens") or 0)
+        want = max(int(ANSWER_RESERVE_SHARE * free), MIN_ANSWER_ROOM)
+        # The ceiling wins even against the floor: a server capped below
+        # MIN_ANSWER_ROOM cannot be talked into writing more by reserving it.
+        if ceiling:
+            want = min(want, ceiling)
+        # And the room wins over both. On a window smaller than the floor's
+        # 4096 — qwen36's 12k once it is two-thirds full — reserving the floor
+        # reserves space that is not there, and the closing round then asks
+        # for a prompt plus an answer that together overflow. Capped here, the
+        # pre-turn gate closes instead and the session rolls over.
+        return max(ABSOLUTE_ANSWER_FLOOR,
+                   min(want, free - PAD_CONTEXT_MARGIN))
+
     def _pad_headroom(self):
-        """Context tokens a thinking pad may still grow into."""
-        answer = self.engine.max_output or (self.engine.extra_params.get("max_tokens") or 0)
-        return self.budget - self.used_now() - answer - PAD_CONTEXT_MARGIN
+        """Context tokens a thinking pad may still grow into.
+
+        The pre-turn gate is not independent policy — it is a *prediction of
+        what the pad wall will do*, and both read this. They were once allowed
+        to differ, which opened a band where the gate waved a turn through,
+        the wall then allowed zero thinking rounds, and the closing round
+        asked for more than the window held: a 400 that discarded the turn.
+        Any change here has to keep them reading the same number.
+        """
+        return (self.budget - self.used_now() - self._answer_reserve()
+                - PAD_CONTEXT_MARGIN)
+
+    async def _server_caps(self):
+        """LLMEngine.capabilities(), or None — never an exception.
+
+        Its two callers are a diagnostic and a notice. Neither is worth
+        failing a turn or a /info over, and an engine that cannot be probed
+        (a stub, a server that is down) is exactly the case where someone is
+        most likely to be reading /info.
+        """
+        if not self.engine:
+            return None
+        try:
+            return await self.engine.capabilities()
+        except Exception as e:
+            logger.debug(f"capability probe failed: {e}")
+            return None
+
+    async def _warn_about_server(self):
+        """Say once, out loud, where the server disagrees with the config.
+
+        A misconfigured `--reasoning-format` or a `context_length` larger than
+        the window the server was started with are both silent: the session
+        keeps working and keeps being wrong, and the symptom surfaces turns
+        later as a context figure nobody can explain. The probe is cached on
+        the engine, so this costs one round per core per model, once.
+
+        Never fatal, and never blocking: a server that cannot answer the probe
+        is a server that may still answer the turn.
+        """
+        if self._server_warned or not self.engine:
+            return
+        self._server_warned = True
+        caps = await self._server_caps()
+        for w in (caps or {}).get("warnings", []):
+            self.emit(ev("notice", level="warn", text=w))
 
     async def _headroom_check(self):
         """Roll over *before* a turn when there is no room left to think in.
@@ -1312,22 +1477,29 @@ class Session:
         thinking would be off exactly where a hard question needs it. Rolling
         first gives the turn a fresh window. Only in auto mode: `ask` must not
         put a question before the turn has even started, and `off` means off.
+
+        When it declines for one of those reasons it still *says* so, once per
+        window. Every early return below is a turn that will start with no room
+        to think in, and the symptom — a hard question answered as if thinking
+        were switched off — looks nothing like its cause. A session can reach
+        the `rollover_pct == 0` case on its own, via the auto-disable in
+        _after_turn, so this is not only a misconfiguration warning.
         """
         if not (self.engine and self.engine.reasoning and self.budget):
             return
         if self.rollover_mode != "auto" or not self.rollover_before_think:
-            return
+            return self._warn_no_thinking_room()
         # rollover_at_percent: 0 means never, and _after_turn already honours it.
         # This path has to as well, or a session that switched rollover off — by
         # config, or by the auto-disable when even a fresh window trips the
         # threshold — would still be rolled over from here, which is both a
         # surprise and, in the auto-disable case, the loop that guard prevents.
         if not self.rollover_pct:
-            return
+            return self._warn_no_thinking_room()
         # Same guard as _maybe_roll, for the same reason: this fires before
         # every turn, so an unarchivable window would error on every one.
         if self.rollover_blocked:
-            return
+            return self._warn_no_thinking_room()
         if self._pad_headroom() >= MIN_THINK_HEADROOM:
             return
         used = self.used_now()
@@ -1336,6 +1508,25 @@ class Session:
                           f"left — rolling over before the turn"))
         await self.roll_over("no thinking headroom", used,
                              int(self.budget * self.rollover_pct / 100))
+
+    def _warn_no_thinking_room(self):
+        """Say once that this window has no room left to think in.
+
+        Policy is unchanged — `ask` still must not interrupt before a turn and
+        `off` still means off. This only ends the silence, which was the part
+        that made a full window indistinguishable from a model that had stopped
+        reasoning.
+        """
+        if self._no_room_warned:
+            return
+        room = self._pad_headroom()
+        if room >= MIN_THINK_HEADROOM:
+            return
+        self._no_room_warned = True
+        self.emit(ev("notice", level="warn",
+                     text=f"only {max(0, room)} tok of thinking room left and this "
+                          "session will not roll over by itself — /rollover, or set "
+                          "rollover_mode: auto"))
 
     async def _think_pad(self, call_round, turn_t0, seed, allow_tools=True):
         """Resume a cut-off round instead of re-asking the question.
@@ -1353,7 +1544,6 @@ class Session:
         """
         pad = seed or ""
         lap_cap = self.engine.extra_params.get("max_tokens") or None
-        answer_cap = self.engine.max_output or lap_cap
         # Thinking must stop early enough that the closing round still fits
         # inside the turn wall that run_turn already holds us to.
         wall = self.engine.turn_timeout
@@ -1362,7 +1552,7 @@ class Session:
 
         transport = await self.engine.resume_transport()
         if transport == "off":
-            return await self._forced_conclusion(call_round, answer_cap)
+            return await self._forced_conclusion(call_round, self._answer_reserve())
         # Only the chat transport parses tool calls; see the answer phase below.
         tools_ok = allow_tools and transport == "chat"
 
@@ -1378,7 +1568,10 @@ class Session:
                                   f"after {rounds} round(s) — concluding"))
                 break
             if self._pad_headroom() - count_text(pad) <= 0:
-                if compactions >= self.engine.max_pad_compactions:
+                # Negative is "no limit" — see config.py. The loop still cannot
+                # spin: every cycle has to shrink the pad or it breaks below.
+                if (self.engine.max_pad_compactions >= 0
+                        and compactions >= self.engine.max_pad_compactions):
                     self.emit(ev("notice", level="info",
                                  text=f"thinking filled the context after {rounds} "
                                       "round(s) — concluding"))
@@ -1391,11 +1584,26 @@ class Session:
                                  text=f"thinking filled the context after {rounds} "
                                       "round(s), too little to compact — concluding"))
                     break
-                compacted = await self._compact_pad(call_round, pad, answer_cap)
+                compacted = await self._compact_pad(call_round, pad,
+                                                    self._answer_reserve())
                 compactions += 1
-                # On failure keep the pad we already have: concluding from a
-                # complete pad is the fallback, losing it is never.
                 if not compacted:
+                    # The model could not distil its own pad. Falling straight
+                    # to the answer here spends the whole compaction budget on
+                    # one bad note, so drop the older reasoning mechanically
+                    # instead: the tail is the resume point, which is the part
+                    # that has to survive verbatim anyway. Lossier than a real
+                    # checkpoint, and still better than stopping.
+                    tail = self._pad_tail(pad)
+                    if count_text(tail) < count_text(pad):
+                        self.emit(ev("notice", level="info",
+                                     text="the checkpoint came back empty — keeping "
+                                          f"the last ~{count_text(tail)} tok and "
+                                          "thinking on"))
+                        pad = tail
+                        continue
+                    # Nothing to gain; concluding from a complete pad is the
+                    # fallback, losing it is never.
                     break
                 pad = compacted
                 continue   # re-test the walls against the smaller pad
@@ -1442,6 +1650,13 @@ class Session:
 
         # Answer phase: we write </think> ourselves, so this cap buys answer only.
         #
+        # Read here rather than at the top of the function, so it is the same
+        # number the wall above just stopped the pad on. A tool can run during
+        # the pad loop, which moves used_now() and therefore the reserve; a cap
+        # captured before that would be the stale one, and the gate and the
+        # request would once again be describing different windows.
+        answer_cap = self._answer_reserve()
+        #
         # Tools are offered here, and only here. A resume must not call one: there
         # is no way to splice a tool result into the middle of an unclosed
         # thinking block, so an interrupted resume would forfeit the pad — the very
@@ -1481,8 +1696,8 @@ class Session:
         text = strip_tool_markup(result.text)
         if not text:
             self.emit(ev("notice", level="warn",
-                         text="the answer phase came back empty — raising "
-                              "max_output_tokens may help"))
+                         text="the answer phase came back empty — the window is "
+                              "full; roll over, or lower rollover_at_percent"))
         return ChatResult(text)
 
     @staticmethod
@@ -1575,9 +1790,117 @@ class Session:
             if result.finish_reason != "length":
                 break
         self.emit(ev("notice", level="warn",
-                     text="forced conclusions came back empty — raising "
-                          "max_output_tokens may help"))
+                     text="forced conclusions came back empty — the window is "
+                          "full; roll over, or lower rollover_at_percent"))
         return ChatResult("")
+
+    async def _digest_turn(self, user_msg, reasoning, blocks_before):
+        """Replace one finished turn's working-out with a digest of it.
+
+        The question and the answer stay word for word. What goes is the part
+        in between — the assistant messages carrying tool_calls, their
+        arguments, and the role="tool" results they produced — which across
+        four measured sessions was 91-95% of the window. The journal already
+        holds every byte of it verbatim, written as the turn ran, so this
+        shortens what the model is shown and nothing else.
+
+        That last sentence is a guarantee, so it is checked rather than
+        assumed. `jot` never raises: a journal that filled the disk on the
+        first tool call of this turn looks exactly like one that recorded it
+        perfectly, and dropping the only copy on that evidence would be
+        silent, total loss. Hence `blocks_before` — the journal must be
+        healthy *and* demonstrably larger than when the turn started.
+
+        Everything else here fails toward keeping the context: no engine, no
+        room, a digest that comes back empty, an exception anywhere — all of
+        them leave the history exactly as the turn left it.
+        """
+        if not (self.digest_turns and self.engine):
+            return
+        # Identity, not an index: repair_history and the tool loop both reshape
+        # the list during a turn, and an index captured before that is a
+        # different message by now.
+        start = next((i for i, m in enumerate(self.history) if m is user_msg), None)
+        if start is None:
+            return
+        work = self.history[start + 1:]
+        if not any(m.get("tool_calls") for m in work) and not reasoning.strip():
+            return   # a plain chat turn has no working-out; spend no round
+
+        if not (self.journal_ok() and self.journal_blocks() > blocks_before):
+            self.emit(ev("notice", level="warn",
+                         text="not collapsing this turn — the journal did not "
+                              "record it, and the context is the only copy"))
+            return
+
+        # The same three caps as the handoff, for the same reasons: an absolute
+        # ceiling, a share of the window so the digests do not become the tax
+        # they exist to avoid, and what is actually free in the call about to
+        # be made.
+        #
+        # That third cap is measured against `work`, not against the session's
+        # current usage, and the difference matters. The handoff summarises the
+        # whole history, so there `budget - used` is the room in its own
+        # prompt. This call sends only the turn, and the window is at its
+        # fullest precisely because of the turn being collapsed — budgeting it
+        # against `used` made the digest decline on every turn big enough to be
+        # worth digesting, rolling the window over instead.
+        cap = min(DIGEST_MAX_TOKENS,
+                  self.budget // DIGEST_WINDOW_SHARE,
+                  self.budget - self.estimate(work) - DIGEST_MARGIN
+                  ) if self.budget else DIGEST_MAX_TOKENS
+        if cap < DIGEST_MIN_TOKENS:
+            self.emit(ev("notice", level="info",
+                         text="no headroom to digest this turn — keeping it in full"))
+            return
+
+        # The answer is the last plain assistant message of the turn. There may
+        # be none: a turn can end on an error or produce nothing but tool calls.
+        answer = next((m for m in reversed(work)
+                       if m.get("role") == "assistant" and not m.get("tool_calls")
+                       and (m.get("content") or "").strip()), None)
+        # Every user message survives, not just the one that opened the turn:
+        # a /steering interjection lands in the middle of the working set and
+        # is something a person typed. Those are the one thing here that exists
+        # nowhere else in a recoverable form, so they are never summarised.
+        spoken = [m for m in work if m.get("role") == "user"]
+        # Inside the try with the call it belongs to, not above it. The turn
+        # has already produced its answer by the time any of this runs, so
+        # nothing here may cost it — and this line reaches two attributes
+        # deep through a gate thirty lines up.
+        try:
+            path = getattr(self._journal, "path", None)
+            record = (f"[full record: grep -n '^## turn {self.turn_id} ' "
+                      f"{path}]") if path else ""
+            digest = await store.build_turn_digest(
+                self.engine, work,
+                pad=reasoning[-DIGEST_PAD_TAIL_CHARS:], max_tokens=cap,
+                record=record)
+        except Exception as e:
+            self.emit(ev("notice", level="warn",
+                         text=f"could not digest this turn ({e}) — keeping it in full"))
+            return
+        if not digest:
+            return
+
+        # Assigned in one statement, never mutated in place: a cancellation
+        # between two mutations would leave a history that settled() no longer
+        # recognises, and this runs inside the turn's own timeout wall.
+        self.history = (
+            self.history[:start + 1]
+            + spoken
+            + ([answer] if answer else [])
+            + [{"role": "assistant", "content": digest,
+                "at": now_stamp(), "digest": True}])
+        # The window just got much smaller, so the measured prompt size
+        # describes a history that no longer exists — same reason as the
+        # max_history trim below and roll_over's own reset. Leaving it set
+        # would have the very next check roll over to relieve pressure this
+        # just relieved.
+        self._last_used = None
+        self.emit(ev("notice", level="info",
+                     text=f"turn {self.turn_id} collapsed to a {count_text(digest)} tok "
+                          f"digest (the full record is in the journal)"))
 
     async def _after_turn(self, measured_used):
         trip = int(self.budget * self.rollover_pct / 100) if self.budget and self.rollover_pct else 0
@@ -1588,6 +1911,7 @@ class Session:
                 rolled = await self._maybe_roll(used, trip)
         if rolled:
             self.declined_at, self.warned_over = None, False
+            self._no_room_warned = False
             if trip and self.estimate() >= trip:
                 self.emit(ev("notice", level="warn",
                              text=f"the fresh session already exceeds {self.rollover_pct}% "
@@ -1814,6 +2138,10 @@ class Session:
                              "trip": int(self.budget * self.rollover_pct / 100)
                                      if self.rollover_pct else 0,
                              "count": self.rollover_count},
+                # What the server actually does, not what the config assumes.
+                # Probed once per engine and cached, so this is free after the
+                # first /info; see LLMEngine.capabilities.
+                "server": await self._server_caps(),
             }}
         if name == "behavior":
             return {"ok": True, "model": self.model_name,
@@ -1854,6 +2182,7 @@ class Session:
                 await self.refresh_behavior()
                 self.history = self.fresh_history()
                 self.declined_at, self.warned_over = None, False
+                self._no_room_warned = False
                 self.rollover_pct = self._configured_rollover_pct()
                 self._last_used = None
                 # /clear starts a new window as surely as a rollover does, it
@@ -1884,6 +2213,7 @@ class Session:
                                      "conversation is untouched. See the error "
                                      "above; free some disk and try again."}
                 self.declined_at, self.warned_over = None, False
+                self._no_room_warned = False
                 await self.persist()
                 return {"ok": True}
             if name == "new":
@@ -1895,6 +2225,7 @@ class Session:
                 await self.refresh_behavior()
                 self.history = self.fresh_history()
                 self.declined_at, self.warned_over = None, False
+                self._no_room_warned = False
                 self.rollover_count = 0
                 self.rollover_pct = self._configured_rollover_pct()
                 self._last_used = None
@@ -1939,6 +2270,9 @@ class Session:
                         self.name, self.model_name, name)
         self.engine = engine
         self.model_name = name
+        # A different engine is a different server with different answers, so
+        # the findings this session has already reported are about somebody else.
+        self._server_warned = False
         # The base is shared by every session, the model file is per model,
         # and the session file is named for this session.
         (self.base_behavior, self.behavior,
@@ -2432,6 +2766,10 @@ class SessionManager:
                                configlib.int_or(new_conv.get("prompt_timeout", 60), 60)),
             ("rollover_before_think", bool(old_conv.get("rollover_before_think", True)),
                                       bool(new_conv.get("rollover_before_think", True))),
+            # Turning this on affects the next turn to finish; turns already
+            # collapsed stay collapsed, which is what the journal is for.
+            ("digest_turns", bool(old_conv.get("digest_turns", False)),
+                             bool(new_conv.get("digest_turns", False))),
             # Turning this off leaves the open segment where it is: it closes at
             # the next rollover, holding what was recorded before the reload.
             ("journal_on", bool(old_conv.get("journal", True)),

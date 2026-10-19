@@ -11,6 +11,31 @@ against it.
 
 ---
 
+## Vocabulary
+
+Four words below are used as if they were defined, and three of them name
+different things that all sound like "the conversation". The one that causes
+real mistakes is `history`:
+
+| term | what it is | lives |
+|---|---|---|
+| `history` | the message list sent to the model each round — **this is the context** | memory; `history[0]` is the system message |
+| transcript | the message list archived at rollover | `state/sessions/*.json` |
+| journal | reasoning, every tool call, every **full** tool result, written as the turn runs | `state/sessions/*.md` |
+| live file | the session, so a restart does not lose it | `state/live/*.json` |
+
+**`history` is not a disk record.** It is the prompt. Shrinking it costs the
+model what it can see, not what was kept — principle 7 is about the journal,
+which is why reasoning can be absent from one and complete in the other.
+
+Two things are context but not history: the **tool schemas**, sent as the
+`tools` parameter and counted once per core, and the **thinking pad**, re-sent
+as a prefill each resume round and gone at the end of the turn. So:
+
+```
+context = history + tool schemas + (within a turn) the pad
+```
+
 ## 1. The core owns the conversation; clients are windows onto it
 
 The core (`source/server.py` + `source/core.py`) is a long-lived service
@@ -47,8 +72,8 @@ templates the core lifts out and sends at the moment each applies:
 
 | section | extracted by | sent when |
 |---|---|---|
-| `## Checkpoint` | `extract_checkpoint_directive` (`core.py:367`) | a full notepad is about to be compacted |
-| `## Forced conclusion` | `extract_conclude_directive` (`core.py:362`) | the server cannot resume a cut-off thought |
+| `## Checkpoint` | `extract_checkpoint_directive()` | a full notepad is about to be compacted |
+| `## Forced conclusion` | `extract_conclude_directive()` | the server cannot resume a cut-off thought |
 
 So the wording of the machinery is tunable without touching code. That is the
 principle: **anything that is really a prompt should live in a file the user
@@ -68,6 +93,13 @@ memory retrieval.
 This is why the token counts in the `⚡` line can be trusted, and it is the
 thing to protect hardest when adding a feature: a feature that quietly adds
 tokens to every prompt has broken the one promise the README opens with.
+
+Taking tokens away is bound by the same rule, which is why the turn digest
+([principle 18](#18-elide-only-what-can-be-reconstructed)) is a *replacement*
+and not an addition: it is counted like any other message, it is visible in
+the conversation as the assistant message it is, and the turn it stands in for
+is gone rather than hidden. An elision the `⚡` line cannot see would break
+the promise in the other direction.
 
 ## 4. Key on the session name, not on the client's identity
 
@@ -89,7 +121,7 @@ already holds that the client can encode into. Usually it is the session name.
 
 ## 5. Identity is the session id; the name is a label
 
-Every session carries an 8-hex `session_id`, minted once (`core.py:456`),
+Every session carries an 8-hex `session_id`, minted once in `Session.__init__()`,
 unchanged by a rename, written into the live file, into every archive's
 filename, and into `state/sessions/index.jsonl`.
 
@@ -108,8 +140,14 @@ answer, and a hard problem gets you a wall of half-finished thought and no
 reply. letsClaw splits them:
 
 - the **notepad** grows across resume rounds, bounded only by time and context
-- the **answer sheet** (`max_output_tokens`) is held back, untouched, until the
-  core closes the thought itself with `</think>`
+- the **answer sheet** (`Session._answer_reserve()`: 10% of the free window,
+  floored at `MIN_ANSWER_ROOM`, ceilinged by `max_output_tokens`, clamped by
+  the room actually left) is worked out at the moment the thinking stops, and
+  the core then closes the thought itself with `</think>`
+
+  It is a share rather than a fixed block because a fixed `max_output_tokens`
+  reserved a third of a 100k window permanently: the pre-turn gate fired at
+  61% while every indicator said 90%.
 
 Closing the thought is doing two jobs: it guarantees the answer budget is
 really separate, and it guarantees an answer at all, because a model inside an
@@ -135,6 +173,10 @@ a section of its own it survives nowhere — and the fresh window walks back int
 an approach the old one already eliminated. *Losing a fact costs a
 re-derivation; losing a rejection costs a loop.*
 
+This principle has a dual, which is what lets the journal pay for itself:
+once a thing is recorded it no longer has to be carried. See
+[principle 18](#18-elide-only-what-can-be-reconstructed).
+
 ## 8. Pick the format by who reads it
 
 | format | used for | why |
@@ -158,11 +200,11 @@ Every default and every parse failure resolves to the more restrictive option:
 - **A tool call that was cut off is never run.** `rm -rf /tmp/scratch`
   truncated to `rm -rf /` is the accident this prevents. The call is recorded
   empty and the model is told.
-- Tool-markup parsing is **confined to the raw transport** (`llm_engine.py:20`).
+- Tool-markup parsing is **confined to the raw transport** (`ToolMarkupFilter`).
   On the chat endpoint the server parses tool calls properly, so the same
   markup arriving as text is the model *writing about* a tool call — prose in
   an answer — and executing that would be a real hazard.
-- A bad `rollover_mode` logs and uses `auto` (`core.py:428`).
+- A bad `rollover_mode` logs and uses `auto` (`Session.__init__()`).
 
 ## 10. The reflexive keystroke is the safe one
 
@@ -212,7 +254,7 @@ unreadable.
 
 - Live files are written by **atomic rename**, so a `kill -9` mid-write leaves
   the previous good copy rather than a truncated one.
-- **A half-finished turn is never written.** `repair_history` (`core.py:586`)
+- **A half-finished turn is never written.** `repair_history()`
   delegates to `settled()` so memory and disk agree: an unanswered tool call
   (which 400s forever after), a dangling tool result, or an unanswered question
   is unwound before saving. What comes back is always a conversation you could
@@ -266,6 +308,37 @@ cheap.
 re-attaching never switches a live one, since that would move the conversation
 out from under anyone else attached to it.
 
+## 18. Elide only what can be reconstructed
+
+Principle 7 says record what cannot be rebuilt. This is the same rule from the
+other end: `history` is not an accumulator, and anything still in it should
+still be doing work.
+
+Raw reasoning is never there — the notepad lives in `_think_pad` and dies with
+the turn. A turn's tool traffic — the calls, their arguments, and the results
+they returned — is collapsed to a short digest once the journal holds it
+verbatim. The pad's tail is an *input* to that digest, deliberately: a digest
+written without it can describe what happened and not what it was for. So with
+`digest_turns` on, a paraphrase of the reasoning does join history — counted
+and visible like any other message, never injected behind the count. Across four measured sessions that traffic was
+91-95% of the window, against 2-8% for the answers a person actually reads.
+
+The user's prompts and those answers are never elided. They are the only
+things in a window that cannot be recovered any other way: the journal can
+reproduce what a command printed, but not what someone meant to ask.
+
+Two consequences, both load-bearing:
+
+- **The collapse is gated on the record, never assumed.** `jot` never raises,
+  by principle 12 — so a journal that filled the disk on the turn's first tool
+  call is indistinguishable from one that recorded it perfectly, unless
+  something checks. Dropping the only copy on that evidence is not a degraded
+  turn, it is silent total loss. See `Session.journal_ok()` and the block
+  high-water mark in `_digest_turn`.
+- **What replaces it says where the rest went.** Every digest ends with the
+  `grep` line that reaches its own turn in the open journal segment, because a
+  summary the model cannot drill into is just amnesia it does not know it has.
+
 ---
 
 ## Where the principles are known to be strained
@@ -279,7 +352,7 @@ Honest notes, not excuses:
   `discord.users`.
 - **`?session=` is not validated on attach**, so a session named
   `../../etc/passwd` can exist. The guard is at the point where a name becomes
-  a path that is *read*: `session_behavior_path` (`core.py:1781`) slugs the
+  a path that is *read*: `session_behavior_path()` slugs the
   name and refuses anything that does not land directly in `session_dir`.
 - **Archive filenames are not disambiguated.** Two rollovers of one session
   inside the same second overwrite. That needs a rollover whose handoff never

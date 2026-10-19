@@ -11,7 +11,7 @@ is built, why it is built that way, and where the edges are.
    the thinking pad, rollover, config reload, the disk layer. Start here. It
    ends with a numbered list of traps that is worth reading even if you skip
    the rest.
-2. **[design-principles.md](design-principles.md)** — the 17 rules the codebase
+2. **[design-principles.md](design-principles.md)** — the 18 rules the codebase
    actually follows, each with its evidence, plus an honest section on where
    they are strained. Read this before proposing a change, so it lands with the
    grain.
@@ -22,6 +22,11 @@ is built, why it is built that way, and where the edges are.
 5. **[extending.md](extending.md)** — recipes: add a tool, a command, a client,
    a model; change the prompt, the protocol or the persisted shape. Also how to
    run the tests.
+6. **[reasoning.md](reasoning.md)** — reference for the token side of the
+   thinking pad: which cap applies to which round, how the answer reserve is
+   derived, every way thinking can stop, and the invariants a change there must
+   not break. Read it before touching `_answer_reserve`, `_pad_headroom`,
+   `_headroom_check` or `_think_pad`.
 
 [`decisions/`](decisions/) holds dated records of features that shipped: what
 was decided, what was rejected, and what deliberately was not built. They were

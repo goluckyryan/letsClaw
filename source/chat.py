@@ -353,6 +353,18 @@ class Renderer:
         count = f" · {n} rollover{'s' if n != 1 else ''}"
         self.line(f"  🔄 Rollover: {ro['mode']} at {ro['percent']}% ({ro['trip']} tok){count}"
                   if ro["percent"] else f"  🔄 Rollover: disabled (/rollover still works){count}")
+        # What the server was probed to actually do. Shown even when it agrees
+        # with the config: "nothing is wrong" is only reassuring if the same
+        # line would have said so when something was.
+        if srv := i.get("server"):
+            ctx = srv.get("server_ctx")
+            self.line(f"  🛰️  Server: thinking={srv.get('reasoning_channel')}"
+                      + (f", window {ctx}" if ctx else "")
+                      + (", usage reported" if srv.get("usage_reported")
+                         else ", usage withheld" if srv.get("usage_reported") is False
+                         else ""))
+            for w in srv.get("warnings") or []:
+                self.line(f"     ⚠️  {w}")
 
     def show_reload(self, r):
         changed = r.get("changed") or []
