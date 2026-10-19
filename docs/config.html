@@ -244,8 +244,6 @@
       <td><span class="tag live">live</span></td><td>Master switch for all tools. <code>false</code> (or the key absent) = the model gets no tools at all.</td></tr>
     <tr><td class="key"><code>allow</code></td><td class="type">list</td><td class="def">all four</td>
       <td><span class="tag live">live</span></td><td>Allowlist: <code>[exec, read_file, write_file, list_dir]</code>. Anything not listed is denied with an error the model can read.</td></tr>
-    <tr><td class="key"><code>max_iterations</code></td><td class="type">int</td><td class="def">8</td>
-      <td><span class="tag live">live</span></td><td>Max tool rounds per user turn before a final answer is forced.</td></tr>
     <tr><td class="key"><code>exec_timeout</code></td><td class="type">sec</td><td class="def">120</td>
       <td><span class="tag live">live</span></td><td>Seconds before an <code>exec</code> command is killed.</td></tr>
     <tr><td class="key"><code>max_output_chars</code></td><td class="type">int</td><td class="def">8000</td>

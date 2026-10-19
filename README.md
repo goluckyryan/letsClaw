@@ -374,12 +374,18 @@ All tool I/O is truncated (`max_output_chars`) so a single call can't blow
 up the context, and the three file tools do their reading and writing off the event
 loop — in the shared core one slow read would otherwise stall every session's stream.
 
-The loop is capped at `tools.max_iterations` **rounds** per turn — a round is one model
-call plus every tool call it returns, so one round can run several tools. At the cap the
-core makes one final call with no tool schemas, so the model must answer in plain text.
-Rollover is only evaluated *after* the loop fully drains, so a high cap means a runaway
-model keeps looping — one full LLM call per round — until the server rejects an
-over-window prompt or you send `/stop`.
+The loop is not capped in **rounds** — a round is one model call plus every tool call it
+returns, so one round can run several tools, and a count of them is not a limit the
+machine actually has. What it is capped by is room: before each round the core checks
+that the free window (what is left once the answer reserve is paid for) still holds
+`MIN_TOOL_ROUND_ROOM` — enough for one clipped tool result and the message carrying it.
+Below that it makes one final call with no tool schemas, so the model must answer in
+plain text. The other wall is time, `turn_timeout`.
+
+This matters because rollover is only evaluated *after* the loop fully drains: nothing
+mid-turn can roll over, every round re-sends a history one tool result longer, and with
+context shift off an over-window prompt is a hard 400 that discards the whole turn. The
+room check is what the turn runs into instead.
 
 `exec` runs in `tools.workdir` (default: the letsClaw directory itself). This matters
 now that the core is a daemon: its own cwd is wherever `./serve.sh` was launched from,
@@ -833,7 +839,7 @@ notepad, which is the one thing this whole mechanism exists to protect.
 **At the end, yes.** By then the notepad has done its job: it worked out *what to
 do*. If the model's conclusion is an action rather than a sentence, the tool
 runs, and the turn carries on with the result in hand — thinking afresh from
-there if it needs to. Same `max_iterations` limit as any other tool round.
+there if it needs to. Subject to the same room check as any other tool round.
 
 Two safety rails:
 
@@ -1132,7 +1138,7 @@ Three tiers:
 | | |
 |---|---|
 | **Live already** | `core.token`, `core.allowed_hosts`, the `state/` paths, and the model list `GET /models` serves — these are read per request, so the reload is what updates the file, not what plumbs it through |
-| **Reload picks it up** | **every setting in every model entry** — the engines are rebuilt from scratch, so `context_length`, `base_url`, `provider_name`, the sampling parameters, and all of the reasoning settings (`reasoning`, `max_tokens`, `max_output_tokens`, `max_pad_compactions`, `turn_timeout`, `answer_time_reserve`, `resume_mode`, `reasoning_effort`) come across; added and removed models; behavior files including `base.md`; the tool allowlist and `exec_timeout`; `max_iterations`; every `conversation.*` setting; `logging.level`; and, in the bot's own process, the Discord allowlist (`discord.users`, `mention_only`, `mention_list`) — see [Discord Client](#discord-client) |
+| **Reload picks it up** | **every setting in every model entry** — the engines are rebuilt from scratch, so `context_length`, `base_url`, `provider_name`, the sampling parameters, and all of the reasoning settings (`reasoning`, `max_tokens`, `max_output_tokens`, `max_pad_compactions`, `turn_timeout`, `answer_time_reserve`, `resume_mode`, `reasoning_effort`) come across; added and removed models; behavior files including `base.md`; the tool allowlist and `exec_timeout`; every `conversation.*` setting; `logging.level`; and, in the bot's own process, the Discord allowlist (`discord.users`, `mention_only`, `mention_list`) — see [Discord Client](#discord-client) |
 | **Restart-only** | `core.bind` and `core.port` — the socket is already bound, and rebinding drops every client, which is the thing being avoided — and the three keys that are read once when the log handlers are installed: `logging.file`, `logging.max_bytes`, `logging.backups`. **`/restart` applies these from any client** (see below); it is no longer a trip to the core's host. On the bot's side, `discord.enabled` (`serve.sh` reads it before deciding to launch at all) and the three that say *where* the bot logs in — `discord.token`, `discord.core`, `discord.core_token`. Those four restart the *bot*, which `/restart` does not touch |
 
 An idle session takes the change immediately; one mid-turn takes it the moment that turn
@@ -1556,7 +1562,7 @@ comments, for people who would rather read the template.
 **Key sections:**
 - `models` — Registry of named models. Each entry is self-contained: its own `base_url` (required), `api_key`, exact server model ID (`provider_name`), behavior file, `context_length` and sampling parameters — so two models can live on two different servers with different window sizes, and reading one entry tells you everything about that model. `default_model` picks the model a new session starts on; `/model <name>` switches one session at runtime without disturbing the others.
 - `core` — The service itself: `bind` (loopback by default — see the security note above), `port` (the WebUI is on the same one), `token`, an optional shared secret, and `allowed_hosts`, extra `Host` header values to accept for a reverse proxy in front of the core (loopback, the bind, this machine's hostname and FQDN and the addresses they resolve to are already accepted). `--bind` / `--port` / `--config` on `./serve.sh` override the first three.
-- `tools` — Agent tools: enable flag, allowlist, `max_iterations` (tool rounds per turn before a final answer is forced), `exec_timeout`, `max_output_chars`, and `workdir` — the base directory `exec` runs in and relative paths resolve against, defaulting to the letsClaw directory.
+- `tools` — Agent tools: enable flag, allowlist, `exec_timeout`, `max_output_chars`, and `workdir` — the base directory `exec` runs in and relative paths resolve against, defaulting to the letsClaw directory.
 - `conversation` — `max_history_messages`, a backstop that trims the oldest messages (never opening on an orphaned tool result) and only applies on turns where no rollover happened — rollover is the real mechanism, this just stops an unbounded session with rollover switched off. Then rollover policy: `rollover_at_percent` (0 disables), `rollover_mode` (`auto`/`ask`/`off`), `prompt_timeout` (seconds to wait for an answer in `ask` mode before keeping the session). Two directories: `live_dir` holds the running conversations and is reloaded at startup, `sessions_dir` holds archived transcripts and the journal segments beside them. Then the journal itself: `journal` (default true — the `.md` record of every round's reasoning and every untruncated tool result, which is what stops a rolled-over window repeating work; see [The journal](#the-journal)) and `journal_max_block_chars` (default 1,000,000, the cap on one recorded block). The context window itself is per model, under `models`.
 - `discord` — the Discord bot, and only ever read by it: `enabled` (the off switch — `false` keeps the bot from starting and makes `./run_discord.sh` refuse to run; absent means enabled), `token` (the bot token), `core`/`core_token` (where the core is and its shared secret, both defaulting to the `core` section above), `users` — the **required** allowlist of snowflake IDs, empty meaning nobody — `mention_only` (`true`/`false`/`white`/`black`) with `mention_list`, `idle_detach_min` (`0` = never, the default — the channel stays attached so a WebUI turn still posts to Discord), `max_messages`/`max_lines` for how an answer is split (`max_messages: 0` = unlimited), and `auto_names` (sessions named `<server>-<channel>`, renamed to follow Discord). Omit the whole section if you do not want a bot. See [Discord Client](#discord-client) for the security note that goes with it.
 - `memory` — `long_term_file`, where rollover handoffs accumulate

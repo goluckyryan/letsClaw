@@ -139,8 +139,9 @@ _headroom_check()           ← BEFORE the user message lands, so a roll starts
 history.append(user)
 jot("turn N user", text)
 
-for _ in range(max_tool_rounds):
-    result = await call_round(tools=schemas)
+while _pad_headroom() >= MIN_TOOL_ROUND_ROOM:   ← room, not a round count: nothing
+    result = await call_round(tools=schemas)      mid-turn can roll over, so what the
+                                                  loop runs out of is window
     if not result.wants_tool:
         if was_cut_off(result):              # thought hit the cap, said nothing
             result = await _think_pad(...)   # ← the notepad, below

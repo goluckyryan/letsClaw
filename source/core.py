@@ -89,6 +89,13 @@ FORCED_CONCLUSION_TRIES = 3
 # Below this much free context there is no room to think in, so the pad is not
 # worth starting — the pre-turn check rolls over instead where it may.
 MIN_THINK_HEADROOM = 4000
+# Below this much free context there is no room for another tool round, so the
+# loop stops asking for work and asks for words. Sized to hold one clipped tool
+# result (tools.max_output_chars, 8000 chars) plus the assistant message and
+# arguments that carry it, with the slack that ESTIMATE_SCALE exists for: a
+# round admitted here must be able to *finish*, and the result lands in the
+# history whether or not there was room for it.
+MIN_TOOL_ROUND_ROOM = 4000
 # The answer reserve, as a share of the context still free. See
 # Session._answer_reserve: a share rather than a fixed block, floored so a
 # nearly-full window still has room for a real answer and ceilinged by what
@@ -255,13 +262,6 @@ class Session:
         self.schemas = []
         self.tools_tok = 0
 
-        # int_or, not int: this runs on every session creation, so a config
-        # that says `max_iterations: eight` would not fail once and loudly at
-        # startup — it would fail here, for every session anyone tries to open,
-        # for the life of the process, with /reload unable to help because the
-        # value is already committed. See reload() for the other half of this.
-        self.max_tool_rounds = configlib.int_or(
-            (config.get("tools") or {}).get("max_iterations", 8), 8)
         # int() because YAML gives a string for `max_history_messages: "50"`,
         # and `len(history) > "50"` raises on 3.x rather than comparing.
         # 0 (or a negative, or junk) means "never trim", matching
@@ -1214,7 +1214,33 @@ class Session:
                 await self.jot(f"turn {self.turn_id} partial (steering)", partial)
 
         try:
-            for _ in range(self.max_tool_rounds):
+            # Unbounded in rounds, walled by room — the same rule as _think_pad,
+            # for the same reason: a count is not a limit the machine has. This
+            # loop used to stop at tools.max_iterations, which knew nothing
+            # about the window it was filling and so was either in the way of
+            # honest work or (set high) not a limit at all. What actually runs
+            # out is context: every round re-sends a history one tool result
+            # longer, nothing mid-turn can roll over, and with context shift off
+            # the overflow is a 400 that discards the whole turn.
+            while True:
+                # _pad_headroom and not a wall of its own, on purpose: it is
+                # already "what is free once the answer is paid for", which is
+                # exactly what a tool round has to fit inside, and a third name
+                # for one number is how the gate and the wall drifted apart
+                # before (see docs/reasoning.md, invariant 1).
+                if self._pad_headroom() < MIN_TOOL_ROUND_ROOM:
+                    self.emit(ev("notice", level="warn",
+                                 text="no room left for another tool round — "
+                                      "asking for a final answer"))
+                    result = await call_round()
+                    if was_cut_off(result):
+                        # No room for another tool round, so this conclusion
+                        # must be words.
+                        result = await self._think_pad(call_round, turn_t0,
+                                                       result.reasoning,
+                                                       allow_tools=False)
+                    full_response = result.text
+                    break
                 # A /steering that landed while the previous tool ran (or before any
                 # round) is drained here, before the model is asked again — the
                 # same boundary a mid-stream one reaches, without interrupting
@@ -1257,16 +1283,6 @@ class Session:
                     break
 
                 await run_tools(result)
-            else:
-                self.emit(ev("notice", level="warn",
-                             text=f"{self.max_tool_rounds} tool rounds used — "
-                                  "asking for a final answer"))
-                result = await call_round()
-                if was_cut_off(result):
-                    # Out of tool rounds, so this conclusion must be words.
-                    result = await self._think_pad(call_round, turn_t0,
-                                                   result.reasoning, allow_tools=False)
-                full_response = result.text
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -2742,7 +2758,6 @@ class SessionManager:
         # is None, which a bare default never replaces.
         old_conv = old_cfg.get("conversation") or {}
         new_conv = fresh.get("conversation") or {}
-        old_tools, new_tools = old_cfg.get("tools") or {}, tools_cfg
         # (attribute, what the old config said, what the new one says). apply_config
         # reassigns only where the session still holds the old value.
         scalars = [
@@ -2751,8 +2766,6 @@ class SessionManager:
             # leave the core running the new settings with half the sessions
             # never told about them — the one failure mode the all-or-nothing
             # validation above exists to prevent.
-            ("max_tool_rounds", configlib.int_or(old_tools.get("max_iterations", 8), 8),
-                                configlib.int_or(new_tools.get("max_iterations", 8), 8)),
             ("max_history", configlib.int_or(old_conv.get("max_history_messages", 100), 100),
                             configlib.int_or(new_conv.get("max_history_messages", 100), 100)),
             ("rollover_pct",

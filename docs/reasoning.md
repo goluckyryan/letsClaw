@@ -148,9 +148,14 @@ Eight exits. The first is the only one that loses work.
 | 7 | the model stopped without text and without being cut off | — | none |
 | 8 | no progress — cut off at the cap having written nothing, so the pad cannot grow and every further round would be identical | `reasoning stopped making progress` | none |
 
-Separately, `max_tool_rounds` (config `tools.max_iterations`, default 8) ends
-the turn's *work* independently of any of this: `8 tool rounds used — asking
-for a final answer` (the round loop in `_turn()`).
+Separately, the round loop in `_turn()` ends the turn's *work* independently
+of any of this, on the same rule the pad uses and for the same reason: when
+`_pad_headroom()` drops below `MIN_TOOL_ROUND_ROOM` (4,000 — one clipped tool
+result plus the message and arguments carrying it), it stops asking for work
+and asks for words: `no room left for another tool round — asking for a final
+answer`. It reads `_pad_headroom()` rather than a figure of its own, which is
+invariant 1 in §7: a third name for one number is how the gate and the wall
+drifted apart before.
 
 Exit 5 deserves a note, because it used to be the worst of them. A checkpoint
 that came back empty ended the turn's thinking outright — with

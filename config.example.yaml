@@ -210,7 +210,6 @@ core:
 tools:
   enabled: true
   allow: [exec, read_file, write_file, list_dir]   # anything not listed is denied
-  max_iterations: 8           # max tool rounds per user turn before forced final answer
   exec_timeout: 120           # seconds
   max_output_chars: 8000      # tool output truncation
   # workdir: "/home/you/project"  # base dir for exec and relative paths.
