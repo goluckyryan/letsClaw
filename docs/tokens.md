@@ -26,6 +26,8 @@ are used strictly from here on.
 | **turn** | one question from you and the final answer back. |
 | **round** | one request-and-reply with the model. **A turn can take several rounds** — one per tool call, plus any resumed thinking. This distinction is the single most important idea on this page. |
 | **floor** | what `used` reads with **no conversation at all** — the system message plus the tool schemas. The starting tax: **1,859 tokens** here, paid on every round, which you can never get below. See the box below. |
+| **bill** | how many input tokens a turn, or a whole session, actually **sent**. Not the same as `used`: `used` is the window measured once, while every round of a turn re-sends the whole of it. The bill is the larger number, always, and on a tool-heavy turn it is several times larger. `/info` shows the session's as `📥 Input`. |
+| **cache hit rate** | the share of the bill the server answered out of its KV cache instead of re-reading. A **cost and speed** figure, never a space figure — see section 4. `/info` shows it as `💾 Cache`, and omits the line when the server reports nothing. |
 | **tokenizer** | the thing that chops text into tokens. Every model has its own, with its own vocabulary, so *the same sentence is a different number of tokens to different models*. There is no universal token. |
 | **tiktoken** | OpenAI's tokenizer library, and the one letsClaw counts with. It is **not Qwen's tokenizer** — the real one lives on the server. letsClaw uses `cl100k_base` (the GPT-3.5/GPT-4 vocabulary) as a stand-in, because it is a pip install and the right one is not. This substitution is the source of one of the two counting errors in section 8; it turns out to be the *smaller* one. |
 
@@ -291,6 +293,14 @@ $$I(n) \;\approx\; r(n)\cdot U(n-1)$$
 **This is the round multiplier, stated exactly.** A turn costs its window
 *times its round count*.
 
+$I(n)$ is no longer only algebra: each round's server-reported `prompt_tokens`
+is now summed over the turn and rides the `stats` event as `input_tokens`. It
+is not rendered on the `⚡` line — the decision was a session total, section 8
+finding 10 — but the per-turn figure is on the wire for anything that wants it,
+and it is measured, never estimated. A round whose server withheld usage
+contributes nothing rather than a guess, and the event's `input_measured` flag
+says whether every round of the turn was counted.
+
 ### Checked against the server
 
 None of the above is worth anything if it does not reproduce reality. Taking
@@ -322,6 +332,13 @@ $$I_{\text{total}} \;=\; \sum_{n=1}^{N} I(n) \;\approx\; \bar r\left(N F + \frac
 conversation quadruples what it cost to produce. This is the real reason
 rollover and digests exist — both attack the $\delta N^2/2$ term by resetting
 $h$, and that is worth far more than any saving on a single turn.
+
+$I_{\text{total}}$ is a number you can read. It is exactly what the session
+odometer `total_input` accumulates, printed by `/info` as `📥 Input`, so the
+$\mathcal{O}(N^2)$ claim above is now **observed rather than derived** — watch
+the gauge crawl while that line sprints. It is also the only place the cost of
+a misfiring rollover shows up: a window rolled at half full still bills every
+round it took to get there, and `used` resets while the odometer does not.
 
 ### What a digest and a rollover do to the recurrence
 
@@ -559,7 +576,7 @@ any of the Qwen models a tool-heavy turn is collapsed as described.
 | **Reasoning** | thinking tokens | the model's private `<think>` block | a **subset of output**, not a fifth category |
 | **Cached** | `cached_tokens` | the slice of your input the server already had in memory | a **subset of input** — cheaper/faster, but still occupies the window |
 
-Two traps worth naming, because both bite people:
+Three traps worth naming, because all three bite people:
 
 **Reasoning is inside output, not beside it.** Measured on your server: a
 reasoning reply reported `completion_tokens: 110` with `reasoning_tokens: 94`
@@ -570,6 +587,19 @@ exactly this, and the assumption is correct.
 not have to re-process — it is a *speed and cost* win, not a *space* win. It
 still sits in the window and still counts toward the limit. This matters because
 "I have 2,048 cached tokens" never means "I have 2,048 tokens of room back".
+
+This is also why the cache figure is reported where it is. `/info` prints it as
+a percentage of *input billed*, never as anything subtracted from the gauge —
+the gauge is a space measurement and the cache has no business in it. Finding 9
+below has the mechanics; the division of labour is the point here.
+
+**Zero cached and no cache figure are different facts.** A server that says
+`cached_tokens: 0` is telling you the prefix missed — something rewrote the
+front of your prompt and the whole window was re-read. A server that says
+nothing is telling you nothing. letsClaw keeps them apart: an unreported figure
+is `None`, stays out of the denominator, and the `💾 Cache` line is omitted
+rather than printed as `0%`. A silent server and a cold cache would otherwise
+look identical, and only one of them is a problem.
 
 ---
 
@@ -636,6 +666,17 @@ There is also a **pre-turn gate** that rolls over *before* a turn when there
 would be no room left to think in — this is why a session can roll at 80-something
 percent rather than exactly 90.
 
+**Which number fires them is the estimate, more often than the measurement.**
+Both gates read `used_now()`, and that falls back to the estimate after every
+operation that reshapes history — including a rollover itself. So the first
+round of a *brand new* window is judged by the estimator, and the question "is
+this fresh window already past the trip point?" is asked of a figure nobody
+measured. When the estimator read 52% high, the answer could be yes on a window
+that was genuinely half empty; rollover would fire again immediately, or
+disable itself for the rest of the session. That is why section 8 treats the
+estimator's accuracy as a correctness problem and not a display one: **the
+estimate is the rollover decision.**
+
 ---
 
 ## 7. How letsClaw counts: two paths
@@ -645,6 +686,15 @@ letsClaw reads `prompt_tokens` straight off the response. Verified: SGLang
 reports the **full** prompt regardless of caching — a request with 2,048 cached
 tokens still reported `prompt_tokens: 2058`. So the window gauge is reading the
 truth, and prefix caching does not corrupt it.
+
+Three more numbers now come off the same usage block, and none of them touches
+the gauge: `completion_tokens`, `cached_tokens` and `reasoning_tokens`. The
+first two feed the session odometers of finding 10 and the hit rate of finding
+9; the third is carried beside letsClaw's own `tiktoken` count of the reasoning
+text rather than replacing it, because the two disagree on a truncated round —
+measured against SGLang, one reply reported `completion_tokens: 5` next to
+`reasoning_tokens: 10`. Each field is `None` on a server that omits it, and
+`None` is propagated rather than flattened to zero.
 
 At the end of a turn the window size is recorded as:
 
