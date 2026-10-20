@@ -503,6 +503,27 @@ whole files instead came out at 3,115 against the control's 35,441.
 It ships **off**. It is the first feature that discards context by design, so
 it is opt-in until a model has run clean with it.
 
+**A model entry may override it**, and `digest_turns` is the only
+`conversation:` setting that one may. The reason is in the paragraph above:
+the digest costs its own round, and that round is billed to whichever model
+the session is on. A model whose `context_length` is large enough that a turn
+will never need collapsing would pay for every digest and benefit from none,
+so it can opt out on its own:
+
+```yaml
+conversation:
+  digest_turns: true            # the default for every session
+
+models:
+  big-window-model:
+    context_length: 1000000
+    digest_turns: false         # ...except this one
+```
+
+Omitting the key in a model entry means "follow the conversation setting";
+`false` there means off. A `/model` switch re-resolves it, so moving a live
+session onto that model stops the digesting and moving it back resumes.
+
 Two directories under `state/`, easily confused: **`state/live/` is the conversation
 you are having** — rewritten as you go and reloaded at startup — while
 **`state/sessions/` is the archive**, a write-once record of a window that filled up.

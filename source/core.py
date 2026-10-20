@@ -289,7 +289,12 @@ class Session:
         # question and the answer verbatim. Off by default: it is the first
         # thing here that discards context on purpose, and it is only safe
         # while the journal is keeping up — see _digest_turn.
-        self.digest_turns = bool(conv.get("digest_turns", False))
+        #
+        # Resolved rather than read, because a model entry may override the
+        # conversation default. This early call always lands on the default:
+        # model_name is still None here and use_model() sets it, which is why
+        # use_model() asks again once it has.
+        self.digest_turns = self._configured_digest_turns()
         self.prompt_timeout = configlib.int_or(conv.get("prompt_timeout", 60), 60)
         self.declined_at = None
         self.warned_over = False
@@ -514,6 +519,30 @@ class Session:
             conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0,
             DEFAULT_ROLLOVER_PCT)
 
+    def _configured_digest_turns(self):
+        """Whether this session digests its turns: the model may override.
+
+        The only conversation setting a model entry can speak for, and it
+        earns the exception because a digest is paid for by whichever model
+        the session is on. On a window large enough that nothing will ever be
+        collapsed, every turn would still spend a whole extra round
+        summarising for no benefit — so the model that owns the window is the
+        right place to say no.
+
+        `is None`, not a falsy test: `digest_turns: false` in a model entry
+        has to mean "off for this one" rather than "not specified", which is
+        the whole point of having the key.
+
+        Read back from the live config like the rollover threshold above,
+        rather than remembered, so a reload and a `/model` switch both land
+        without either having to know about the other.
+        """
+        entry = (self.config.get("models", {}) or {}).get(self.model_name) or {}
+        override = entry.get("digest_turns")
+        if override is not None:
+            return bool(override)
+        return bool((self.config.get("conversation") or {}).get("digest_turns", False))
+
     def fresh_history(self, carryover=""):
         """System message: the three behavior layers, then the carryover.
 
@@ -653,6 +682,16 @@ class Session:
         for attr, was, now in blob["scalars"]:
             if getattr(self, attr) == was:
                 setattr(self, attr, now)
+
+        # Recomputed outright rather than diffed like the scalars above, and
+        # the divergence rule does not apply: nothing changes digest_turns for
+        # a single session at runtime, so there is no per-session value to
+        # protect. It is derived from two config layers — the model entry over
+        # the conversation default — and re-resolving is the only way to pick
+        # up a change in either. Turning it on affects the next turn to
+        # finish; turns already collapsed stay collapsed, which is what the
+        # journal is for.
+        self.digest_turns = self._configured_digest_turns()
 
         if blob["engine"] is not None and blob["engine"] is not self.engine:
             # The engine being dropped still owns an httpx connection pool. On
@@ -2371,6 +2410,12 @@ class Session:
                         self.name, self.model_name, name)
         self.engine = engine
         self.model_name = name
+        # Resolved after model_name moves, because the model entry is allowed
+        # to override it — a session switched onto a model whose window makes
+        # digesting pointless must stop digesting, and one switched back must
+        # start again. Reading the live config means this needs no cooperation
+        # from reload, which may have rewritten either layer since.
+        self.digest_turns = self._configured_digest_turns()
         # A different engine is a different server with different answers, so
         # the findings this session has already reported are about somebody else.
         self._server_warned = False
@@ -2872,10 +2917,10 @@ class SessionManager:
                                configlib.int_or(new_conv.get("prompt_timeout", 60), 60)),
             ("rollover_before_think", bool(old_conv.get("rollover_before_think", True)),
                                       bool(new_conv.get("rollover_before_think", True))),
-            # Turning this on affects the next turn to finish; turns already
-            # collapsed stay collapsed, which is what the journal is for.
-            ("digest_turns", bool(old_conv.get("digest_turns", False)),
-                             bool(new_conv.get("digest_turns", False))),
+            # digest_turns is deliberately absent: it is resolved per session
+            # against that session's model entry, so there is no single pair of
+            # old/new values this shared list could carry. apply_config asks
+            # _configured_digest_turns() instead.
             # Turning this off leaves the open segment where it is: it closes at
             # the next rollover, holding what was recorded before the reload.
             ("journal_on", bool(old_conv.get("journal", True)),

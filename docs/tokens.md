@@ -542,9 +542,10 @@ their results into one ~200-token summary, while keeping your question and the
 final answer verbatim. So that turn's 1,365-token footprint might shrink to
 ~700, with the full record still on disk in the journal.
 
-It is also **off by default** — your `config.yaml` has no `digest_turns` key, so
-nothing in your sessions is being digested today, and the trace above is what
-you are actually paying.
+It ships **off by default**, but your `config.yaml` now sets
+`digest_turns: true` — with one exception, `argo-opus5`, whose model entry
+overrides it back to false. So the trace above is what you pay **on argo**; on
+any of the Qwen models a tool-heavy turn is collapsed as described.
 
 ---
 
@@ -616,8 +617,9 @@ not the sum of the prompts the turn actually sent (Finding 10).
 
 ## 6. Digest and rollover — the two ways history shrinks
 
-**Digest** (`conversation.digest_turns`, **default false**, not set in your
-config). At the end of a turn that used tools, the tool calls and their output
+**Digest** (`conversation.digest_turns`, ships **false**, on in your config
+except on `argo-opus5`, whose model entry overrides it). At the end of a turn
+that used tools, the tool calls and their output
 are replaced by a short summary; your question and the final answer stay
 verbatim. It only runs if the full record reached the journal first — the
 context is never the only copy. Gated to ~600 tokens max.

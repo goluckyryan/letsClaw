@@ -82,6 +82,12 @@ models:
     # Seconds held back from turn_timeout so the answer still fits inside the
     # wall after a long think. Thinking stops at turn_timeout - this.
     answer_time_reserve: 120
+    # Optional, and the only conversation setting a model may speak for:
+    # overrides conversation.digest_turns for sessions on this model. Omit it
+    # to follow the global setting. Worth setting to false on a model whose
+    # context_length is large enough that a turn will never need collapsing —
+    # the digest costs a whole extra round, billed to this model.
+    digest_turns: false
     # When the pad fills the context, distil it to a checkpoint (the model's own
     # note of what it has established) plus the last ~2000 tokens kept verbatim,
     # then carry on thinking. This is the only wall that can be pushed back, so
@@ -248,6 +254,13 @@ conversation:
   # watched a few turns and confirmed the model greps the journal rather than
   # redoing the work. It requires `journal: true` and silently declines on any
   # turn the journal did not record — the context must never be the only copy.
+  #
+  # A model entry may override this, and it is the only conversation setting
+  # that may: the digest is an extra round billed to whichever model the
+  # session is on, so a model with a window large enough that nothing will
+  # ever be collapsed should say `digest_turns: false` under models: and skip
+  # paying for it. Omit the key there to follow this default; `false` there
+  # means off, not unset.
   digest_turns: false
   live_dir: "state/live"        # live conversations; reloaded when the core restarts
   prompt_timeout: 60            # seconds to wait for a rollover answer before keeping the session
