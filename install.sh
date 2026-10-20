@@ -55,6 +55,19 @@ setup_env() {
     echo "→ installing dependencies (requirements.txt)"
     .venv/bin/python -m pip install -r requirements.txt
   fi
+  # pip just ran, so the network is up — which makes this the right moment to
+  # fetch tiktoken's 1.6 MB vocab into state/tiktoken/. Doing it here rather
+  # than on first count means a lab machine that is later offline, or behind a
+  # proxy that is down, still counts with cl100k instead of dropping to the
+  # chars/4 fallback. Non-fatal: the core starts either way, and the fallback
+  # says loudly in the log when it has engaged.
+  if ! .venv/bin/python -c "
+import sys; sys.path.insert(0, 'source')
+import token_counter as tc
+sys.exit(0 if tc.calibrated() else 1)" 2>/dev/null; then
+    echo "  ! tiktoken vocab could not be fetched — token counts will use the"
+    echo "    coarse chars/4 fallback until this machine can reach the network."
+  fi
   # The bot is a separate dependency: only required if the config will start
   # it. The same question serve.sh asks, asked by the same script — this used
   # to be a second hand-written copy of that check, and it was the copy that

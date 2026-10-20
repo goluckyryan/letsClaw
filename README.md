@@ -1011,8 +1011,11 @@ context figure: the prompt side and the output side can be measured or estimated
 separately.
 
 The `~` on `context` means the same thing everywhere it appears, `/info` included:
-the figure is the local estimate, which carries a deliberate **+60%** pad
-(`ESTIMATE_SCALE`) for servers that withhold usage. Once the server has reported a
+the figure is the local estimate rather than a count the server reported. The
+estimate is calibrated — `PROSE_SCALE` corrects the encoding difference, and the
+tool block is measured from a reported prompt size where one exists and falls
+back to a formula where none does — but it is still an estimate. Once the server
+has reported a
 `prompt_tokens` for the current window, that count is what gets shown and the `~`
 drops away. This matters beyond cosmetics — it is also the figure the pre-turn
 thinking-headroom check works from, so spending the pad when the real number is known

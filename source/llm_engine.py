@@ -15,6 +15,8 @@ from pathlib import Path
 import aiohttp
 from openai import AsyncOpenAI
 
+from token_counter import corrected_messages
+
 logger = logging.getLogger("letclaw.engine")
 
 # Tool-call markup, for the raw transport only. /completion has no tool-call
@@ -290,12 +292,14 @@ class ChatResult:
     def wants_tool(self) -> bool:
         return bool(self.tool_calls)
 
-    @property
-    def context_used(self) -> int | None:
-        """Exact size of the context after this turn, or None if unreported."""
-        if self.prompt_tokens is None:
-            return None
-        return self.prompt_tokens + (self.completion_tokens or 0)
+    # There was a `context_used` property here returning
+    # `prompt_tokens + completion_tokens`. It had no callers, and it was a trap
+    # for the next one: completion_tokens counts reasoning the thinking pad
+    # throws away, so the sum is not the size of anything that gets sent again.
+    # A window measured that way appears to *shrink* as the conversation grows.
+    # What the next prompt will carry is `prompt_tokens` of the round just
+    # finished plus the text that was kept — which is what Session computes at
+    # the end of a turn, deliberately not from here.
 
 
 class LLMEngine:
@@ -334,6 +338,12 @@ class LLMEngine:
         # What the server actually does, as opposed to what config assumes.
         # Probed once, lazily; see capabilities().
         self._caps = None
+        # What this server's chat template charges for the tool block, solved
+        # for from a reported prompt_tokens. None until a round goes past
+        # note_schema_cost() with a window small enough to solve against; see
+        # it for why that is the only place the subtraction is safe.
+        self.schema_tok = None
+        self._schema_fit_prose = None
         # Whether the chat transport looks for an inline thinking block in
         # message.content. True until the probe says otherwise, because the
         # failure it guards against — a whole trace appended to history as the
@@ -427,8 +437,10 @@ class LLMEngine:
           than the server was started with and every overflow is the server's
           to handle: a 400, or, with --context-shift, silent truncation.
         - **usage is reported.** When it is withheld every context figure is a
-          local estimate carrying a deliberate +60% pad, which is a very
-          different number to act on.
+          local estimate — calibrated, but against Qwen's chat template, and
+          with nothing to check it against on this server. It is also the only
+          case where the estimate decides anything: with usage reported, a
+          measurement is available everywhere it matters.
 
         Resolved once and cached, like resume_transport(): a diagnostic may
         not cost a round per turn. Every failure degrades to "unknown" rather
@@ -506,7 +518,10 @@ class LLMEngine:
         if caps["usage_reported"] is False:
             caps["warnings"].append(
                 "this server withholds token usage — every context figure is "
-                f"a local estimate carrying the +60% pad, shown with a ~")
+                "a local estimate, shown with a ~. The tool-block cost in it "
+                "is a formula fitted on Qwen's chat template, since there is "
+                "no reported prompt size here to measure it from; on another "
+                "template that term is a guess")
 
         self._caps = caps
         for w in caps["warnings"]:
@@ -552,6 +567,51 @@ class LLMEngine:
             logger.error(f"LLM stream failed: {e}")
             raise
 
+    # Below this much prose, a round is worth solving the schema cost against.
+    # The subtraction inherits the prose correction's error over the whole
+    # window, so the window has to be small for the remainder to mean
+    # anything: at ±1% a 4,000-token prompt contributes ±40 tokens of slop to
+    # a block that is a few hundred, which is tolerable. At 90,000 it
+    # contributes ±900 and the answer would be noise.
+    SCHEMA_FIT_MAX_PROSE = 4000
+
+    def note_schema_cost(self, messages, tools, prompt_tokens):
+        """Solve for what the chat template charges for the tool block.
+
+        `prompt_tokens = (what the server counts for the conversation) + (what
+        it counts for the schemas)`. The first term is the one we can estimate
+        well, so subtracting it leaves the one we cannot estimate at all —
+        rendering is template-specific, and nothing on this side knows which
+        template the server runs.
+
+        Called from the one place where both halves are unambiguous: the
+        request itself, after any prefill has been appended. Reconstructing
+        "what was sent" anywhere else means guessing whether tools rode along
+        on that particular round, and a wrong guess here poisons every
+        rollover decision for the life of the process.
+
+        The smallest window wins rather than the first, because the error in
+        this subtraction is proportional to the prose it subtracts.
+        """
+        if prompt_tokens is None or not tools:
+            return
+        prose = corrected_messages(messages)
+        if prose >= self.SCHEMA_FIT_MAX_PROSE:
+            return
+        if self.schema_tok is not None and prose >= self._schema_fit_prose:
+            return
+        observed = prompt_tokens - prose
+        # A server that reports a prompt smaller than the conversation alone
+        # is not describing this request — a cached-prefix accounting quirk, a
+        # truncating server, a proxy rewriting the payload. Take nothing from
+        # it rather than cache a negative block and under-report every window.
+        if observed <= 0:
+            return
+        self.schema_tok = observed
+        self._schema_fit_prose = prose
+        logger.debug("schema block measured at %d tok (against %d tok of prose)",
+                     observed, prose)
+
     async def chat_with_tools(self, messages: list, model: str | None = None,
                               tools: list | None = None,
                               on_text=None, on_reasoning=None,
@@ -596,6 +656,8 @@ class LLMEngine:
                         "arguments": tc.function.arguments or "",
                     })
                 usage = getattr(response, "usage", None)
+                self.note_schema_cost(messages, params.get("tools"),
+                                      getattr(usage, "prompt_tokens", None))
                 reasoning = getattr(msg, "reasoning_content", None) or ""
                 # Defensive: a server configured to inline its thinking sends
                 # the whole trace here, and letsClaw would append it to history
@@ -684,6 +746,8 @@ class LLMEngine:
                 text_parts.append(ftext)
                 on_text(ftext)
             tool_calls = [pending[i] for i in sorted(pending)]
+            self.note_schema_cost(messages, params.get("tools"),
+                                  getattr(usage, "prompt_tokens", None))
             return ChatResult("".join(text_parts), tool_calls, finish,
                               reasoning="".join(reason_parts),
                               prompt_tokens=getattr(usage, "prompt_tokens", None),

@@ -36,7 +36,8 @@ import paths
 import session as store
 from llm_engine import ChatResult, RoundInterrupted
 from ssh_forward import SSHForwardManager
-from token_counter import count_messages, count_text, count_tools
+from token_counter import (count_messages, count_text, count_tools,
+                           corrected_messages, corrected_text, schema_cost)
 
 logger = logging.getLogger("letclaw.core")
 
@@ -69,19 +70,20 @@ DIGEST_WINDOW_SHARE = 50
 # and it is already on disk in full, so the tail is taken: the reasoning that
 # led to the answer, rather than the exploring that preceded it.
 DIGEST_PAD_TAIL_CHARS = 20_000
-# cl100k plus our framing under-counts this stack by ~30% (chat-template markers
-# and the server's own tool rendering are invisible to us). Only used when the
-# server withholds usage: rolling over early costs a summary, late costs a 400.
-ESTIMATE_SCALE = 1.6
-
 SESSION_MARKER = "\n=== SESSION ===\n"
 CARRYOVER_MARKER = "\n\n=== CONTINUED SESSION ===\n"
 
 # Seconds held back from turn_timeout so the closing round still fits inside the
 # wall after a long think. Thinking stops at turn_timeout - this.
-# Slack left between the pad and the context ceiling. The pad rides in the
-# prompt and grows every round, and our token count runs low (see
-# ESTIMATE_SCALE), so the headroom wall trips this far short of the real edge.
+# Slack left between the pad and the context ceiling. Not an allowance for a
+# bad token count — the margin is the same on a server that reports usage
+# exactly, and it is needed there too. It is the only slack in the closing
+# invariant: because the pad is sized as `free - reserve - this`, the worst
+# case the design permits is `used + pad + reserve == budget - this`. At zero,
+# the worst case the design permits is the server's hard limit, where being
+# one token out is a 400 instead of a slightly shorter think. And `used_now()`
+# describes the prompt of the round *before* this one, so even an exact
+# measurement is one round stale by the time the pad is sized against it.
 PAD_CONTEXT_MARGIN = 2000
 # How many times a server that cannot resume is asked to conclude before we give
 # up. Only the fallback path uses it; resumable servers never come here.
@@ -89,13 +91,16 @@ FORCED_CONCLUSION_TRIES = 3
 # Below this much free context there is no room to think in, so the pad is not
 # worth starting — the pre-turn check rolls over instead where it may.
 MIN_THINK_HEADROOM = 4000
-# Below this much free context there is no room for another tool round, so the
-# loop stops asking for work and asks for words. Sized to hold one clipped tool
-# result (tools.max_output_chars, 8000 chars) plus the assistant message and
-# arguments that carry it, with the slack that ESTIMATE_SCALE exists for: a
-# round admitted here must be able to *finish*, and the result lands in the
-# history whether or not there was room for it.
+# Floor for the room one more tool round needs; the real figure is derived
+# per session by Session._min_tool_round_room(), because the dominant term is
+# configurable. Below that much free context the loop stops asking for work
+# and asks for words — a round admitted here must be able to *finish*, and its
+# result lands in the history whether or not there was room for it.
 MIN_TOOL_ROUND_ROOM = 4000
+# What else a tool round carries besides the result: the assistant message
+# announcing the call, its arguments (a write_file call carries its whole
+# payload here), and the framing on both messages.
+TOOL_ROUND_OVERHEAD = 400
 # The answer reserve, as a share of the context still free. See
 # Session._answer_reserve: a share rather than a fixed block, floored so a
 # nearly-full window still has room for a real answer and ceilinged by what
@@ -424,19 +429,68 @@ class Session:
         return self.lock.locked() or bool(self._turn_task
                                           and not self._turn_task.done())
 
-    def estimate(self, messages=None):
-        """Deliberately conservative context size, for servers that hide usage."""
+    def _min_tool_round_room(self):
+        """Free context below which another tool round is not worth starting.
+
+        The constant this replaces hard-coded tools.py's 8,000-char default
+        and read 4000. `tools.max_output_chars` is configuration: set it to
+        32,000 and the old figure was 4x short, admitting rounds that could
+        not finish and landing the overflow in the history anyway.
+
+        Two results, not one: `used_now()` at the check is already a round
+        stale — the assistant message with the tool_calls and the result it
+        returned are both in the history and neither is in the measurement —
+        and the round being admitted has to fit as well.
+        """
+        from tools import DEFAULT_MAX_OUTPUT     # local, as build_tools is
+        chars = configlib.int_or(
+            (self.config.get("tools") or {}).get("max_output_chars",
+                                                 DEFAULT_MAX_OUTPUT),
+            DEFAULT_MAX_OUTPUT)
+        # chars // 4 rather than a real count: there is no text to count yet.
+        # The rounding is deliberate on the safe side — tool output is paths,
+        # JSON and log lines, which tokenize *worse* than 4 chars each.
+        return max(MIN_TOOL_ROUND_ROOM, 2 * (chars // 4) + TOOL_ROUND_OVERHEAD)
+
+    def schema_tok(self):
+        """What the tool block costs in this session's prompts.
+
+        Measured where the server reports usage: the engine solves for it from
+        a real prompt_tokens, and that answer is true for whatever chat
+        template the server actually runs. Otherwise the Qwen-calibrated
+        formula — which is the case the estimate exists for, and also the case
+        where it is least certain, so the startup warning says which template
+        it was fitted on.
+        """
+        observed = getattr(self.engine, "schema_tok", None) if self.engine else None
+        return observed if observed is not None else schema_cost(self.schemas)
+
+    def estimate(self, messages=None, tools=True):
+        """Context size in server tokens, for rounds no measurement covers.
+
+        Two terms, because what we hold locally is wrong in two unrelated
+        ways: cl100k disagrees with the server's encoding by a *ratio* on
+        prose, and the tool schemas cost a *fixed* block more than their JSON
+        does. Correcting both with one multiplier — which is what this did for
+        a long time, at 1.6 — cannot work: the result reads 34% high on an
+        empty window and 52% high on a full one, because a scale applied to a
+        constant error grows with everything around it. See docs/tokens.md.
+
+        `tools=False` for a request sent without a `tools=` argument. The
+        digest is the one such caller, and its whole prompt is smaller than
+        the schema block it would otherwise be charged for.
+        """
         msgs = self.history if messages is None else messages
-        return int((count_messages(msgs) + self.tools_tok) * ESTIMATE_SCALE)
+        prose = corrected_messages(msgs)
+        return prose + self.schema_tok() if tools else prose
 
     def used_now(self):
         """How full the window is: measured where the server told us, else estimated.
 
-        estimate() carries a deliberate +60% (ESTIMATE_SCALE) for servers that
-        withhold usage. Spending that margin when the real figure is already
-        known costs tens of thousands of phantom tokens on a large window, and
-        the pre-turn headroom check reads it as context pressure that is not
-        there.
+        A measurement is still preferred over an accurate estimate. The
+        estimate is calibrated, not exact — it is blind to anything the
+        template does that we have not fitted, and on a server that withholds
+        usage there is nothing to check it against.
 
         _last_used is only ever the size of the *current* window: every path
         that rebuilds the history from nothing clears it, so this is either a
@@ -579,9 +633,22 @@ class Session:
         rollover was auto-disabled at _after_turn would have the threshold handed
         straight back, and would disable it again on the next turn, forever.
         """
+        # Compared before the assignment, and against the schemas rather than
+        # their token count: two different tool sets can coincidentally cost
+        # the same, and the question here is whether the block changed at all.
+        schemas_changed = self.schemas != blob["schemas"]
         self.tools = blob["tools"]
         self.schemas = blob["schemas"]
         self.tools_tok = blob["tools_tok"]
+        # A reload that adds or drops a tool changes the schema block every
+        # request carries, so a measurement taken before it describes a prompt
+        # with the old block. The history is untouched here, which is why this
+        # is the one invalidation that is not about history: the *other* half
+        # of the prompt moved. Gated, because most reloads change neither, and
+        # throwing the measurement away would put the next turn's headroom
+        # check back on the estimate for nothing.
+        if schemas_changed:
+            self._last_used = None
 
         for attr, was, now in blob["scalars"]:
             if getattr(self, attr) == was:
@@ -1228,7 +1295,7 @@ class Session:
                 # exactly what a tool round has to fit inside, and a third name
                 # for one number is how the gate and the wall drifted apart
                 # before (see docs/reasoning.md, invariant 1).
-                if self._pad_headroom() < MIN_TOOL_ROUND_ROOM:
+                if self._pad_headroom() < self._min_tool_round_room():
                     self.emit(ev("notice", level="warn",
                                  text="no room left for another tool round — "
                                       "asking for a final answer"))
@@ -1583,7 +1650,16 @@ class Session:
                              text=f"thinking stopped at the {reserve} s answer reserve "
                                   f"after {rounds} round(s) — concluding"))
                 break
-            if self._pad_headroom() - count_text(pad) <= 0:
+            # corrected_text, not count_text: this is the one place a local
+            # count is subtracted from a figure in the server's own tokens,
+            # and the pad is the largest term in the whole window. The ~5%
+            # cl100k runs low is proportional while PAD_CONTEXT_MARGIN is
+            # fixed, so on a big window the error eats the margin whole — a
+            # 200k pad on a 262k window is ~10,000 tokens past the wall this
+            # line exists to stop short of. The count_text calls below stay
+            # raw on purpose: they size a tail against PAD_TAIL_TOKENS, which
+            # is a local target, not the server's budget.
+            if self._pad_headroom() - corrected_text(pad) <= 0:
                 # Negative is "no limit" — see config.py. The loop still cannot
                 # spin: every cycle has to shrink the pad or it breaks below.
                 if (self.engine.max_pad_compactions >= 0
@@ -1854,16 +1930,26 @@ class Session:
         # they exist to avoid, and what is actually free in the call about to
         # be made.
         #
-        # That third cap is measured against `work`, not against the session's
-        # current usage, and the difference matters. The handoff summarises the
-        # whole history, so there `budget - used` is the room in its own
-        # prompt. This call sends only the turn, and the window is at its
-        # fullest precisely because of the turn being collapsed — budgeting it
-        # against `used` made the digest decline on every turn big enough to be
-        # worth digesting, rolling the window over instead.
+        # That third cap is measured against this call's own prompt, not
+        # against the session's current usage, and the difference matters. The
+        # handoff summarises the whole history, so there `budget - used` is
+        # the room in its own prompt. This call sends only the turn, and the
+        # window is at its fullest precisely because of the turn being
+        # collapsed — budgeting it against `used` made the digest decline on
+        # every turn big enough to be worth digesting, rolling the window over
+        # instead.
+        #
+        # The prompt is built here rather than estimated from `work`, because
+        # it is not `work`: it carries the pad, which is in no history at all
+        # and is the largest of the three terms, and it carries no tool block.
+        # Estimating from the slice got both wrong in opposite directions, and
+        # an estimator that read 60% high happened to cover the difference.
+        # It no longer does.
+        pad_tail = reasoning[-DIGEST_PAD_TAIL_CHARS:]
+        request = store.digest_messages(work, pad_tail)
         cap = min(DIGEST_MAX_TOKENS,
                   self.budget // DIGEST_WINDOW_SHARE,
-                  self.budget - self.estimate(work) - DIGEST_MARGIN
+                  self.budget - self.estimate(request, tools=False) - DIGEST_MARGIN
                   ) if self.budget else DIGEST_MAX_TOKENS
         if cap < DIGEST_MIN_TOKENS:
             self.emit(ev("notice", level="info",
@@ -1889,8 +1975,7 @@ class Session:
             record = (f"[full record: grep -n '^## turn {self.turn_id} ' "
                       f"{path}]") if path else ""
             digest = await store.build_turn_digest(
-                self.engine, work,
-                pad=reasoning[-DIGEST_PAD_TAIL_CHARS:], max_tokens=cap,
+                self.engine, work, pad=pad_tail, max_tokens=cap,
                 record=record)
         except Exception as e:
             self.emit(ev("notice", level="warn",
@@ -2132,8 +2217,8 @@ class Session:
         if name == "info":
             # The same figure the headroom check works from, so what a person
             # reads here is what the session is actually acting on. Marked
-            # honestly: `estimated` is only true when the server withheld usage
-            # and the +60% pad is all we have.
+            # honestly: `estimated` is only true when the server withheld
+            # usage and the local figure is all we have.
             used = self.used_now()
             return {"ok": True, "info": {
                 "session": self.name, "session_id": self.session_id,
@@ -2301,6 +2386,14 @@ class Session:
             self.history = self.fresh_history(carried) + body
         else:
             self.history = self.fresh_history(carried)
+        # Two things just moved under the measurement, not one. history[0] was
+        # rebuilt from a different model's behavior layers, so _last_used sizes
+        # a system prompt that is gone — and self.engine changed, so budget is
+        # a different number too. Switching from a 262k window to a 12k one
+        # would otherwise compare a figure measured against the big model's
+        # prompt with the small model's budget, in _pad_headroom, in
+        # _answer_reserve and in the next _after_turn.
+        self._last_used = None
 
 
 class SessionManager:

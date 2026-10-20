@@ -10,13 +10,15 @@
 aiohttp==3.14.3        # the WS/HTTP server (server.py) and every client
 openai==3.24.0         # llm_engine.py — the OpenAI-compatible chat API
 PyYAML==6.0.3          # config.yaml (imported as `yaml`)
-
-# --- optional ----------------------------------------------------------------
-# Token accounting. token_counter.py uses tiktoken (cl100k_base) when present
-# and falls back to a character estimate when it is not, so the core runs
-# without it — but the ⚡ token line is only as good as tiktoken makes it.
+# Token accounting. token_counter.py counts with cl100k_base, and the
+# corrections that decide when a window rolls over are calibrated against it.
+# There is a chars/4 fallback so a missing tiktoken never stops the core, but
+# it is a much cruder count and the calibration does not apply to it — so
+# install this. First use fetches a 1.6 MB vocab file into state/tiktoken/,
+# once, and never needs the network again.
 tiktoken==0.14.0
 
+# --- optional ----------------------------------------------------------------
 # The Discord bot (source/discord_client.py) only. The core never imports
 # discord.py and does not know the bot exists, so skip this if you do not run
 # a bot.

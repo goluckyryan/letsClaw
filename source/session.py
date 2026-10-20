@@ -721,6 +721,32 @@ async def build_handoff(engine, history, max_tokens=1500, prior=""):
     return (text or "").strip()
 
 
+def digest_messages(turn_slice, pad=""):
+    """The exact message list build_turn_digest will send. [] if there is none.
+
+    Split out so the caller can size its own request instead of guessing at
+    it. The cap on `max_tokens` has to be `budget - (this prompt)`, and the
+    prompt is not the turn slice: the slice is flattened into a single user
+    message, two fixed blocks are wrapped around it, and the thinking pad —
+    which exists in no history anywhere — is spliced in. Estimating it from
+    the raw slice missed the pad entirely, which is the biggest term of the
+    three, and charged the request for a tool block it does not send.
+    """
+    body = render_transcript(turn_slice)
+    if pad.strip():
+        body = (f"{body}\n\n--- the assistant's own reasoning during this turn ---"
+                f"\n\n{pad.strip()}")
+    if not body.strip():
+        return []
+    return [
+        {"role": "system", "content": _SUMMARISER_SYSTEM},
+        {"role": "user", "content": (
+            f"One turn of a conversation:\n\n{body}\n\n"
+            f"Write a digest of the work in that turn using exactly these four "
+            f"sections:\n\n{_DIGEST_FORMAT}")},
+    ]
+
+
 async def build_turn_digest(engine, turn_slice, pad="", max_tokens=600,
                             record=""):
     """Compress one turn's working-out. Returns "" if it produced nothing.
@@ -745,19 +771,9 @@ async def build_turn_digest(engine, turn_slice, pad="", max_tokens=600,
     Runs on its own message list, like build_handoff — the real history is
     never touched and this request never becomes part of the conversation.
     """
-    body = render_transcript(turn_slice)
-    if pad.strip():
-        body = (f"{body}\n\n--- the assistant's own reasoning during this turn ---"
-                f"\n\n{pad.strip()}")
-    if not body.strip():
+    messages = digest_messages(turn_slice, pad)
+    if not messages:
         return ""
-    messages = [
-        {"role": "system", "content": _SUMMARISER_SYSTEM},
-        {"role": "user", "content": (
-            f"One turn of a conversation:\n\n{body}\n\n"
-            f"Write a digest of the work in that turn using exactly these four "
-            f"sections:\n\n{_DIGEST_FORMAT}")},
-    ]
     # Same hint and same fallback as build_handoff: a thinking model spends the
     # whole budget reasoning and returns an empty string otherwise.
     try:

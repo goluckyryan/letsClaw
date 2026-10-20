@@ -39,7 +39,7 @@ conversation state — see
 | `source/ssh_forward.py` | ~560 | **model servers over ssh.** One supervised `ssh -N -L` child per model entry that names an `ssh_forward`, on a port the core picks itself |
 | `source/tools.py` | ~210 | `exec`, `read_file`, `write_file`, `list_dir`, … and their JSON schemas |
 | `source/logging_setup.py` | ~110 | one rotating log file **per writer** (`letclaw-core.log`, `letclaw-discord.log`), because two processes sharing one file cannot rotate it safely |
-| `source/token_counter.py` | ~90 | tiktoken when present, a 4-chars-per-token estimate otherwise |
+| `source/token_counter.py` | ~115 | counts with tiktoken's `cl100k_base`, cached under `state/tiktoken/` so it is fetched once ever rather than once per reboot; degrades loudly to 4-chars-per-token if the vocab cannot be loaded at all |
 | `source/paths.py` | ~75 | `REPO_ROOT` and `resolve()` — [principle 15](design-principles.md#15-one-definition-of-where-the-repo-is) |
 | `source/chunker.py` | ~310 | fence-aware message splitting; separate so it tests without `discord.py` |
 | `source/chat.py` | ~610 | the terminal client |

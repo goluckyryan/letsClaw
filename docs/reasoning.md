@@ -95,9 +95,10 @@ Thinking continues while `_pad_headroom() - count_text(pad) > 0`.
 Two things about `used_now()` matter here:
 
 - It prefers the **server-measured** prompt size (`_last_used`) and only falls
-  back to a local estimate padded by `ESTIMATE_SCALE = 1.6`. Which one is in
-  force is reported at startup, so a padded guess is never mistaken for a
-  measurement.
+  back to the local estimate. Which one is in force is reported at startup, so
+  an estimate is never mistaken for a measurement. The estimate is calibrated
+  rather than padded — a flat `×1.6` here used to make a half-full window read
+  as full, which rolled sessions over to relieve pressure that was not there.
 - `tally` publishes `_last_used` **mid-turn**, on every round whose prompt was
   exactly the current history (`history_shaped=True`, in `tally()`). A tool
   result landing between two pad rounds therefore moves the wall immediately.
@@ -262,11 +263,16 @@ Known gaps, as of this writing:
 2. **The reserve is read *after* the pad loop, not before it**.
    A tool can run mid-pad and move `used_now()`; a cap captured at the top of
    `_think_pad` would be stale, which is invariant 1 broken by another route.
-3. **Every path that reshapes `history` must clear `_last_used`.** Because
-   `tally` publishes mid-turn, a stale measurement describes a window that no
-   longer exists and triggers a rollover to relieve pressure already relieved.
-   The paths: `repair_history()`, `_digest_turn`, the
-   `max_history` trim, `roll_over`, `use_model`, `/clear`.
+3. **Every path that changes what the next prompt contains must clear
+   `_last_used`.** Because `tally` publishes mid-turn, a stale measurement
+   describes a window that no longer exists and triggers a rollover to relieve
+   pressure already relieved. Most of those paths reshape `history`:
+   `repair_history()`, `_digest_turn()`, the `max_history` trim in
+   `_after_turn()`, `roll_over()`, `/clear`, `/new`. Two do not, and are the
+   easy ones to miss — `use_model()` rebuilds the system message from another
+   model's layers *and* changes the budget the measurement is compared
+   against, and `apply_config()` leaves the history alone but can change the
+   tool schemas, which are the other half of every prompt.
 4. **The pad never enters history.** Rounds carrying it tally with
    `history_shaped=False`.
 5. **`_pad_tail` is verbatim.** The last ~2,000 tokens are never summarised,

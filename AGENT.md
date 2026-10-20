@@ -20,8 +20,9 @@ cd ~/letsClaw
 # 1. Interpreter + dependencies. All Python deps live in .venv, never system-wide.
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-#    required: aiohttp, openai, PyYAML   optional: tiktoken (token counts),
-#    discord.py (bot only). See requirements.txt for which is which.
+#    required: aiohttp, openai, PyYAML, tiktoken (token counts — there is a
+#    cruder fallback, but the rollover calibration assumes tiktoken)
+#    optional: discord.py (bot only). See requirements.txt for which is which.
 
 # 2. Config. config.yaml is gitignored — it does not exist yet.
 cp config.example.yaml config.yaml
