@@ -28,10 +28,10 @@ is built, why it is built that way, and where the edges are.
    not break. Read it before touching `_answer_reserve`, `_pad_headroom`,
    `_headroom_check` or `_think_pad`.
 7. **[tokens.md](tokens.md)** — the input side, in plain language: what fills
-   the window on every round, why one turn is several prompts, and a measured
-   audit of the counter itself — which figures are the server's truth, which
-   are guesses, and where the guesses are wrong. Written to be readable without
-   the source open.
+   the window on every round, why one turn is several prompts, and how the
+   counter behaves — which figures are the server's truth, which are
+   estimates, and how accurate the estimates are. Written to be readable
+   without the source open.
 
 [`decisions/`](decisions/) holds dated records of features that shipped: what
 was decided, what was rejected, and what deliberately was not built. They were

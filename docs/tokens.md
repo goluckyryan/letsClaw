@@ -1,4 +1,4 @@
-# Tokens: what gets counted, and whether the counter is right
+# Tokens: what gets counted, and how accurately
 
 **Who this is for:** anyone who reads the `⚡` line or the WebUI gauge and wants to
 know what the numbers mean — and whether to believe them. No code required. The
@@ -6,8 +6,11 @@ code-level companion is [reasoning.md](reasoning.md), which covers the *output*
 side (caps, the thinking pad, the answer reserve). This page is the *input* side:
 what fills the context window, and how letsClaw measures it.
 
-Every figure in the audit at the bottom was measured against the real server
-(SGLang, Qwen3.8-27B, `192.168.203.132:8888`) on 2026-10-19, not estimated.
+Every figure on this page was measured against the real server (SGLang,
+Qwen3.8-27B, `192.168.203.132:8888`) on 2026-10-19, not estimated. This page
+describes what the code does **now**; it is not a changelog, and where a number
+here disagrees with the running system, the system is right and the page is
+stale.
 
 ---
 
@@ -29,7 +32,7 @@ are used strictly from here on.
 | **bill** | how many input tokens a turn, or a whole session, actually **sent**. Not the same as `used`: `used` is the window measured once, while every round of a turn re-sends the whole of it. The bill is the larger number, always, and on a tool-heavy turn it is several times larger. `/info` shows the session's as `📥 Input`. |
 | **cache hit rate** | the share of the bill the server answered out of its KV cache instead of re-reading. A **cost and speed** figure, never a space figure — see section 4. `/info` shows it as `💾 Cache`, and omits the line when the server reports nothing. |
 | **tokenizer** | the thing that chops text into tokens. Every model has its own, with its own vocabulary, so *the same sentence is a different number of tokens to different models*. There is no universal token. |
-| **tiktoken** | OpenAI's tokenizer library, and the one letsClaw counts with. It is **not Qwen's tokenizer** — the real one lives on the server. letsClaw uses `cl100k_base` (the GPT-3.5/GPT-4 vocabulary) as a stand-in, because it is a pip install and the right one is not. This substitution is the source of one of the two counting errors in section 8; it turns out to be the *smaller* one. |
+| **tiktoken** | OpenAI's tokenizer library, and the one letsClaw counts with. It is **not Qwen's tokenizer** — the real one lives on the server. letsClaw uses `cl100k_base` (the GPT-3.5/GPT-4 vocabulary) as a stand-in, because it is a pip install and the right one is not. It is one of the three corrections section 8 applies, and the smallest of them. |
 
 One shorthand you will see below, now that the words are pinned down:
 *"the window grew by 427"* is loose for *"`used` went up by 427"*. The window
@@ -93,8 +96,9 @@ What the four cost:
 | sum of the JSON | ~353 tok | what letsClaw counts |
 | **what the server charges** | **595 tok** | measured |
 
-The gap is not a rounding error, and it is the root of Finding 8. The server
-does not pass your JSON through — it **re-renders** the schemas into Qwen's own
+The gap is not a rounding error, and it is why the schema term in section 8
+is measured from the server rather than counted locally. The server does not
+pass your JSON through — it **re-renders** the schemas into Qwen's own
 chat-template format, wrapping them in section markers and instructions on how
 to emit a tool call. None of that scaffolding is visible to a counter that only
 looks at `json.dumps()`, so letsClaw sees 353 where the model sees 595.
@@ -242,8 +246,8 @@ ratio is 2.7, and as tools are added it falls toward
 $$\frac{T}{\tau} \;\longrightarrow\; 1 + \frac{11}{\bar s} \;\approx\; 1.13
 \qquad (\bar s = \text{average tool size, } \approx 88 \text{ tokens here})$$
 
-This matters for the fix in section 8: **anything that hardcodes 1.69 is
-calibrated to today's tool list and silently wrong after you add a tool.**
+This matters in section 8: **anything that hardcodes 1.69 is calibrated to
+today's tool list and silently wrong after you add a tool.**
 
 ### The history
 
@@ -293,10 +297,10 @@ $$I(n) \;\approx\; r(n)\cdot U(n-1)$$
 **This is the round multiplier, stated exactly.** A turn costs its window
 *times its round count*.
 
-$I(n)$ is no longer only algebra: each round's server-reported `prompt_tokens`
-is now summed over the turn and rides the `stats` event as `input_tokens`. It
-is not rendered on the `⚡` line — the decision was a session total, section 8
-finding 10 — but the per-turn figure is on the wire for anything that wants it,
+$I(n)$ is not only algebra: each round's server-reported `prompt_tokens` is
+summed over the turn and rides the `stats` event as `input_tokens`. It
+is not rendered on the `⚡` line — the choice was a session total, section 8 —
+but the per-turn figure is on the wire for anything that wants it,
 and it is measured, never estimated. A round whose server withheld usage
 contributes nothing rather than a guess, and the event's `input_measured` flag
 says whether every round of the turn was counted.
@@ -335,7 +339,7 @@ $h$, and that is worth far more than any saving on a single turn.
 
 $I_{\text{total}}$ is a number you can read. It is exactly what the session
 odometer `total_input` accumulates, printed by `/info` as `📥 Input`, so the
-$\mathcal{O}(N^2)$ claim above is now **observed rather than derived** — watch
+$\mathcal{O}(N^2)$ claim above is **observed, not just derived** — watch
 the gauge crawl while that line sprints. It is also the only place the cost of
 a misfiring rollover shows up: a window rolled at half full still bills every
 round it took to get there, and `used` resets while the odometer does not.
@@ -378,16 +382,11 @@ in $F$ coincides with a reset of $h$, which is why the recurrences above can
 treat $F$ as a constant: each piece is exactly one window, and a new window
 starts a new piece.
 
-### The counter, and where it goes wrong
+### The counter, and what it has to correct
 
-When the server withholds usage, letsClaw has to estimate the window. It used
-to do that with a single scale over the lot:
-
-$$\hat{U}(n) = 1.6\,\big(m(n) + \tau\big)$$
-
-One multiplier, applied to everything. The measured truth is not shaped like
-that. The local count differs from the server's in **three ways, and the three
-have three different shapes**:
+When the server withholds usage, letsClaw has to estimate the window from its
+own local count. That count differs from the server's in **three ways, and the
+three have three different shapes**:
 
 | the error | why it exists | shape | grows with |
 |---|---|---|---|
@@ -413,19 +412,11 @@ spanning 1,800 to 17,000 tokens gives
 
 $$\alpha = 1.0510, \qquad \beta = 10.79, \qquad \text{worst residual } \mathbf{0.60\%}$$
 
-**A single multiplier cannot correct three errors of three different shapes.**
-That is the whole bug, in one line. Dividing the old estimate by the truth
-shows what it cost:
-
-$$\frac{\hat{U}(n)}{U(n)} \;=\; \frac{1.6\,(m + \tau)}{\alpha\mu + \beta\nu + T} \;\xrightarrow[\;\mu \to \infty\;]{} \; \frac{1.6}{\alpha} \;=\; \mathbf{1.52}$$
-
-At the floor $\mu \approx 1200$ it evaluates to 1.34; by $\mu \approx 10^4$ it
-has reached 1.47 and is still climbing. Measured: **+34%** at the floor,
-**+47%** at 17,000 tokens, **+52%** at 25,000. The law predicts all three,
-which is how we know the error was understood rather than merely tabulated.
-
-**The fix is the form, and it is now what the code does.** Three constants,
-each multiplying the term whose error it actually describes:
+**A single multiplier cannot correct three errors of three different shapes** —
+scale the lot by one number and the per-message and per-prompt terms are scaled
+too, so the result is a straight line fitted to a curve and the only question is
+where it crosses. So the code uses three constants, each multiplying the term
+whose error it actually describes:
 
 $$\hat{U}(n) \;=\; \text{PROSE\_SCALE}\cdot\mu(n) \;+\; \text{MESSAGE\_FRAMING\_TOKENS}\cdot\nu(n) \;+\; T$$
 
@@ -436,9 +427,9 @@ from the server wherever it reports a prompt size, and falls back to
 $198 + \tau + 11N$ — `SCHEMA_BASE_TOKENS` + $\tau$ + `SCHEMA_PER_TOOL_TOKENS`
 $\times N$ — where it does not.
 
-Across the same nine checkpoints this lands within **0.5%**, against +34% to
-+47%. Section 8 has the before-and-after at every point, and the alternatives
-that were tried and rejected on the way there.
+Across the same nine checkpoints this lands within **0.5%**. Section 8 has the
+figure at every point, and the alternative forms that were considered and
+rejected.
 
 ---
 
@@ -498,7 +489,7 @@ conversation. A 5-tool turn pays six times over.
 The `⚡` line will report `context 3651/262144` for this turn. That is honest —
 it is the window *size* — but it is **2.3× smaller than what the turn actually
 cost**. The per-turn figure is on the `stats` event and rendered nowhere;
-what `/info` shows is the session total these turns add up to (Finding 10).
+what `/info` shows is the session total these turns add up to (section 8).
 
 ### ...16 more ordinary turns... → turn *n*
 
@@ -524,23 +515,23 @@ whole conversation is re-sent, every round, forever.*
 
 ### What the counter said at each of those checkpoints
 
-The same trace, with letsClaw's own estimator beside the truth — as it read
-before this was fixed, and as it reads now:
+The same trace, with letsClaw's own estimator beside the truth and beside the
+uncorrected local count it starts from:
 
-| window after turn | truth | raw count | old: ×1.6 | now |
-|---|---|---|---|---|
-| 0 — empty window | 1,859 | 1,553 | 2,484 (+34%) | **1,865** (+0.3%) |
-| 1 — after a plain Q&A | 2,286 | 1,952 | 3,123 (+37%) | **2,291** (+0.2%) |
-| 2 — after a 2-tool turn | 3,651 | 3,219 | 5,150 (+41%) | **3,662** (+0.3%) |
-| 18 — "turn *n*" | 10,713 | 9,815 | 15,704 (**+47%**) | **10,805** (+0.9%) |
-| 19 — "turn *n+1*" | 11,110 | 10,195 | 16,312 (**+47%**) | **11,218** (+1.0%) |
+| window after turn | truth | raw count | the estimate |
+|---|---|---|---|
+| 0 — empty window | 1,859 | 1,553 | **1,865** (+0.3%) |
+| 1 — after a plain Q&A | 2,286 | 1,952 | **2,291** (+0.2%) |
+| 2 — after a 2-tool turn | 3,651 | 3,219 | **3,662** (+0.3%) |
+| 18 — "turn *n*" | 10,713 | 9,815 | **10,805** (+0.9%) |
+| 19 — "turn *n+1*" | 11,110 | 10,195 | **11,218** (+1.0%) |
 
-**Lesson 4: a safety factor is not safety.** The raw count is consistently a
-*little* low. The old ×1.6 overcorrected, and the overshoot *grew* with the
-conversation — exactly where being wrong is expensive. The current estimator
-has no safety factor at all; each of its three constants corrects a measured
-error of a known shape, and what is left is under 1%. Section 8 takes the whole
-thing apart.
+**Lesson 4: the corrections are not a safety factor.** The raw count is
+consistently a *little* low, and the gap is not one error but three. The
+estimator carries no safety margin at all — each of its three constants
+corrects a measured error of a known shape, and what is left is under 1%. A
+single blanket multiplier would read right at one window size and wrong at
+every other; section 8 has the arithmetic.
 
 The residual that remains is **positive and grows slowly with message count**
 — +0.3% at the floor, +1.0% by turn 19. That is the deliberate rounding of the
@@ -590,8 +581,8 @@ still sits in the window and still counts toward the limit. This matters because
 
 This is also why the cache figure is reported where it is. `/info` prints it as
 a percentage of *input billed*, never as anything subtracted from the gauge —
-the gauge is a space measurement and the cache has no business in it. Finding 9
-below has the mechanics; the division of labour is the point here.
+the gauge is a space measurement and the cache has no business in it. Section 8
+has the mechanics; the division of labour is the point here.
 
 **Zero cached and no cache figure are different facts.** A server that says
 `cached_tokens: 0` is telling you the prefix missed — something rewrote the
@@ -643,7 +634,7 @@ part of the prompt that varies:
 Rounds that skip the schemas are ~595 tokens cheaper here. None of this is
 visible in the `⚡` line, which reports the window *size* once per turn rather
 than the sum of the prompts the turn actually sent. `/info`'s input odometer is
-where that sum lands, across the whole session (Finding 10).
+where that sum lands, across the whole session (section 8).
 
 ---
 
@@ -671,11 +662,11 @@ Both gates read `used_now()`, and that falls back to the estimate after every
 operation that reshapes history — including a rollover itself. So the first
 round of a *brand new* window is judged by the estimator, and the question "is
 this fresh window already past the trip point?" is asked of a figure nobody
-measured. When the estimator read 52% high, the answer could be yes on a window
-that was genuinely half empty; rollover would fire again immediately, or
-disable itself for the rest of the session. That is why section 8 treats the
-estimator's accuracy as a correctness problem and not a display one: **the
-estimate is the rollover decision.**
+measured. An estimator reading high answers yes on a window that is genuinely
+half empty — rollover fires again immediately, or disables itself for the rest
+of the session. So the estimator's accuracy is a correctness property, not a
+display one: **the estimate is the rollover decision**, and section 8 gives its
+measured error.
 
 ---
 
@@ -709,9 +700,8 @@ and the code gets it right.
 
 **The estimate path (fallback).** When a server withholds usage, letsClaw counts
 locally with `tiktoken` (`cl100k_base`, a GPT encoding) and corrects that count
-toward the server's own tokenizer with the three constants of section 2. It
-used to multiply the lot by 1.6 instead; section 8 is mostly about why that was
-wrong and what replaced it.
+toward the server's own tokenizer with the three constants of section 2.
+Section 8 takes that path apart and gives its measured accuracy.
 
 The estimate is also what you see **after** any operation that reshapes history
 — a digest, a rollover, `/clear`, a history trim — because each correctly
@@ -720,110 +710,53 @@ screen more often than you would think.
 
 ---
 
-## 8. The audit
+## 8. The three numbers in detail
 
-### Verdict
+Section 2 gives the algebra and section 7 gives the two paths. This section is
+the measurement behind each: how accurate the estimate is, what the cache
+figure means, what the input odometer counts, and where the `~` convention
+still misleads. The estimate section ends with the alternative forms that were
+considered and rejected, because the project's first design principle is that a
+chosen solution comes with the ones it beat.
 
-| # | area | verdict |
-|---|---|---|
-| 1 | reading the server's `prompt_tokens` | ✅ correct, and cache-safe |
-| 2 | `used = prompt + answer`, not prompt + completion | ✅ correct, and subtle |
-| 3 | excluding the thinking pad from window size | ✅ correct |
-| 4 | invalidating the measurement after reshaping history | ✅ correct, all 6 sites |
-| 5 | `completion_tokens` includes reasoning | ✅ assumption verified |
-| 6 | measured/estimated honesty flags exist at all | ✅ rare and good |
-| 7 | **the flat ×1.6 estimate was miscalibrated** | ❌ **~52% over at scale** → ✅ **fixed, now under 1%** |
-| 8 | **tool schemas undercounted by 41%** | ❌ a *second* error, different shape → ✅ **fixed** |
-| 9 | **cached tokens never read** | ⚠️ available, discarded → ✅ **fixed** |
-| 10 | **per-turn input cost never totalled** | ⚠️ not measurable → ✅ **fixed, as a session total** |
-| 11 | honesty flags inconsistent across clients | ⚠️ cosmetic but misleading |
-
-### Finding 7 + 8 — the estimate was wrong in both directions at once
-
-> **Status: fixed.** This section keeps the original diagnosis, because the
-> measurements are what justify the replacement — and then records what was
-> actually built, what it measures at now, and the four alternatives that were
-> tried and rejected along the way.
+### 8a. The estimate, and why it has three constants
 
 Measured against the real tokenizer, same messages, with and without tools:
 
-| what | letsClaw's count | server's truth | truth ÷ estimate |
+| what | letsClaw's local count | server's truth | truth ÷ local |
 |---|---|---|---|
 | conversation text only | 1,201 | 1,265 | **1.05** |
 | the 4 tool schemas | 353 | 595 | **1.69** |
 | both together | 1,554 | 1,860 | 1.20 |
 
-So the tokenizer substitution is nearly harmless — `cl100k_base` is within **5%**
-of Qwen's tokenizer on prose, much better than the "10-20%" the module header
-claimed at the time (it now says 5%). **Most of the error is in the tool
-schemas**, where
-`json.dumps(specs)` misses the chat template's rendering scaffolding and comes in
-**41% low** (the server's figure is 1.69× ours).
+The tokenizer substitution is nearly harmless: `cl100k_base` is within **5%**
+of Qwen's tokenizer on prose. **Most of the gap is in the tool schemas**, where
+`json.dumps(specs)` misses the chat template's rendering scaffolding and comes
+in **41% low** — the server's figure is 1.69× ours.
 
 Read that 1.69 as a measurement of *this install*, not a constant: section 2
 breaks the gap down tool by tool and finds it is $198 + 11N$ — a fixed block
 plus a small per-tool cost — so the ratio depends on how many tools you offer
 and falls toward 1.13 as you add them.
 
-That is exactly what made it dangerous: the schema error is a **fixed ~242
-tokens**, while the 1.6 was a **multiplier**. Correcting a fixed error with a
-multiplier means the correction grows without bound as the conversation does.
+This is why the schema term is an **offset and not a ratio**. A fixed ~242-token
+shortfall corrected by a multiplier grows without bound as the conversation
+does, and it is the full window — not the empty one — where the number is
+load-bearing.
 
-A second, controlled run — pure prose turns, carried further than the worked
-example in section 3, which showed the same curve reaching +47%:
-
-| conversation | raw estimate | ×1.6 | truth | ×1.6 overshoots by |
-|---|---|---|---|---|
-| empty | 1,556 | 2,489 | 1,862 | +34% |
-| 4 turns | 4,562 | 7,299 | 4,985 | +46% |
-| 16 turns | 13,476 | 21,561 | 14,205 | **+52%** |
-| 40 turns | 25,022 | 40,035 | 26,385 | **+52%** |
-
-The scale had evidently been calibrated on a near-empty window, where fixed
-template overhead dominates and 1.6 looks defensible. By the time the window is
-full — exactly when the number is load-bearing — the true ratio has settled at
-**1.05**, and 1.6 was overstating the window by half.
-
-**What this cost, on a server without usage reporting:** rollover trips at 90%
-of 262,144 = 235,929. With the 1.6 scale that fires when the raw count hits
-147,455 — a window whose *true* size is about 155,000, or **59% full**. The
-session archives itself and throws away a handoff's worth of continuity **31
-percentage points early**, giving up roughly **80,000 usable tokens**.
-
-The code comment said the stack was under-counted "by ~30%". Measured, it is
-20% on an empty window and 5% on a full one. That comment is gone.
-
-#### The fix as first proposed — and why it was not enough
-
-The obvious reading of the evidence above is **two** errors: a ratio on the
-prose, a fixed offset on the schemas. So:
-
-$$\hat{U}(n) \;=\; 1.05\,m(n) \;+\; T$$
-
-That was built and measured against the live server. It came in at **−0.2% to
-−2.4%** — a large improvement, but running *low* in every case and drifting
-further low as the window grew. A pure scale cannot produce a drift. Something
-in the form was still wrong.
-
-The tempting fix was to raise the scale: the apparent ratio $U/m$ climbed from
-1.063 at the floor to 1.092 by the ninth checkpoint, so 1.08 would split the
-difference and the table would look fine. **That would have been the same
-mistake again** — fitting a ratio to an error that is not a ratio, exactly what
-1.6 did, just smaller. So instead of tuning the constant, the residual was
-fitted for shape:
+The third shape is per-message, and it is the easiest to miss. Correct the
+prose by a ratio and the schemas by an offset, and the result still runs low —
+**−0.2% at the floor, drifting to −2.4%** as the window grows. A pure scale
+cannot produce a drift, so the residual was fitted for shape:
 
 $$\text{prose\_true} = a\cdot\mu + b\cdot\nu \qquad\Longrightarrow\qquad a = 1.0510,\; b = 10.79$$
 
-worst residual **0.60%**. The scale had been right all along at 1.05. The drift
-was $b$: `count_messages` charges 4 tokens of framing per message, the two-term
-form scaled that to 4.2, and the real template charges about 11. Conversations
-grow by messages, so a per-message shortfall of ~7 tokens drifts exactly the
-way the measurement showed.
+worst residual **0.60%**. The per-token scale is 1.05 and the drift is $b$:
+`count_messages` charges 4 tokens of framing per message where the real
+template charges about 11, so a shortfall of ~7 tokens is paid once per
+message — and conversations grow by messages. Hence three constants, not two.
 
-That is the third shape, and it is why the shipped form has three constants and
-not two. Section 2 derives it.
-
-#### What it reads now
+#### What the schema term reads
 
 $T$ is the schemas' **real** cost. It is measured rather than assumed: the
 engine solves $T = \text{prompt\_tokens} - \text{corrected prose}$ the first
@@ -844,38 +777,49 @@ tool count.
 Measured against the live server at the nine checkpoints of section 3's trace
 and its tool-heavy continuation:
 
-| checkpoint | truth | old: ×1.6 | now |
-|---|---|---|---|
-| empty window | 1,859 | 2,484 (+33.6%) | **1,865** (+0.3%) |
-| after a plain Q&A | 2,286 | 3,123 (+36.6%) | **2,291** (+0.2%) |
-| after a 2-tool turn | 3,651 | 5,150 (+41.1%) | **3,662** (+0.3%) |
-| after turn 3 | 5,394 | 7,768 (+44.0%) | **5,420** (+0.5%) |
-| after turn 4 | 7,072 | 10,278 (+45.3%) | **7,109** (+0.5%) |
-| after turn 5 | 8,833 | 12,910 (+46.2%) | **8,877** (+0.5%) |
-| after turn 6 | 10,762 | 15,758 (+46.4%) | **10,787** (+0.2%) |
-| after turn 7 | 12,691 | 18,616 (+46.7%) | **12,703** (+0.1%) |
-| after turn 8 | 14,704 | 21,555 (+46.6%) | **14,672** (−0.2%) |
-| after turn 9 | 16,635 | 24,392 (+46.6%) | **16,575** (−0.4%) |
+| checkpoint | truth | the estimate |
+|---|---|---|
+| empty window | 1,859 | **1,865** (+0.3%) |
+| after a plain Q&A | 2,286 | **2,291** (+0.2%) |
+| after a 2-tool turn | 3,651 | **3,662** (+0.3%) |
+| after turn 3 | 5,394 | **5,420** (+0.5%) |
+| after turn 4 | 7,072 | **7,109** (+0.5%) |
+| after turn 5 | 8,833 | **8,877** (+0.5%) |
+| after turn 6 | 10,762 | **10,787** (+0.2%) |
+| after turn 7 | 12,691 | **12,703** (+0.1%) |
+| after turn 8 | 14,704 | **14,672** (−0.2%) |
+| after turn 9 | 16,635 | **16,575** (−0.4%) |
 
-**Worst case 0.5%, against +34% to +47%.** The schema block on this install:
-formula says 595, the server charges 595 — exact.
+**Worst case 0.5%.** The schema block on this install: formula says 595, the
+server charges 595 — exact.
 
 #### What was rejected, and why
 
-Per the project's first design principle, the alternatives are recorded rather
-than dropped.
+**A single multiplier over the lot.** One scale, applied to prose and schemas
+together, is the cheapest thing that could work and it is what a
+quickly-calibrated counter tends to be. It cannot work here: with a fixed
+schema offset inside it, the overshoot ratio has a *limit* of
+$\text{scale}/\alpha$ and climbs toward it as the window fills, so the constant
+reads right at one window size and wrong at every other. Calibrate it on a
+near-empty window — where template overhead dominates — and it overstates a
+full one by half. Rejected on shape: changing the number moves the crossing
+point, changing the form removes the curve.
 
-**Re-tuning the multiplier.** Pick 1.15 instead of 1.6 and the floor reads
-right. But the overshoot ratio has a *limit* of $1.6/\alpha$ and climbs toward
-it as the window fills — any single multiplier is a straight line fitted to a
-curve, and the only question is where it crosses. Changing the number moves the
-crossing point; changing the form removes the curve. Rejected on shape.
+**Raising `PROSE_SCALE` to ~1.08.** The apparent ratio $U/\mu$ climbs from
+1.063 at the floor to 1.092 by the ninth checkpoint, so 1.08 splits the
+difference and the table looks fine. It is the same mistake one order smaller:
+a per-token constant papering over a per-message error, reading high on a few
+long messages and low on many short ones — which is to say low on exactly the
+long tool-heavy conversations that approach the wall. Rejected because the fit
+shows the residual is per-message.
 
-**Raising `PROSE_SCALE` to ~1.08.** Covered above: it would have papered over a
-per-message error with a per-token constant, reading high on a few long
-messages and low on many short ones — which is to say, low on exactly the long
-tool-heavy conversations that approach the wall. Rejected because the fit
-proved the residual was per-message.
+**A global safety multiplier as a knob.** Keeping one scale at 1.0 "in case we
+need it" is an invitation: "bump it to 1.3" is the obvious answer to the next
+overflow, and it is wrong in the way above. There is no such knob. The real
+safety knobs exist and are tunable — `rollover_at_percent`,
+`PAD_CONTEXT_MARGIN`, `max_output_chars` — and `PROSE_SCALE` is itself a
+defensible one, in the right place, multiplying the single term that genuinely
+scales.
 
 **An online least-squares fit.** Instead of fixed constants, have the engine
 accumulate $(\mu, \nu, \text{prompt\_tokens})$ triples and re-solve as it goes.
@@ -886,64 +830,36 @@ and the solution swings. It also adds persistent state that has to be
 invalidated on every model and template change. Rejected: more machinery,
 worse answer.
 
-**Keeping the constant at 1.0 as a knob.** A multiplier left at 1.0 is an
-invitation to reintroduce this exact bug — "bump it to 1.3" is the obvious
-answer to the next overflow and is wrong in precisely the way 1.6 was wrong.
-The real safety knobs already exist and are tunable: `rollover_at_percent`,
-`PAD_CONTEXT_MARGIN`, `max_output_chars`. `PROSE_SCALE` is itself the
-defensible knob, in the right place, multiplying the one term that genuinely
-scales. Rejected: deleted outright.
-
-**Loosening the two margin constants.** `PAD_CONTEXT_MARGIN` and
-`MIN_TOOL_ROUND_ROOM` both cited the old scale in their comments, which made
-them look like compensation for it. Both citations were wrong and both
-constants are right anyway. `PAD_CONTEXT_MARGIN` is the *only* slack in the
-closing invariant — since $\text{pad} = \text{free} - \text{reserve} - M$, the
-worst case the design permits is exactly $\text{used} + \text{pad} +
+**Tightening the two margin constants now that the estimate is accurate.** An
+accurate estimator looks like a reason to reclaim `PAD_CONTEXT_MARGIN` and
+`MIN_TOOL_ROUND_ROOM`. It is not. `PAD_CONTEXT_MARGIN` is the *only* slack in
+the closing invariant — since $\text{pad} = \text{free} - \text{reserve} - M$,
+the worst case the design permits is exactly $\text{used} + \text{pad} +
 \text{reserve} = \text{budget} - M$, so at $M = 0$ the worst case is the
-server's hard limit and a one-token error is an HTTP 400. And the window figure
-it works from describes the *previous* round's prompt even when it is exact.
-`MIN_TOOL_ROUND_ROOM`'s stated derivation actually *under*counted. Kept, with
-both rationales rewritten; `MIN_TOOL_ROUND_ROOM` additionally became a floor
-under a figure derived from `DEFAULT_MAX_OUTPUT`, since that is configurable and
-the constant had the 8,000-char default hardcoded into it.
+server's hard limit and a one-token error is an HTTP 400. Neither constant is
+compensation for estimator error: both read `used_now()`, which on a reporting
+server is the exact measurement, and both are sized against the fact that it
+describes the *previous* round's prompt. `MIN_TOOL_ROUND_ROOM` is a floor under
+a figure derived from `DEFAULT_MAX_OUTPUT`, because that is configurable and a
+constant with the default hardcoded into it would be wrong by the same factor
+you raised it by.
 
 > Scope note: this path is **inactive on your SGLang server**, which reports
 > usage. It governs the fresh-window figure after `/clear`, after a rollover,
 > after a digest, and any server that withholds usage.
 
-### Finding 9 — the cached figure is on the wire and thrown away
+### 8b. The cache figure
 
-> **Status: fixed.** The original diagnosis stands below; what changed, and
-> the trap found on the way, is at the end of the section.
-
-Your server reports it. Measured, same prompt sent twice:
-
-```
-run 1:  prompt_tokens 2058,  prompt_tokens_details: null
-run 2:  prompt_tokens 2058,  prompt_tokens_details: {"cached_tokens": 2048}
-```
-
-No code in the project reads `prompt_tokens_details`, `cached_tokens`, or any
-equivalent — the fields are parsed off the response and dropped on the floor,
-in both the OpenAI-compatible and the llama.cpp paths. This is not a correctness bug
-(the window figure is right either way, see Finding 1), but it is the single
-most useful diagnostic letsClaw is currently discarding: cache hit rate tells you
-whether a config change just invalidated the server's prefix cache and quietly
-made every turn slower.
-
-Related: the server also reports its own `reasoning_tokens`, which letsClaw
-ignores in favour of counting reasoning locally with tiktoken. The local count
-is good enough and has the advantage of updating live during the stream — but
-note the server's figure was *inconsistent* under truncation in testing
-(`completion_tokens: 5` alongside `reasoning_tokens: 9`), so the local count may
-well be the more trustworthy of the two. Not a defect.
-
-#### What it reads now
+Cache hit rate is the one direct diagnostic for prefix-cache invalidation: a
+sudden drop means something rewrote the front of the prompt and every session
+quietly lost its KV cache, paying full price and full latency for input the
+server used to have in hand. Nothing else on screen shows that.
 
 `ChatResult` carries `cached_tokens` and `reasoning_tokens` off every
 transport, the session keeps a running `total_cached` beside a `cached_input`
-denominator, and `/info` prints the hit rate in all three clients.
+denominator, and `/info` prints the hit rate in all three clients. It never
+touches the window figure, which is right with or without it — section 4 has
+why a cached token still occupies the window.
 
 **Three servers, three spellings of zero** — each measured, the same prompt
 twice:
@@ -985,25 +901,22 @@ than absent, since it would have looked like it was working. `timings.cache_n`
 is the reuse, and is what the raw path reports.
 
 `reasoning_tokens` is carried too, and deliberately **beside** the local
-tiktoken count rather than in place of it. The inconsistency noted above
-reproduced immediately on the live server — a round reporting
-`completion_tokens: 5` alongside `reasoning_tokens: 10` — which is the
-argument for keeping both and against displaying the server's.
+tiktoken count rather than in place of it. The server's figure contradicts
+itself on a truncated round — measured on the live server, one reply reported
+`completion_tokens: 5` alongside `reasoning_tokens: 10`, a part larger than its
+whole. The local count is of the text that actually arrived, which is the
+honest thing to display; the server's rides the `stats` event beside it so the
+disagreement is visible rather than hidden by a choice.
 
-### Finding 10 — per-turn input cost is not measurable
+### 8c. The input odometer
 
-> **Status: fixed**, as a session total rather than a per-turn line — see
-> the end of the section for why that is the useful end of it.
+`total_output` is an odometer of everything generated, and `total_input` is its
+counterpart — the larger number by far on a tool-heavy turn (section 3),
+because a turn re-sends the whole window on every round. Without it the only
+input figure anywhere is `used`, which is the window measured once and says
+nothing about what the conversation has cost.
 
-`total_output` is an odometer of everything generated. There is no counterpart
-for input, and input is the larger number by far on a tool-heavy turn (section
-3). Each round's `prompt_tokens` is already in hand — only the last one is kept.
-Summing them into a per-turn `input_tokens` would be a small change and would
-close the gap between "how full is the window" and "what did that turn cost".
-
-#### What it reads now
-
-`total_input` is an odometer beside `total_output`, persisted with it, printed
+`total_input` sits beside `total_output`, is persisted with it, and is printed
 by `/info` in all three clients:
 
 ```
@@ -1020,9 +933,9 @@ belongs in the total. Without this the odometer would quietly become a second
 copy of `used`, which is the one thing it exists not to be.
 
 **No estimate, ever.** There is no local fallback for a round whose server
-withheld usage, and none was added: the prompt a round actually sent is not
-reconstructable on this side — the pad never reaches history and the schema
-block is the server's rendering, not ours. An unreported round therefore adds
+withheld usage: the prompt a round actually sent is not reconstructable on this
+side — the pad never reaches history and the schema block is the server's
+rendering, not ours. An unreported round therefore adds
 nothing and flips `input_exact`, and the figure prints as `≥N`. The `≥` is not
 the `~` used elsewhere on purpose: a tilde marks a guess that could land either
 side, while this is a sum with holes in it and can only be low.
@@ -1039,15 +952,16 @@ conversation is *spending* is the actionable one. It is also the number that
 makes a misfiring rollover visible — rolling a half-full window throws away
 context and the input bill is where that shows up.
 
-Both fields were added to the live payload **without bumping `LIVE_SCHEMA`**,
-which would make `load_live` discard every existing conversation. A restored
-session written before they existed starts its input count at zero and
+The odometers live in the live payload **without a `LIVE_SCHEMA` bump**, which
+would make `load_live` discard every existing conversation. A session restored
+from a file written before they existed starts its input count at zero and
 under-reports its own past, which is much the smaller harm.
 
-### Finding 11 — the honesty flags disagree with each other
+### 8d. Where the `~` convention breaks down
 
-letsClaw marks estimated figures with `~`, which is genuinely better than most
-tools do. But the convention is applied unevenly:
+letsClaw marks estimated figures with `~`, which is better than most tools do.
+The convention is applied unevenly, and these are the places it currently
+misleads:
 
 - Two flags for one concept with **opposite polarity**: the per-turn event sends
   `measured` (true = exact), `/info` sends `estimated` (true = guess).
@@ -1072,7 +986,7 @@ tools do. But the convention is applied unevenly:
 | the number | trust it? |
 |---|---|
 | `context N/262144` **without** `~` | ✅ the server measured it |
-| `context ~N/262144` **with** `~` | ✅ calibrated estimate, within ~1% (Finding 7) |
+| `context ~N/262144` **with** `~` | ✅ calibrated estimate, within ~1% (section 8a) |
 | `out N tok` without `~` | ✅ server-reported, includes reasoning |
 | `out ~N tok` | ⚠️ local estimate, ~5% low |
 | `reasoning N tok` | ✅ ~5% low, never marked but fine |
@@ -1083,10 +997,12 @@ tools do. But the convention is applied unevenly:
 | `N% ... served from the server's KV cache` | ✅ server-measured; the line is absent when no server reported one |
 | what a **single turn** cost in input | ⚠️ on the `stats` event, rendered nowhere by choice |
 
-**The short version:** the measured path — which is the one you are actually on
-— is well built, and gets several subtle things right that are easy to get
-wrong. The fallback estimate *was* miscalibrated in a way that got worse as the
-window filled; it is now within about 1% across a measured range from an empty
-window to 17,000 tokens, because the three errors it has to correct are
-corrected separately, each in the shape it actually has. No safety multiplier
-is involved, and that is the point: a safety multiplier was the bug.
+**The short version:** on a server that reports usage — which is the path you
+are actually on — the window figure is the server's own, and the subtle calls
+around it (answer excluded from completion, pad excluded from the window,
+measurement discarded whenever history is reshaped) are made correctly. On a
+server that withholds it, the estimate is within about 1% from an empty window
+to 17,000 tokens, because the three errors it has to correct are corrected
+separately, each in the shape it actually has. No safety multiplier is
+involved, and that is deliberate: a blanket multiplier cannot be right at more
+than one window size.
