@@ -348,6 +348,17 @@ class Renderer:
         if i.get("output_total") is not None:
             self.line(f"  📤 Output: {i['output_total']} tok generated in this session"
                       f"  (an odometer — /clear does not rewind it)")
+        if i.get("input_total") is not None:
+            # "≥", not the "~" used above, and the difference is the point: a
+            # tilde marks a guess that could fall either side, while this is a
+            # sum of what servers actually reported with the unreported rounds
+            # left out. It can only be low.
+            at_least = "" if i.get("input_exact", True) else "≥"
+            self.line(f"  📥 Input: {at_least}{i['input_total']} tok sent in this session"
+                      f"  (every round of every turn — the window is re-sent each time)")
+        if (hit := i.get("cache_hit_pct")) is not None:
+            self.line(f"  💾 Cache: {hit}% of that input served from the server's "
+                      f"KV cache ({i.get('cached_total', 0)} tok)")
         ro = i["rollover"]
         n = ro.get("count") or 0
         count = f" · {n} rollover{'s' if n != 1 else ''}"

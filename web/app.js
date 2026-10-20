@@ -1482,6 +1482,17 @@ function showInfo(i) {
     (i.output_total != null
       ? `📤 ${i.output_total} output tok generated in this session (an odometer — /clear does not rewind it)<br>`
       : '') +
+    // "≥" rather than the "~" above: the tilde marks a guess that could land
+    // either side, this is a sum with the unreported rounds left out and can
+    // only be low. The cache line is omitted entirely when no round ever
+    // reported a figure — 0% would be a claim about a server that was silent.
+    (i.input_total != null
+      ? `📥 ${i.input_exact === false ? '≥' : ''}${i.input_total} input tok sent in this session ` +
+        `(every round of every turn — the window is re-sent each time)<br>`
+      : '') +
+    (i.cache_hit_pct != null
+      ? `💾 ${i.cache_hit_pct}% of that served from the server's KV cache (${i.cached_total || 0} tok)<br>`
+      : '') +
     (i.rollover.percent
       ? `🔄 rollover ${esc(i.rollover.mode)} at ${i.rollover.percent}% (${i.rollover.trip} tok)${rolloverCount(i.rollover)}<br>`
       : `🔄 rollover disabled (/rollover still works)${rolloverCount(i.rollover)}<br>`) +

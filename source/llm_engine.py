@@ -277,6 +277,49 @@ class ToolMarkupFilter:
         return [c for c in calls if c]
 
 
+def _dig(obj, *names):
+    """Follow a chain of attributes or keys, giving up at the first miss.
+
+    Usage blocks arrive as pydantic models from the OpenAI SDK and as plain
+    dicts from the raw transport, and the nested detail objects are missing
+    far more often than they are present. One accessor for both shapes, so
+    the callers below read as the field names they are after.
+    """
+    for name in names:
+        if obj is None:
+            return None
+        obj = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+    return obj
+
+
+def _usage_extras(usage):
+    """(cached_tokens, reasoning_tokens) out of three disagreeing servers.
+
+    Measured, not assumed — the same request to each, twice:
+
+        SGLang      prompt_tokens_details: null on a cold prefix,
+                    {"cached_tokens": 2688} on the warm one, and
+                    reasoning_tokens hoisted to the top of usage rather
+                    than nested under completion_tokens_details
+        llama.cpp   prompt_tokens_details always present, cached_tokens 0
+                    when cold — so absent and zero really do both occur
+        Argo        neither key at all
+
+    Hence the `or` chains and the tolerance of None at every level: a missing
+    key must come back as None ("not reported"), never as 0, because 0 is a
+    claim that the cache missed and a reader would act on it.
+    """
+    if usage is None:
+        return None, None
+    cached = _dig(usage, "prompt_tokens_details", "cached_tokens")
+    # Nested is where the OpenAI schema puts it; top-level is where SGLang
+    # does. Checked in that order so a server doing both is read by the spec.
+    reasoning = _dig(usage, "completion_tokens_details", "reasoning_tokens")
+    if reasoning is None:
+        reasoning = _dig(usage, "reasoning_tokens")
+    return cached, reasoning
+
+
 @dataclass
 class ChatResult:
     """Structured chat response: text and/or tool calls."""
@@ -287,6 +330,15 @@ class ChatResult:
     # Server-reported token usage; None when the server doesn't supply it.
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    # How many of prompt_tokens the server served from its KV cache instead of
+    # re-reading. None is "this server does not report it" and is a different
+    # fact from 0, which is a reported cold prefix — the first says nothing,
+    # the second says the cache missed. See _usage_extras.
+    cached_tokens: int | None = None
+    # The reasoning share of completion_tokens, server-counted. Only the local
+    # count exists otherwise, and the local count is of the text that arrived —
+    # which is not the same thing on a round the server truncated.
+    reasoning_tokens: int | None = None
 
     @property
     def wants_tool(self) -> bool:
@@ -668,10 +720,12 @@ class LLMEngine:
                     text, inline = _split_inline_think(text)
                     if inline:
                         reasoning = f"{reasoning}{inline}" if reasoning else inline
+                cached, reason_tok = _usage_extras(usage)
                 return ChatResult(text, tool_calls, choice.finish_reason,
                                   reasoning=reasoning,
                                   prompt_tokens=getattr(usage, "prompt_tokens", None),
-                                  completion_tokens=getattr(usage, "completion_tokens", None))
+                                  completion_tokens=getattr(usage, "completion_tokens", None),
+                                  cached_tokens=cached, reasoning_tokens=reason_tok)
 
             create_kw = dict(messages=messages, stream=True, **params)
             if self._usage_opt:
@@ -748,10 +802,12 @@ class LLMEngine:
             tool_calls = [pending[i] for i in sorted(pending)]
             self.note_schema_cost(messages, params.get("tools"),
                                   getattr(usage, "prompt_tokens", None))
+            cached, reason_tok = _usage_extras(usage)
             return ChatResult("".join(text_parts), tool_calls, finish,
                               reasoning="".join(reason_parts),
                               prompt_tokens=getattr(usage, "prompt_tokens", None),
-                              completion_tokens=getattr(usage, "completion_tokens", None))
+                              completion_tokens=getattr(usage, "completion_tokens", None),
+                              cached_tokens=cached, reasoning_tokens=reason_tok)
         except RoundInterrupted:
             # A /steering stopped this round mid-stream. Not a model failure — the
             # turn re-plans with the correction — so it is not logged as one.
@@ -832,7 +888,15 @@ class LLMEngine:
                     hit_cap = (d.get("stop_type") == "limit") or d.get("stopped_limit")
                     finish = "length" if hit_cap else "stop"
                     usage = {"prompt_tokens": d.get("tokens_evaluated"),
-                             "completion_tokens": d.get("tokens_predicted")}
+                             "completion_tokens": d.get("tokens_predicted"),
+                             # timings.cache_n, and NOT the tokens_cached
+                             # sitting right beside the two above. Measured on
+                             # the same prompt twice: tokens_cached read 2706
+                             # both times — it is how full the KV cache is
+                             # *after* the request, so it never moves and a
+                             # reader would see a permanent 100% hit rate.
+                             # cache_n read 0 then 2700, which is the reuse.
+                             "cached_tokens": (d.get("timings") or {}).get("cache_n")}
                 chunk = d.get("content") or ""
                 if not chunk:
                     continue
@@ -860,7 +924,12 @@ class LLMEngine:
         return ChatResult("".join(text_parts), calls, finish,
                           reasoning="".join(reason_parts),
                           prompt_tokens=usage.get("prompt_tokens"),
-                          completion_tokens=usage.get("completion_tokens"))
+                          completion_tokens=usage.get("completion_tokens"),
+                          cached_tokens=usage.get("cached_tokens"),
+                          # /completion has no reasoning channel at all — the
+                          # thinking arrives inline and the splitter above is
+                          # what separates it — so there is nothing to report.
+                          reasoning_tokens=None)
 
     async def resume_round(self, messages: list, pad: str, closing: bool,
                            max_tokens: int | None = None,

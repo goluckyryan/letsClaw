@@ -1276,6 +1276,15 @@ def _format_info(info, where=None):
                  f"{info.get('tools_tokens')} tok of tool schemas")
     if info.get("output_total") is not None:
         lines.append(f"📤 {info['output_total']} tok generated in this session")
+    if info.get("input_total") is not None:
+        # "≥" where the context line above uses "~": that one marks a guess,
+        # this one a sum missing the rounds no server reported. Only low.
+        at_least = "" if info.get("input_exact", True) else "≥"
+        lines.append(f"📥 {at_least}{info['input_total']} tok sent in this session "
+                     f"(every round of every turn)")
+    if info.get("cache_hit_pct") is not None:
+        lines.append(f"💾 {info['cache_hit_pct']}% of that served from the "
+                     f"server's KV cache ({info.get('cached_total', 0)} tok)")
     if roll.get("percent"):
         lines.append(f"🔄 rollover {roll.get('mode')} at {roll['percent']}% "
                      f"({roll.get('trip')} tok) · {roll.get('count') or 0} so far")

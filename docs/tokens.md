@@ -480,7 +480,8 @@ conversation. A 5-tool turn pays six times over.
 
 The `⚡` line will report `context 3651/262144` for this turn. That is honest —
 it is the window *size* — but it is **2.3× smaller than what the turn actually
-cost**. letsClaw reports no per-turn input figure anywhere (Finding 10).
+cost**. The per-turn figure is on the `stats` event and rendered nowhere;
+what `/info` shows is the session total these turns add up to (Finding 10).
 
 ### ...16 more ordinary turns... → turn *n*
 
@@ -610,8 +611,9 @@ part of the prompt that varies:
 | a forced conclusion / checkpoint round | no |
 
 Rounds that skip the schemas are ~595 tokens cheaper here. None of this is
-visible in any UI figure: the `⚡` line reports the window *size* once per turn,
-not the sum of the prompts the turn actually sent (Finding 10).
+visible in the `⚡` line, which reports the window *size* once per turn rather
+than the sum of the prompts the turn actually sent. `/info`'s input odometer is
+where that sum lands, across the whole session (Finding 10).
 
 ---
 
@@ -682,8 +684,8 @@ screen more often than you would think.
 | 6 | measured/estimated honesty flags exist at all | ✅ rare and good |
 | 7 | **the flat ×1.6 estimate was miscalibrated** | ❌ **~52% over at scale** → ✅ **fixed, now under 1%** |
 | 8 | **tool schemas undercounted by 41%** | ❌ a *second* error, different shape → ✅ **fixed** |
-| 9 | **cached tokens never read** | ⚠️ available, discarded |
-| 10 | **per-turn input cost never totalled** | ⚠️ not measurable today |
+| 9 | **cached tokens never read** | ⚠️ available, discarded → ✅ **fixed** |
+| 10 | **per-turn input cost never totalled** | ⚠️ not measurable → ✅ **fixed, as a session total** |
 | 11 | honesty flags inconsistent across clients | ⚠️ cosmetic but misleading |
 
 ### Finding 7 + 8 — the estimate was wrong in both directions at once
@@ -862,6 +864,9 @@ the constant had the 8,000-char default hardcoded into it.
 
 ### Finding 9 — the cached figure is on the wire and thrown away
 
+> **Status: fixed.** The original diagnosis stands below; what changed, and
+> the trap found on the way, is at the end of the section.
+
 Your server reports it. Measured, same prompt sent twice:
 
 ```
@@ -884,13 +889,110 @@ note the server's figure was *inconsistent* under truncation in testing
 (`completion_tokens: 5` alongside `reasoning_tokens: 9`), so the local count may
 well be the more trustworthy of the two. Not a defect.
 
+#### What it reads now
+
+`ChatResult` carries `cached_tokens` and `reasoning_tokens` off every
+transport, the session keeps a running `total_cached` beside a `cached_input`
+denominator, and `/info` prints the hit rate in all three clients.
+
+**Three servers, three spellings of zero** — each measured, the same prompt
+twice:
+
+| server | cold | warm |
+|---|---|---|
+| SGLang | `prompt_tokens_details: null` | `{"cached_tokens": 2752}` of 2759 |
+| llama.cpp (`/v1`) | `{"cached_tokens": 0}` | `{"cached_tokens": 2755}` of 2759 |
+| Argo | neither key, ever | — |
+
+So *absent*, *null* and *0* all occur and they do not mean the same thing. A
+missing figure is read as `None`, never as zero, because zero is a claim that
+the cache **missed** and an operator would act on it. The rate therefore gets
+its own denominator: only rounds that came with a figure are in it, and `/info`
+omits the line entirely rather than printing `0%` about a server that said
+nothing.
+
+That leaves one ambiguity — SGLang's `null` is a cold prefix, not a silence.
+It is resolved by a latch: once an engine has reported a figure even once, a
+later `None` from it is read as zero and the round counts against the rate.
+The latch resets on `/model`, or a switch to a silent server would show every
+one of its rounds as a miss and the rate collapsing to zero — an alarm about
+nothing, raised by the very number that exists to raise it honestly.
+
+**The trap, on the raw transport.** llama.cpp's `/completion` endpoint returns
+a field called `tokens_cached`, sitting directly beside the `tokens_evaluated`
+and `tokens_predicted` that become `prompt_tokens` and `completion_tokens`.
+It is the obvious one to take and it is the wrong one. Measured:
+
+| | cold | warm |
+|---|---|---|
+| `tokens_cached` | 2706 | 2706 |
+| `timings.cache_n` | **0** | **2700** |
+
+`tokens_cached` is how full the KV cache is *after* the request — prompt plus
+prediction — so it is identical on a cold call and never moves. A reader would
+have seen a permanent 100% hit rate and the diagnostic would have been worse
+than absent, since it would have looked like it was working. `timings.cache_n`
+is the reuse, and is what the raw path reports.
+
+`reasoning_tokens` is carried too, and deliberately **beside** the local
+tiktoken count rather than in place of it. The inconsistency noted above
+reproduced immediately on the live server — a round reporting
+`completion_tokens: 5` alongside `reasoning_tokens: 10` — which is the
+argument for keeping both and against displaying the server's.
+
 ### Finding 10 — per-turn input cost is not measurable
+
+> **Status: fixed**, as a session total rather than a per-turn line — see
+> the end of the section for why that is the useful end of it.
 
 `total_output` is an odometer of everything generated. There is no counterpart
 for input, and input is the larger number by far on a tool-heavy turn (section
 3). Each round's `prompt_tokens` is already in hand — only the last one is kept.
 Summing them into a per-turn `input_tokens` would be a small change and would
 close the gap between "how full is the window" and "what did that turn cost".
+
+#### What it reads now
+
+`total_input` is an odometer beside `total_output`, persisted with it, printed
+by `/info` in all three clients:
+
+```
+📤 Output: 48,210 tok generated in this session
+📥 Input: 1,284,900 tok sent in this session
+          (every round of every turn — the window is re-sent each time)
+💾 Cache: 94.1% of that input served from the server's KV cache
+```
+
+**Every round counts, resumed ones included.** The window figure deliberately
+ignores a resumed round — its prompt carries a thinking pad that will not exist
+by the end of the turn — but that prompt was sent and it was billed, so it
+belongs in the total. Without this the odometer would quietly become a second
+copy of `used`, which is the one thing it exists not to be.
+
+**No estimate, ever.** There is no local fallback for a round whose server
+withheld usage, and none was added: the prompt a round actually sent is not
+reconstructable on this side — the pad never reaches history and the schema
+block is the server's rendering, not ours. An unreported round therefore adds
+nothing and flips `input_exact`, and the figure prints as `≥N`. The `≥` is not
+the `~` used elsewhere on purpose: a tilde marks a guess that could land either
+side, while this is a sum with holes in it and can only be low.
+
+`input_exact` latches false for the life of the session rather than being
+recomputed each turn. A later fully-measured turn cannot supply what an earlier
+round never said, so a total that was once incomplete stays labelled
+incomplete.
+
+**Why a session total and not a per-turn line.** The per-turn figure rides on
+the `stats` event and is rendered by nobody. It is a number you can do nothing
+about once the turn has run, and the `⚡` line is already dense; what a long
+conversation is *spending* is the actionable one. It is also the number that
+makes a misfiring rollover visible — rolling a half-full window throws away
+context and the input bill is where that shows up.
+
+Both fields were added to the live payload **without bumping `LIVE_SCHEMA`**,
+which would make `load_live` discard every existing conversation. A restored
+session written before they existed starts its input count at zero and
+under-reports its own past, which is much the smaller harm.
 
 ### Finding 11 — the honesty flags disagree with each other
 
@@ -927,7 +1029,9 @@ tools do. But the convention is applied unevenly:
 | `user N` / `LLM N` | ✅ ~5% low, never marked |
 | `N tok of tool schemas` | ⚠️ the **raw JSON** cost, 41% below what the server charges — the window figure uses the corrected one, this line does not |
 | `N this session` (output odometer) | ⚠️ mixed measured and estimated |
-| what the turn **cost** in input | ❌ not reported anywhere |
+| `N tok sent in this session` (input odometer) | ✅ server-measured; `≥` means some rounds withheld usage |
+| `N% ... served from the server's KV cache` | ✅ server-measured; the line is absent when no server reported one |
+| what a **single turn** cost in input | ⚠️ on the `stats` event, rendered nowhere by choice |
 
 **The short version:** the measured path — which is the one you are actually on
 — is well built, and gets several subtle things right that are easy to get

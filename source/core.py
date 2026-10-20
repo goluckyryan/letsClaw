@@ -309,6 +309,39 @@ class Session:
         # odometer, not a gauge: /clear empties the conversation but does not
         # rewind what it cost, and it carries across a restart with the session.
         self.total_output = 0
+        # And everything it has ever sent. The counterpart nobody had, and the
+        # larger number by far: `used` is the size of the window *once*, while
+        # a turn re-sends the whole of it on every round, so a three-round turn
+        # on a 10k window bills ~30k of input and the gauge still reads 10k.
+        # Cost is quadratic in the length of a conversation and until now it
+        # was reported nowhere — which also made the cost of a rollover firing
+        # too early invisible, the very thing the estimator audit was about.
+        #
+        # Measured rounds only. A round whose server withheld usage adds
+        # nothing rather than an estimate, and input_exact goes false so the
+        # figure is labelled as the floor it is.
+        self.total_input = 0
+        self.input_exact = True
+        # Of that input, what the server served from its KV cache. The one
+        # direct diagnostic for prefix-cache invalidation: a hit rate that
+        # falls off a cliff means something rewrote the prompt prefix and
+        # every session on that server is re-reading its whole history.
+        #
+        # Its own denominator, not total_input, because the two have different
+        # domains: only rounds that came with a cache figure belong in a cache
+        # hit rate. Dividing by total_input would read 0% on a server that
+        # never reports one, which is the alarming end of a number that
+        # actually means nothing.
+        self.total_cached = 0
+        self.cached_input = 0
+        # Latched on the first round that reports a figure. SGLang sends
+        # prompt_tokens_details: null on a cold prefix and a real number once
+        # warm, so a bare None is ambiguous — unreported, or reported zero? It
+        # is read as zero only after this engine has proved it reports at all,
+        # which keeps cold rounds in the denominator where they belong without
+        # inventing hits for a server that is simply silent. Reset by
+        # use_model: the next engine is a different server with its own habits.
+        self._cache_reported = False
         # How many times this session has rolled over (auto, /new, or an
         # accepted ask). Like total_output it survives /clear and a restart —
         # it counts the session's life, not the current window.
@@ -805,6 +838,15 @@ class Session:
             "warned_over": self.warned_over,
             "last_used": self._last_used,
             "total_output": self.total_output,
+            # Added without touching LIVE_SCHEMA. A bump makes load_live
+            # discard every existing conversation, and these are odometers: a
+            # restored session that predates them starts its input count at
+            # zero and under-reports its own history, which is a far smaller
+            # harm than throwing the history away to avoid it.
+            "total_input": self.total_input,
+            "input_exact": self.input_exact,
+            "total_cached": self.total_cached,
+            "cached_input": self.cached_input,
             "rollover_count": self.rollover_count,
             # The system message goes too. A rolled-over session carries a
             # === CONTINUED SESSION === block holding a model-written handoff and
@@ -842,6 +884,13 @@ class Session:
         last_used = payload.get("last_used")
         self._last_used = None if last_used is None else configlib.int_or(last_used, None)
         self.total_output = configlib.int_or(payload.get("total_output") or 0, 0)
+        self.total_input = configlib.int_or(payload.get("total_input") or 0, 0)
+        # Defaults true for a file written before the key existed, matching a
+        # fresh session. Such a file also has total_input 0, so the claim it
+        # makes is "nothing counted, nothing missed" — which is accurate.
+        self.input_exact = bool(payload.get("input_exact", True))
+        self.total_cached = configlib.int_or(payload.get("total_cached") or 0, 0)
+        self.cached_input = configlib.int_or(payload.get("cached_input") or 0, 0)
         self.rollover_count = configlib.int_or(payload.get("rollover_count") or 0, 0)
         self._persisted = True
 
@@ -1044,6 +1093,26 @@ class Session:
         # accumulated the same way, and the figure goes out marked estimated.
         rounds = out_reported = 0
         out_measured = out_estimated = 0
+        # Input accounting, and nothing like the output kind above. There is no
+        # local estimate to fall back on and no attempt at one: the prompt a
+        # round actually sent is not reconstructable here — a resumed round
+        # carries a thinking pad that never reaches history, and the schema
+        # block is the server's rendering, not ours. So this sums what was
+        # reported and says so, rather than filling the gaps with a guess.
+        #
+        # Every round counts, resumed ones included. last_prompt deliberately
+        # ignores those because they describe a window that will not exist by
+        # the end of the turn — but they were sent, and they were billed.
+        in_tok = in_reported = 0
+        cache_tok = cache_base = 0
+        # The server's own count of the reasoning share, kept beside the local
+        # tiktoken count rather than replacing it. The local one is of the text
+        # that arrived and updates live during the stream; this one is of what
+        # the server generated, which on a truncated round is more. Carried so
+        # the two can be compared at all — measured against SGLang, a round
+        # reporting completion_tokens 5 also reported reasoning_tokens 10, and
+        # a usage block that contradicts itself is worth being able to see.
+        srv_reason = None
 
         def push_reasoning_stat(now, flush=False):
             """Count whatever has arrived since the last push and send the total.
@@ -1081,8 +1150,24 @@ class Session:
             were genuinely generated.
             """
             nonlocal last_prompt, rounds, out_reported, out_measured, out_estimated
+            nonlocal in_tok, in_reported, cache_tok, cache_base, srv_reason
             nonlocal reason_tok   # re-synced below, on the round boundary
             rounds += 1
+            # Before the history_shaped gate below, deliberately: what this
+            # round cost does not depend on whether its prompt resembles the
+            # window afterwards.
+            if result.prompt_tokens is not None:
+                in_reported += 1
+                in_tok += result.prompt_tokens
+                # A round belongs in the cache rate only once this engine has
+                # shown it reports one — see _cache_reported. After that a
+                # None is a cold prefix (SGLang's spelling of zero) and the
+                # round counts against the rate rather than vanishing from it.
+                if result.cached_tokens is not None:
+                    self._cache_reported = True
+                if self._cache_reported:
+                    cache_tok += result.cached_tokens or 0
+                    cache_base += result.prompt_tokens
             if history_shaped and result.prompt_tokens is not None:
                 last_prompt = result.prompt_tokens
                 # Publish it immediately, not only at turn end. history_shaped
@@ -1097,6 +1182,10 @@ class Session:
             if result.completion_tokens is not None:
                 out_reported += 1
                 out_measured += result.completion_tokens
+            if result.reasoning_tokens is not None:
+                # Stays None until something is reported, so "no server said"
+                # and "the server said zero" remain distinguishable.
+                srv_reason = (srv_reason or 0) + result.reasoning_tokens
             if result.reasoning:
                 reasoning_parts.append(result.reasoning)
                 # Re-sync the live count on the round boundary: counting the
@@ -1440,6 +1529,16 @@ class Session:
         # rounds still records what those rounds generated. Rounds that never
         # returned never reached tally(), so they contribute nothing.
         self.total_output += out_tok
+        # Same placement, same reason — and the odometer is a floor, not an
+        # estimate: input_exact latches false the moment any round in the
+        # session's life went unreported, and never recovers. A total that was
+        # once incomplete stays labelled incomplete, because there is no later
+        # round that could fill in what the earlier one never said.
+        self.total_input += in_tok
+        if rounds > 0 and in_reported != rounds:
+            self.input_exact = False
+        self.total_cached += cache_tok
+        self.cached_input += cache_base
 
         if not had_error and full_response:
             self.history.append({"role": "assistant", "content": full_response,
@@ -1460,6 +1559,10 @@ class Session:
                          # turn, not a fresh tally of the same text: one number,
                          # so the live figure and this one cannot disagree.
                          reasoning_tokens=reason_tok,
+                         # The server's figure for the same quantity, or None
+                         # where it offers none. Beside the local count, not
+                         # instead of it: see srv_reason.
+                         reasoning_server=srv_reason,
                          tool_calls=tools_used,
                          # Everything generated this turn, across every round:
                          # the answer, the reasoning, and the tool-call arguments.
@@ -1469,6 +1572,16 @@ class Session:
                          output_tokens=out_tok,
                          output_measured=out_exact,
                          output_total=self.total_output,
+                         # Sent, not held: what the whole turn cost in input
+                         # across every round, and the session odometer behind
+                         # it. Deliberately not rendered on the ⚡ line — the
+                         # per-turn figure is a number you can do nothing
+                         # about, where the total is what a long conversation
+                         # is actually spending. /info reads the totals.
+                         input_tokens=in_tok,
+                         input_measured=rounds > 0 and in_reported == rounds,
+                         input_total=self.total_input,
+                         cached_tokens=cache_tok,
                          used=used, budget=self.budget,
                          measured=last_prompt is not None))
         elif not had_error:
@@ -2274,6 +2387,20 @@ class Session:
                 "tools_tokens": self.tools_tok,
                 # Since the session was created, surviving /clear and restarts.
                 "output_total": self.total_output,
+                # The bill, as opposed to the gauge. input_total counts every
+                # round of every turn, so on a long conversation it runs an
+                # order of magnitude above `used` — that gap is the cost of
+                # re-sending the window, and it is the number a rollover
+                # firing too early inflates.
+                "input_total": self.total_input,
+                "input_exact": self.input_exact,
+                # None, not 0, when no round has ever reported a cache figure:
+                # Argo's shim withholds it entirely, and a 0% hit rate there
+                # would be a sincere-looking claim about a server that said
+                # nothing. See Session.total_cached.
+                "cache_hit_pct": (round(100 * self.total_cached / self.cached_input, 1)
+                                  if self.cached_input else None),
+                "cached_total": self.total_cached,
                 "rollover": {"mode": self.rollover_mode, "percent": self.rollover_pct,
                              "trip": int(self.budget * self.rollover_pct / 100)
                                      if self.rollover_pct else 0,
@@ -2419,6 +2546,12 @@ class Session:
         # A different engine is a different server with different answers, so
         # the findings this session has already reported are about somebody else.
         self._server_warned = False
+        # Same reason, and it matters more than the warning does: the latch
+        # says "this server reports a cache figure, so read a missing one as
+        # zero". Carried onto a server that reports nothing, it would read
+        # every silent round as a cache miss and show a hit rate collapsing to
+        # zero — the exact alarm this number exists to raise honestly.
+        self._cache_reported = False
         # The base is shared by every session, the model file is per model,
         # and the session file is named for this session.
         (self.base_behavior, self.behavior,
