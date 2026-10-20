@@ -979,8 +979,8 @@ def main():
     if created:
         print(f"⚠️  wrote a starter config to {args.config or configlib.CONFIG_PATH}"
               " — no model is configured yet, so fill in models.local.base_url")
-        print("   (config.example.yaml is the fully commented template; "
-              "docs/config.html is the reference)")
+        print("   (config.example.yaml is the fully commented reference — "
+              "every key, its default, and what needs a restart)")
     core_cfg = config.get("core", {})
     bind = args.bind or core_cfg.get("bind", "127.0.0.1")
     # Not int_or: silently falling back to 8770 would start a core on a port

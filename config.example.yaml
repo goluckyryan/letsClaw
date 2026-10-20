@@ -113,6 +113,35 @@ models:
     # the server's default alone.
     reasoning_effort: medium
     top_p: 0.95
+    # --- Reaching a model server over ssh --------------------------------------
+    # For a server behind a jump host, unreachable directly from this machine.
+    # The core spawns and supervises the port-forward itself — no systemd unit,
+    # no shell on the core's host — and points the engine at the local end.
+    # All three are read live (/reload); the core picks its own local port.
+    #
+    # base_url is then a placeholder: the engine is retargeted to the forward,
+    # so give it the shape you would use anyway and let these three say where
+    # it really goes.
+    #   ssh_forward:       the destination as ssh takes it: user@ip, ip, or an
+    #                      alias. Not a host:port — the port is ssh_remote_port.
+    #   ssh_jump:          the jump host, carried as a ProxyCommand rather than
+    #                      -J, because -J drops command-line options on the
+    #                      inner hop and some jump servers need them (an old
+    #                      sshd offering only ssh-rsa, for one). Keeping the
+    #                      whole path here rather than in ~/.ssh/config is what
+    #                      makes the entry work on a fresh machine holding only
+    #                      the ssh keys.
+    #   ssh_remote_port:   the port on the ssh_forward destination — always that
+    #                      host's own loopback, so just the number.
+    #                      (Legacy ssh_remote: "host:port" is still read; the
+    #                      host half is ignored.)
+    # ssh_forward: "someone@10.0.0.5"
+    # ssh_jump: "jump@192.168.203.52"
+    # ssh_remote_port: 8888
+    #
+    # /models reports each forward as {target, jump, remote, local, pid}; a
+    # missing pid means the path is down. The startup banner prints the full
+    # path for each and warns if the `ssh` binary is not installed at all.
   # Example: a second model on another server (e.g. llama.cpp + GGUF)
   qwen38:
     provider_name: "path/or/id/exactlly-as-reported-by-the-server"
@@ -138,16 +167,24 @@ core:
                         # allowed_hosts). The second half is what makes the first mean
                         # anything — on its own, Origin-matches-Host is satisfied by a
                         # page whose own domain has been re-pointed at 127.0.0.1.
+  # ssh_health_sec: 30  # how often the keepalive checks the core-owned ssh
+                        # port-forwards (models.*.ssh_forward) and respawns a
+                        # dropped path on the same port. Picked up by /reload.
   # allowed_hosts: []   # extra Host header values to accept, for a reverse proxy.
                         # Loopback, the bind address, this machine's hostname and FQDN
                         # and the addresses they resolve to are accepted already, so
                         # you only need this when something in front forwards a name
                         # the core has never heard of. Picked up by /reload.
                         #
-                        # bind and port are the only settings here that need a restart:
-                        # the socket is already bound, and rebinding it would drop every
-                        # client. Everything else in this file is picked up by /reload
-                        # (or the ♻️ button) without stopping the core.
+                        # bind and port need a restart: the socket is already
+                        # bound, and rebinding it would drop every client.
+                        # Everything else under core: is picked up by /reload
+                        # (or the ♻️ button) — core.token included, which is read
+                        # per request. They are NOT the only restart keys in the
+                        # file: the three logging keys are read once when the
+                        # handlers are installed, and most of discord: is read
+                        # once when the bot builds its Settings. The full list is
+                        # the "Restart-only" row of the config table in README.
 
 # Discord client — a client like the terminal and the WebUI, in its own process
 # (./run_discord.sh). The core never imports discord.py and does not know this

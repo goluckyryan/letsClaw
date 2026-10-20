@@ -1163,7 +1163,7 @@ Three tiers:
 |---|---|
 | **Live already** | `core.token`, `core.allowed_hosts`, the `state/` paths, and the model list `GET /models` serves — these are read per request, so the reload is what updates the file, not what plumbs it through |
 | **Reload picks it up** | **every setting in every model entry** — the engines are rebuilt from scratch, so `context_length`, `base_url`, `provider_name`, the sampling parameters, and all of the reasoning settings (`reasoning`, `max_tokens`, `max_output_tokens`, `max_pad_compactions`, `turn_timeout`, `answer_time_reserve`, `resume_mode`, `reasoning_effort`) come across; added and removed models; behavior files including `base.md`; the tool allowlist and `exec_timeout`; every `conversation.*` setting; `logging.level`; and, in the bot's own process, the Discord allowlist (`discord.users`, `mention_only`, `mention_list`) — see [Discord Client](#discord-client) |
-| **Restart-only** | `core.bind` and `core.port` — the socket is already bound, and rebinding drops every client, which is the thing being avoided — and the three keys that are read once when the log handlers are installed: `logging.file`, `logging.max_bytes`, `logging.backups`. **`/restart` applies these from any client** (see below); it is no longer a trip to the core's host. On the bot's side, `discord.enabled` (`serve.sh` reads it before deciding to launch at all) and the three that say *where* the bot logs in — `discord.token`, `discord.core`, `discord.core_token`. Those four restart the *bot*, which `/restart` does not touch |
+| **Restart-only** | `core.bind` and `core.port` — the socket is already bound, and rebinding drops every client, which is the thing being avoided — and the three keys that are read once when the log handlers are installed: `logging.file`, `logging.max_bytes`, `logging.backups`. **`/restart` applies these from any client** (see below); it is no longer a trip to the core's host. On the bot's side, **everything in `discord:` except the allowlist trio above** — `enabled` (`serve.sh` reads it before deciding to launch at all), the three that say *where* the bot logs in (`token`, `core`, `core_token`), and the four it reads once when it builds its `Settings` (`idle_detach_min`, `max_messages`, `max_lines`, `auto_names`). All of them restart the *bot*, which `/restart` does not touch — the bot is a sibling process, so restart it yourself |
 
 An idle session takes the change immediately; one mid-turn takes it the moment that turn
 ends, and the reply says how many of each. **A setting a session changed for itself is
@@ -1578,10 +1578,12 @@ refuses to install one flavour while the other is present — uninstall first.
 
 ## Config
 
-See [`docs/config.html`](docs/config.html) for the full reference — every
-setting, its type, its default, and whether a change is picked up by `/reload`
-or needs a restart. `config.example.yaml` carries the same reference inline as
-comments, for people who would rather read the template.
+[`config.example.yaml`](config.example.yaml) is the reference: every key,
+inline, with its type, its default, and what a change costs. Read it beside the
+three-tier table above — the table says *which tier*, the file says *what the
+key does*. It is a template, so it is also the thing you copy to start:
+`cp config.example.yaml config.yaml`, then edit your copy (`config.yaml` is
+gitignored — it holds the API key and the bot token).
 
 **Key sections:**
 - `models` — Registry of named models. Each entry is self-contained: its own `base_url` (required), `api_key`, exact server model ID (`provider_name`), behavior file, `context_length` and sampling parameters — so two models can live on two different servers with different window sizes, and reading one entry tells you everything about that model. `default_model` picks the model a new session starts on; `/model <name>` switches one session at runtime without disturbing the others.

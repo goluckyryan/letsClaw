@@ -339,6 +339,89 @@ Two consequences, both load-bearing:
   `grep` line that reaches its own turn in the open journal segment, because a
   summary the model cannot drill into is just amnesia it does not know it has.
 
+## 19. The agent decides; asking is the last resort
+
+The point of a turn is that it finishes. A model that stops to ask *"shall I do
+A or B?"* has not paused the work — it has ended it, and the difference is
+invisible from the outside, which is why this has to be stated as a rule rather
+than assumed as good sense.
+
+**The mechanism is the reason it is a rule.** The agent loop in `Session._turn()`
+is `while True:` around one test: keep going while the model asked for a tool.
+The moment it emits text instead, the turn is over. Nothing distinguishes a
+finished answer from a question — there is no `endswith("?")` anywhere in the
+core, and there could not be a useful one, since a good answer can end with a
+question and a refusal can end with a period. So the loop cannot catch it, the
+reasoning machinery cannot catch it, and no config key can. **The only lever is
+the prompt** — which makes this the clearest case of [principle
+2](#2-behavior-is-markdown-and-some-of-that-markdown-is-machinery): the rule is
+`## How you work` in `models/base.md`, tunable with `/reload`, and if it is
+weakened there is no backstop behind it.
+
+What `base.md` therefore commits to, in this order:
+
+| rule | what it forecloses |
+|---|---|
+| Check before you answer | answering from memory when a tool would have settled it |
+| Decide, don't ask | stopping at a fork — investigate both branches with tools, pick one, say which and why the others are worse |
+| Ask only when you genuinely cannot proceed | questions as a substitute for looking. Three cases and no more: it would destroy data, it would cost money, or the fact lives only in the user's head and no tool reaches it |
+| Finish the whole task before you answer | reporting back part-way to check in |
+
+**"Say which you picked and why the others are worse" is load-bearing, not
+politeness.** A decision the reader cannot audit is indistinguishable from a
+guess, and [principle 7](#7-record-what-cannot-be-reconstructed)'s RULED OUT
+section exists for the same reason: a rejected approach that is never written
+down gets tried again by whoever comes next — in the next window, or by the
+same model one rollover later.
+
+**The honest limit.** This principle governs the model's *choices*; it does not
+govern the room available to make them. The loop stops on `_pad_headroom()
+< MIN_TOOL_ROUND_ROOM` and asks for words, and by
+[principle 20](#20-rollover-belongs-to-the-turn-not-the-round) nothing mid-turn
+can roll over. An unfinished task at that wall is cut off, and the fresh window
+starts on the *next* turn rather than resuming this one. `digest_turns` is the
+mitigation, because it is what keeps the wall from arriving mid-task at all —
+which is the practical reason it exists.
+
+## 20. Rollover belongs to the turn, not the round
+
+Nothing rolls over while a turn is in flight. `roll_over()` has exactly three
+call sites, and every one sits at a turn boundary:
+
+| call site | when | gated on |
+|---|---|---|
+| `_headroom_check()` | **before** a turn starts | `rollover_before_think`, `mode == auto`, `rollover_pct`, `rollover_blocked` |
+| `_after_turn()` | after the tool loop has fully drained | the trip point, and `rollover_mode` via `_maybe_roll()` |
+| `command()` — `/rollover` | when a person asks | **`self.busy` only** |
+
+The boundary is not a convenience, it is a correctness requirement: rolling
+over mid-loop would archive a `tool_call` whose `tool_result` had not been
+written, and an unanswered tool call is the exact shape that
+[`settled()`](../source/core.py) exists to unwind because it **400s forever
+after** ([principle 13](#13-a-crash-may-cost-the-running-turn-and-nothing-more)).
+The comment on the `_after_turn` call says it plainly: *"Rollover is evaluated
+only here: the tool loop has fully drained, so no tool_call/tool_result pair can
+be split."* Keep it that way.
+
+**"Automatic" and "manual" are not the same gate, and the difference is
+deliberate.** Automatic rollover is subject to `rollover_mode` — `auto` rolls
+and says so, `ask` prompts, `off` warns once — to the configured percentage, and
+to the `rollover_blocked` guard a failed archive sets. Manual rollover is
+subject to none of those: `roll_over()` never reads `rollover_mode`, the command
+passes its own `trip` rather than consulting the threshold, and it *clears*
+`rollover_blocked` first, because someone who just freed the disk has said so by
+typing the word. A person asking is the one event that overrides a policy
+setting, and that is the point of having both.
+
+**What "any time" means, precisely.** Manual means any time *between* turns, in
+any mode, at any window size. It does not mean during a turn: the `self.busy`
+guard refuses it, deliberately sharing that guard with `/clear` and `/new`,
+which destroy more. The route to a rollover while a turn is running is `/stop`,
+which unwinds the unfinished turn through `repair_history()` first, then
+`/rollover`. Two keystrokes rather than one, because the intermediate state is
+a conversation with no dangling tool call — which is the thing the whole
+principle protects.
+
 ---
 
 ## Where the principles are known to be strained
