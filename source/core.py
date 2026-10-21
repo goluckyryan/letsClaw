@@ -38,6 +38,7 @@ from llm_engine import ChatResult, RoundInterrupted
 from ssh_forward import SSHForwardManager
 from token_counter import (count_messages, count_text, count_tools,
                            corrected_messages, corrected_text, schema_cost)
+from version import __version__
 
 logger = logging.getLogger("letclaw.core")
 
@@ -465,6 +466,7 @@ class Session:
                   session=self.name,
                   seq=self.last_seq,
                   proto=PROTOCOL_VERSION,
+                  version=__version__,
                   model=self.model_name,
                   budget=self.budget,
                   busy=self.busy,
@@ -2412,6 +2414,9 @@ class Session:
             used = self.used_now()
             return {"ok": True, "info": {
                 "session": self.name, "session_id": self.session_id,
+                # The build that is answering, which on a long-lived core is
+                # not necessarily the one checked out in the working tree.
+                "version": __version__,
                 "model": self.model_name,
                 "base_url": (str(self.engine.client.base_url)
                              if self.engine else None),

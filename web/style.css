@@ -329,6 +329,16 @@ header button.on { background: var(--accent); border-color: var(--accent); color
 .status.off { background: rgba(247,118,142,.15); color: var(--err); }
 .status.wait{ background: rgba(224,175,104,.15); color: var(--warn); }
 
+/* Sits against the status pill and reads as an annotation on it, so: same
+   type, no pill of its own, dimmed. It is a fact about the core, not a state
+   that changes, and must not compete with the colour next to it. */
+.version {
+  font: 11px var(--mono);
+  color: var(--dim);
+  white-space: nowrap;
+  margin-left: -2px;
+}
+
 /* ---------- log ---------- */
 
 main {

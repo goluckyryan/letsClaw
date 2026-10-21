@@ -73,6 +73,9 @@
   <button id="btn-reload"    title="re-read config.yaml into the running core (/reload)">♻️ reload</button>
   <button id="btn-restart"   title="restart the core process — needed for core.bind, core.port and the logging keys (/restart)">↻ restart</button>
   <span id="status" class="status off">offline</span>
+  <!-- The core's version, not the page's: filled from the hello event, and
+       hidden until one arrives (an older core sends none). -->
+  <span id="version" class="version" hidden></span>
 </header>
 
 <main id="log" tabindex="0"></main>

@@ -1150,7 +1150,7 @@ Start `./serve.sh` once; clients come and go around it.
 
 | | |
 |---|---|
-| `GET /health` | liveness + protocol version |
+| `GET /health` | liveness, the core's version, and the protocol version |
 | `GET /models` | configured models, and the state of any ssh forwards |
 | `GET /sessions` | live sessions: model, message count, attached clients, busy |
 | `GET /sessions/<name>/history` | the tail of one conversation, newest last — `?limit=` messages (10 by default), system message omitted. Capped on purpose: a switch digest wants the last few lines, not a slow copy of everything |
@@ -1339,7 +1339,7 @@ picks the token up from the local `config.yaml` on its own).
 | `/new` | **wipe everything** — the conversation *and* every transcript and journal this session has written. No undo |
 | `/model` , `/model <name>` | list the configured models, or switch this session to one |
 | `/models` | the model list on its own |
-| `/info` | session name and id, recent history, context usage, output total |
+| `/info` | the core's version, session name and id, recent history, context usage, output total |
 | `/behavior` | print the loaded behavior file |
 | `/reasoning` | toggle live display of the model's thinking |
 | `/stop` | interrupt the turn in progress |

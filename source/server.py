@@ -35,6 +35,7 @@ import config as configlib
 import core
 import logging_setup
 import paths
+from version import __version__
 
 logger = logging.getLogger("letclaw.server")
 
@@ -274,6 +275,7 @@ async def health(request):
     # second — but a poller that catches it there would otherwise see a healthy
     # core and then a refused connection, with nothing to connect the two.
     return web.json_response({"ok": True, "proto": core.PROTOCOL_VERSION,
+                              "version": __version__,
                               "sessions": len(mgr.sessions),
                               "restarting": bool(mgr.restarting)})
 
@@ -1074,6 +1076,9 @@ def main():
     ap = argparse.ArgumentParser(description="letsClaw core service")
     ap.add_argument("--bind"); ap.add_argument("--port", type=int)
     ap.add_argument("--config")
+    # Answered before anything is loaded: "which version is this?" must not
+    # depend on config.yaml being valid, or on a port being free.
+    ap.add_argument("--version", action="version", version=f"letsClaw {__version__}")
     args = ap.parse_args()
     try:
         # ensure_config, not load_config: a fresh clone has no config.yaml at all
@@ -1118,7 +1123,8 @@ def main():
         sys.exit(1)
 
     app = build_app(config, args.config, bind)
-    print(f"🧠 letsClaw core on ws://{bind}:{port}/ws  (proto {core.PROTOCOL_VERSION})")
+    print(f"🧠 letsClaw {__version__} — core on ws://{bind}:{port}/ws "
+          f" (proto {core.PROTOCOL_VERSION})")
     if (WEB_DIR / "index.html").exists():
         print(f"   WebUI:  http://{_webui_host(bind)}:{port}/")
     print(f"   models: {', '.join(configlib.known_models(config)) or '(none)'}")

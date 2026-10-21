@@ -1267,6 +1267,8 @@ def _format_info(info, where=None):
     roll = info.get("rollover") or {}
     lines = [
         f"🤖 **{info.get('model')}** @ {info.get('base_url')}",
+        # The core's version, dropped on a core too old to report one.
+        *([f"🧠 letsClaw {info['version']}"] if info.get("version") else []),
         f"🆔 session `{info.get('session')}` (id `{info.get('session_id')}`)",
         f"💬 {info.get('messages')} messages",
     ]

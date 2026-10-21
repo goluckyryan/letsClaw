@@ -17,7 +17,7 @@ Routes registered in `build_app()`.
 
 | Method + path | Auth | Returns |
 |---|---|---|
-| `GET /health` | **no** | `{ok, proto, sessions}` — open so a monitor can check liveness without holding the secret |
+| `GET /health` | **no** | `{ok, proto, version, sessions}` — open so a monitor can check liveness without holding the secret. `version` is the core's release (`source/version.py`), `proto` the wire version below |
 | `GET /models` | yes | `{default, configured[]}` |
 | `GET /sessions` | yes | `{sessions: [...]}` — the WebUI polls this every 5 s |
 | `DELETE /sessions/{name}` | yes | 404 if no such session, 409 if a turn is running |
@@ -120,7 +120,7 @@ Every event carries `seq` and `session`, stamped by `Session.emit`
 
 | `t` | payload | |
 |---|---|---|
-| `hello` | `session, seq, proto, model, budget, busy, theme, messages, rollover{}, missed[], gap` | the snapshot; `theme` is `webui.theme` (`auto`/`dark`/`light`); `messages` excludes the system message, `gap` is true when the replay buffer could not cover `last_seq` |
+| `hello` | `session, seq, proto, version, model, budget, busy, theme, messages, rollover{}, missed[], gap` | the snapshot; `version` is the core's release, which the WebUI shows beside its status pill — a cached page cannot report the build it is talking to from a constant of its own; `theme` is `webui.theme` (`auto`/`dark`/`light`); `messages` excludes the system message, `gap` is true when the replay buffer could not cover `last_seq` |
 | `turn_start` | `turn_id, text, origin` | the core's echo of your own message |
 | `steering` | `turn_id, text` | a `/steering` interjection was taken: the round was interrupted (or the correction queued at a round boundary) and the model re-plans with it. It is a real user message, so a fresh attach sees it in `hello.messages` instead |
 | `text` | `delta` | |

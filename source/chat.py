@@ -326,7 +326,13 @@ class Renderer:
 
     def show_info(self, r):
         i = r["info"]
-        self.line(f"\n🤖 Model: {i['model']} @ {i['base_url']}")
+        self.line()
+        # The core's version, not this client's: they are the same checkout
+        # here far more often than not, but not when the core has been running
+        # since before a `git pull`. Omitted by a core too old to send it.
+        if i.get("version"):
+            self.line(f"🧠 letsClaw {i['version']}")
+        self.line(f"🤖 Model: {i['model']} @ {i['base_url']}")
         # The id, not just the name: it is what the archive filenames and
         # logs/session_ID.log are keyed on, and unlike the name it never changes.
         sid = i.get("session_id")

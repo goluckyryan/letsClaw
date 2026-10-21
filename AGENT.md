@@ -58,7 +58,7 @@ exception as "no token" and skipping `discord.py` on a fresh install.
 
 ```bash
 curl -s http://127.0.0.1:8770/health
-# -> {"ok": true, "proto": <int>, "sessions": 0}
+# -> {"ok": true, "proto": <int>, "version": "1.0.0", "sessions": 0}
 ```
 
 `/health` needs no token. The core **boots even if no model server is reachable** —
@@ -141,6 +141,7 @@ source/chat.py           the terminal client
 source/discord_client.py the Discord bot (optional)
 source/discord_probe.py  "start the bot?" — serve.sh and install.sh both ask it
 source/chunker.py        fence-aware answer chunking (shared by the clients)
+source/version.py        `__version__` — the one place the release number lives
 web/                     the WebUI (vanilla JS, no build)
 tests/                   every suite and helper, whatever it tests
 models/base.md           the base behavior file (committed)

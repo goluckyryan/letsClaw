@@ -876,6 +876,18 @@ function setStatus(cls, text) {
   el.textContent = text;
 }
 
+/* The core's version, beside the status pill. The core's and not this page's:
+   a tab left open across an upgrade is serving app.js from its own cache, so a
+   constant baked in here would report the build you are no longer running.
+   Nothing to show until a hello lands, and an older core sends none — hidden
+   in both cases rather than reading 'v undefined'. */
+function setVersion(v) {
+  const el = $('#version');
+  el.hidden = !v;
+  el.textContent = v ? `v${v}` : '';
+  el.title = v ? `letsClaw core ${v}` : '';
+}
+
 const short = (n) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
 
 function setGauge(used, budget, measured) {
@@ -1407,6 +1419,7 @@ function hello(e) {
   }
   S.model = e.model;
   S.budget = e.budget;
+  setVersion(e.version);
   // Zeroed before the replay below: attaching to a turn already in flight, we
   // never saw its earlier thinking, so counting on from a previous turn's total
   // would invent tokens. A replayed turn_start resets it again, harmlessly. The
@@ -1573,6 +1586,8 @@ function showInfo(i) {
     return `${emoji} ${esc(m.role)}: ${esc(m.content)} (${m.tokens} tok)`;
   }).join('<br>');
   slab('notice',
+    // Omitted rather than blank on a core too old to send it.
+    (i.version ? `<b>🧠 letsClaw ${esc(i.version)}</b><br>` : '') +
     `<b>🤖 ${esc(i.model)}</b> @ ${esc(i.base_url)}<br>` +
     // The id as well as the name: archives are filed under it, and it is the
     // half that survives a rename.
