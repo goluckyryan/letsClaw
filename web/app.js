@@ -24,7 +24,7 @@ const COMMANDS = {
   '/model':     'list models, or /model <name> to switch',
   '/info':      'recent history and context usage',
   '/behavior':  'print the loaded behavior files (base + model + session)',
-  '/reasoning': "toggle live display of the model's thinking",
+  '/reasoning': "cycle the model's thinking: off → folded → open (or name one)",
   '/stop':      'interrupt the turn in progress',
   '/steering':       'send a correction to the turn in progress',
   '/reload':    're-read config.yaml into the running core',
@@ -61,6 +61,21 @@ function loadSent(name) {
   return [];
 }
 
+/* How much of the model's thinking this browser shows. One setting, not two,
+   because the three states are one dimension — none of it, the headline, the
+   lot — and the 🧠 button walks them in that order. 'collapsed' and
+   'expanded' differ only in how a *new* block arrives: either way it is a
+   <details> the reader can open or shut on its own.
+
+   Builds before this wrote '1' / '0' into the same key; those still read. */
+const REASON_MODES = ['off', 'collapsed', 'expanded'];
+function loadReasonMode() {
+  const v = localStorage.getItem('letsclaw.reasoning');
+  if (REASON_MODES.includes(v)) return v;
+  return v === '1' ? 'expanded' : 'off';
+}
+const reasonShown = () => S.reason !== 'off';
+
 const SESSION0 = new URLSearchParams(location.search).get('session') || 'web';
 
 const S = {
@@ -72,7 +87,7 @@ const S = {
   budget: 0,
   tripPct: 0,
   rollovers: 0,
-  showReasoning: localStorage.getItem('letsclaw.reasoning') === '1',
+  reason: loadReasonMode(),
   theme: 'auto',
   sideW: clampW(parseInt(localStorage.getItem('letsclaw.sideW'), 10)),
   busy: false,
@@ -402,10 +417,12 @@ function stampThinking() {
              + (secs >= 0.1 ? ` in ${secs.toFixed(1)}s` : '');
   // Onto the thinking block when there is one to hang it off, so the figure sits
   // with the text it measures; on its own line when the thinking is hidden.
+  // Into that block's *summary*, since the summary is the part that survives
+  // folding — what a think cost is exactly what you want from a shut block.
   const on = S.turn && S.turn.reasonEl;
   if (on) {
     const tag = node('thought', esc(text));
-    on.appendChild(tag);
+    (on.closest('details.think')?.querySelector('summary') || on).appendChild(tag);
   } else {
     slab('thought', esc(text));
   }
@@ -584,27 +601,45 @@ function node(cls, html) {
   return el;
 }
 
-/* The left-gutter clock: the core's stamp as date over time —
-   2026-10-13 / 13:49:02, right-aligned so both lines march straight down the
-   left edge. The full local time rides in `title` on hover. Every block the
-   user can refer to — prompt, answer, thinking, tool call, tool result —
-   carries one, stamped by the core at the moment it happened, so a live turn
-   and its replay read identically. Old sessions without stamps show an
-   empty gutter instead of a guess. */
-function tsEl(iso) {
+/* The left gutter: when a block happened, and where in the session it sits.
+   Date over time — 2026-10-13 / 13:49:02 — then the turn, and the round
+   inside it: #47 for the question, #47.3 for the third round of work under
+   it. Right-aligned, so all three march straight down the left edge. The full
+   local time rides in `title` on hover, the pair spelled out under the
+   number. Every block the user can refer to — prompt, answer, thinking, tool
+   call, tool result — carries one, stamped by the core at the moment it
+   happened, so a live turn and its replay read identically.
+
+   Takes the record itself — an event live, a history message on replay —
+   because the three fields travel together; a bare ISO string still works for
+   the blocks that have only a time. Sessions written before the core stamped
+   these show whichever parts they have, and an empty gutter rather than a
+   guess when they have none. */
+function tsEl(src) {
+  const r = (src && typeof src === 'object') ? src : { at: src };
   const el = document.createElement('div');
   el.className = 'ts';
-  if (iso) {
-    el.title = iso;
-    el.textContent = iso.slice(0, 10) + '\n' + iso.slice(11, 19);
+  if (r.at) {
+    el.title = r.at;
+    el.textContent = r.at.slice(0, 10) + '\n' + r.at.slice(11, 19);
+  }
+  // Turn 0 is where a session sits before its first question, so a falsy turn
+  // is "no turn", not turn zero. Round 0 is the question itself and anything
+  // outside a round — those show the turn on its own.
+  if (r.turn) {
+    const n = document.createElement('span');
+    n.className = 'ts-turn';
+    n.textContent = `#${r.turn}${r.round ? '.' + r.round : ''}`;
+    n.title = r.round ? `turn ${r.turn}, round ${r.round}` : `turn ${r.turn}`;
+    el.appendChild(n);
   }
   return el;
 }
 
-function msg(kind, who, html, ts) {
+function msg(kind, who, html, src) {
   const el = node(`msg ${kind}`);
   el.innerHTML = `<div class="who">${esc(who)}</div><div class="body"></div>`;
-  el.insertBefore(tsEl(ts), el.firstChild);
+  el.insertBefore(tsEl(src), el.firstChild);
   if (html !== undefined) el.querySelector('.body').innerHTML = html;
   return append(el);
 }
@@ -619,9 +654,17 @@ function msg(kind, who, html, ts) {
    pins and appends this one, which is what a steering wants. */
 function pinUser(el) {
   for (const old of log.querySelectorAll('.msg.user.pin'))
-    if (old !== el) old.classList.remove('pin');
+    if (old !== el) unpin(old);
   el.classList.add('pin');
   layoutPins();
+}
+
+/* Back to an ordinary message in the flow: the clamp, the expanded state and
+   the stacking offset are all things only a pin wears. */
+function unpin(p) {
+  p.classList.remove('pin', 'long', 'open');
+  p.style.top = '';
+  p.querySelector('.body')?.removeAttribute('title');
 }
 
 function addPin(el) {
@@ -640,20 +683,58 @@ function layoutPins() {
   if (batching) return;
   let top = 0;
   for (const p of log.querySelectorAll('.msg.user.pin')) {
+    measurePin(p);                      // the clamp decides the height read below
     p.style.top = top + 'px';
     top += p.offsetHeight;
   }
 }
 if (typeof ResizeObserver !== 'undefined') new ResizeObserver(layoutPins).observe(log);
 
+/* How much of a pinned prompt stays on screen. Four lines is enough to
+   recognise what you asked without the band swallowing the answer. */
+const PIN_LINES = 4;
+
+/* Mark a pin that overflows PIN_LINES. Measured unclamped and in px rather
+   than counted in newlines, because a one-line question wraps to three in a
+   narrow pane: whether a prompt is "too long" changes with the log's box,
+   which is why this rides along with layoutPins and its ResizeObserver. */
+function measurePin(p) {
+  const body = p.querySelector('.body');
+  if (!body) return;
+  p.classList.remove('long');           // read the full height, not the clamped one
+  const cs = getComputedStyle(body);
+  const lh = parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.55;
+  const pad = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+  // clientHeight is the padding box — the same box `pad` was measured in.
+  if (body.clientHeight > lh * PIN_LINES + pad + 1) {
+    p.classList.add('long');
+    body.title = p.classList.contains('open') ? 'Click to collapse' : 'Click to expand';
+  } else {
+    p.classList.remove('open');         // it fits; nothing left to have opened
+    body.removeAttribute('title');
+  }
+}
+
+/* Click the bubble to open a clamped prompt, click again to put it back.
+   Ignored when the click ended a drag-select: highlighting the question to
+   copy it is not a request to fold it away. */
+log.addEventListener('click', (e) => {
+  const body = e.target.closest?.('.msg.user.pin.long > .body');
+  if (!body) return;
+  if (window.getSelection()?.toString()) return;
+  const open = body.parentElement.classList.toggle('open');
+  body.title = open ? 'Click to collapse' : 'Click to expand';
+  layoutPins();                         // the stack below it just moved
+});
+
 /* Two elements, not one: the outer div does the positioning that lines a slab up
    under the message bodies, the inner one is the visible box. .tool and .roll set
    their own padding, and on a single element that shorthand would wipe out the
    50px gutter offset. Callers get the inner box, so `.slab.roll button` and the
    like still match as descendants. */
-function slab(cls, html, ts) {
+function slab(cls, html, src) {
   const outer = node(`slab ${cls}`);
-  outer.appendChild(tsEl(ts));
+  outer.appendChild(tsEl(src));
   const sp = document.createElement('div');
   sp.className = 'ts-spacer';
   outer.appendChild(sp);
@@ -857,13 +938,17 @@ function applyPin(pin) {
     if (v === null || v === undefined) continue;
     root.setProperty(`--pin-${k.replace('_', '-')}`, String(v));
   }
+  // font-size re-wraps the pinned prompts: both the clamp and the stack
+  // offsets are measured in lines, and neither resizes #log, so the
+  // ResizeObserver would not catch this one.
+  layoutPins();
 }
 
 function setHint(extra) {
   const ro = (S.tripPct ? `rollover at ${S.tripPct}%` : 'rollover off')
            + rolloverCount({ count: S.rollovers });
   $('#hint').textContent =
-    `session '${S.session}' · ${S.model || '?'} · ${ro} · thinking ${S.showReasoning ? 'shown' : 'hidden'}` +
+    `session '${S.session}' · ${S.model || '?'} · ${ro} · thinking ${S.reason}` +
     (extra ? ` · ${extra}` : '');
 }
 
@@ -1015,8 +1100,8 @@ function switchSession(name) {
 
 /* ---------------------------------------------------------------- rendering */
 
-function toolSlab(name, args, ts) {
-  const el = slab('tool', null, ts);
+function toolSlab(name, args, src) {
+  const el = slab('tool', null, src);
   const d = document.createElement('details');
   d.innerHTML = `<summary>⚙️ <b>${esc(name)}</b> <span class="arg"></span></summary>`;
   d.querySelector('.arg').textContent = (args || '').slice(0, 160);
@@ -1031,6 +1116,26 @@ function toolSlab(name, args, ts) {
 
 function pretty(args) {
   try { return JSON.stringify(JSON.parse(args), null, 2); } catch { return args; }
+}
+
+/* A run of thinking, as a <details> the reader can fold. A model that thinks
+   hard writes pages before it says a word, and scrolling back through a
+   finished turn meant scrolling past all of it; folded, the block is one line
+   that still says the thinking happened and what it cost. S.reason decides
+   how a new one arrives, and the reader overrides it per block from there.
+
+   Returns the element the text streams into — not the block — because that is
+   what the turn holds on to and appends every delta to. */
+function reasonBlock(src) {
+  const body = msg('reasoning', '🧠', null, src).querySelector('.body');
+  const d = document.createElement('details');
+  d.className = 'think';
+  d.open = S.reason === 'expanded';
+  d.innerHTML = '<summary><span class="think-lead">thinking</span></summary>';
+  const text = node('think-text');
+  d.appendChild(text);
+  body.appendChild(d);
+  return text;
 }
 
 function handle(e) {
@@ -1055,7 +1160,7 @@ function handle(e) {
     // reader put it.
     if (S.weAsked) follow = true;
     S.weAsked = false;
-    pinUser(msg('user', '👤', esc(e.text), e.at));
+    pinUser(msg('user', '👤', esc(e.text), e));
     setWaiting('thinking');
     return;
 
@@ -1064,9 +1169,9 @@ function handle(e) {
     // this counter is the only feedback that the model is still working.
     think.chars += e.delta.length;
     thinkGrew();
-    if (!S.showReasoning) return;
+    if (!reasonShown()) return;
     if (!S.turn) S.turn = { textEl: null, reasonEl: null, tools: new Map() };
-    if (!S.turn.reasonEl) S.turn.reasonEl = msg('reasoning', '🧠', null, e.at).querySelector('.body');
+    if (!S.turn.reasonEl) S.turn.reasonEl = reasonBlock(e);
     appendText(S.turn.reasonEl, e.delta);
     scrollSoon();
     return;
@@ -1087,7 +1192,7 @@ function handle(e) {
     clearWaiting();
     if (!S.turn) S.turn = { textEl: null, reasonEl: null, tools: new Map() };
     else S.turn.reasonEl = null;   // any further thinking opens its own block
-    if (!S.turn.textEl) S.turn.textEl = msg('llm', '🐱', null, e.at).querySelector('.body');
+    if (!S.turn.textEl) S.turn.textEl = msg('llm', '🐱', null, e).querySelector('.body');
     stream(S.turn.textEl, e.delta);
     return;
 
@@ -1095,7 +1200,7 @@ function handle(e) {
     stampThinking();
     clearWaiting();
     if (S.turn) { flushStream(S.turn.textEl); S.turn.textEl = null; S.turn.reasonEl = null; }
-    const el = toolSlab(e.name, e.arguments, e.at);
+    const el = toolSlab(e.name, e.arguments, e);
     if (S.turn) S.turn.tools.set(e.id, el);
     setWaiting(e.name);
     return;
@@ -1112,7 +1217,7 @@ function handle(e) {
     } else {
       // Attached mid-turn: we never saw the tool_call this answers.
       slab('tool', `⚙️ <b>${esc(e.name)}</b> <span class="done">↳ ${num(e.size)} chars`
-        + (e.at ? ` · ${esc(e.at.slice(11, 19))}` : '') + `</span>`, null, e.at);
+        + (e.at ? ` · ${esc(e.at.slice(11, 19))}` : '') + `</span>`, e);
     }
     setWaiting('thinking');
     return;
@@ -1125,7 +1230,7 @@ function handle(e) {
     stampThinking();
     clearWaiting();
     if (S.turn) { flushStream(S.turn.textEl); S.turn.textEl = null; S.turn.reasonEl = null; }
-    const st = msg('user', '📌', esc(e.text), e.at);
+    const st = msg('user', '📌', esc(e.text), e);
     st.classList.add('steering');
     addPin(st);
     setWaiting('thinking');
@@ -1348,19 +1453,19 @@ function replayInto(messages) {
   const pending = new Map();
   for (const m of messages) {
     if (m.role === 'user') {
-      pinUser(msg('user', '👤', esc(m.content || ''), m.at));
+      pinUser(msg('user', '👤', esc(m.content || ''), m));
     // 'assistant' here is the wire role the server stores, not a display name:
     // the chat template switches on that exact string. The bubble is .msg.llm.
     } else if (m.role === 'assistant' && m.tool_calls) {
       // .trim(): a model heading straight for a tool usually still emits "\n\n",
       // which is truthy and would replay as an avatar beside an empty bubble.
-      if ((m.content || '').trim()) msg('llm', '🐱', renderMd(m.content), m.at);
+      if ((m.content || '').trim()) msg('llm', '🐱', renderMd(m.content), m);
       for (const tc of m.tool_calls) {
-        pending.set(tc.id, toolSlab(tc.function.name, tc.function.arguments, m.at));
+        pending.set(tc.id, toolSlab(tc.function.name, tc.function.arguments, m));
       }
     } else if (m.role === 'assistant') {
       if (!(m.content || '').trim()) continue;
-      msg('llm', '🐱', renderMd(m.content), m.at);
+      msg('llm', '🐱', renderMd(m.content), m);
     } else if (m.role === 'tool') {
       const el = pending.get(m.tool_call_id);
       if (!el) continue;
@@ -1601,7 +1706,12 @@ function submit() {
       return slab('notice', Object.entries(COMMANDS)
         .map(([c, d]) => `<b>${c}</b> — ${esc(d)}`).join('<br>'));
     }
-    if (word === '/reasoning') return toggleReasoning();
+    if (word === '/reasoning') {
+      const want = args.trim().toLowerCase();
+      if (want && !REASON_MODES.includes(want))
+        return notice(`/reasoning takes ${REASON_MODES.join(', ')} — or nothing, to cycle`, 'warn');
+      return cycleReasoning(want || undefined);
+    }
     if (word === '/stop')      { send({ t: 'stop' }); return; }
     if (word === '/steering') {
       if (!args) {
@@ -1631,19 +1741,44 @@ function submit() {
   autosize();
 }
 
-function toggleReasoning() {
-  S.showReasoning = !S.showReasoning;
-  localStorage.setItem('letsclaw.reasoning', S.showReasoning ? '1' : '0');
-  $('#btn-reasoning').classList.toggle('on', S.showReasoning);
-  notice(`🧠 reasoning display ${S.showReasoning ? 'ON' : 'OFF'}`);
+const REASON_SAID = {
+  off: 'hidden',
+  collapsed: 'shown, new blocks folded',
+  expanded: 'shown, new blocks open',
+};
+
+/* The 🧠 button and a bare /reasoning walk the three states in that order;
+   /reasoning <mode> jumps straight to one. Blocks already on screen follow
+   the new setting: switching to expanded to read the think that just went
+   past, and finding it still shut, would be the wrong answer. A block the
+   reader opened by hand is overridden too — this is the same deliberate act,
+   one level up. */
+function cycleReasoning(mode) {
+  const i = REASON_MODES.indexOf(S.reason);
+  S.reason = mode || REASON_MODES[(i + 1) % REASON_MODES.length];
+  localStorage.setItem('letsclaw.reasoning', S.reason);
+  showReasonMode();
+  for (const d of log.querySelectorAll('details.think')) d.open = S.reason === 'expanded';
+  notice(`🧠 thinking ${REASON_SAID[S.reason]}`);
   setHint();
+}
+
+/* The button carries its state in the label as well as the colour, because
+   two of the three states are lit: ▸ folded, ▾ open, bare when it is off. */
+function showReasonMode() {
+  const b = $('#btn-reasoning');
+  b.classList.toggle('on', reasonShown());
+  b.textContent = '🧠 think'
+    + (S.reason === 'collapsed' ? ' ▸' : S.reason === 'expanded' ? ' ▾' : '');
+  b.title = `the model's thinking: ${REASON_SAID[S.reason]}`
+          + ` — click to cycle (/reasoning off|collapsed|expanded)`;
 }
 
 /* ------------------------------------------------------------------- wiring */
 
 $('#send').onclick = submit;
 $('#stop').onclick = () => send({ t: 'stop' });
-$('#btn-reasoning').onclick = toggleReasoning;
+$('#btn-reasoning').onclick = () => cycleReasoning();
 $('#btn-info').onclick = () => rpc('info').catch(() => {});
 $('#btn-behavior').onclick = () => rpc('behavior').catch(() => {});
 
@@ -2140,6 +2275,198 @@ if ($('#side-settings')) {
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && settingsOpen) closeSettings(); });
 }
 
+/* ------------------------------------------------------------------- media
+
+   Everything in webui.files_dir, which is where the agent's show_image tool
+   puts pictures. The log only holds what was shown and not yet trimmed; this
+   is the directory itself, so a plot from a cleared conversation is still here.
+
+   Built on the settings overlay's parts deliberately — same box, same head,
+   same close. The only new idea is the grid. */
+
+let mediaOpen = false;
+let mediaData = null;     // the last listing, whole, so the filter can re-render
+                          // without a round trip and without losing `truncated`
+
+/* Failures go here and not to notice(): notice() appends into #log, which is
+   behind this overlay, so the user would learn nothing until they closed the
+   panel they were trying to use. */
+function medNotice(text, cls) {
+  const body = $('#med-body');
+  body.insertBefore(cfgEl('div', `med-note${cls ? ` ${cls}` : ''}`, text), body.firstChild);
+}
+
+/* Which pictures this conversation has shown, read off the log when the panel
+   opens. A scan rather than a Set kept as messages arrive: five sites do
+   log.innerHTML = '' and a Set would need clearing at every one, which is five
+   chances to forget. A scan cannot drift.
+
+   The src *attribute*, not the .src property — the property resolves to an
+   absolute URL and the prefix strip stops matching.
+
+   Two things it deliberately misses: images trimmed away by LOG_MAX, and the
+   detached nodes adoptImages() parks in its _imgs map. Neither is on screen,
+   which is exactly what this filter claims to list. */
+function sessionImageNames() {
+  const out = new Set();
+  for (const img of log.querySelectorAll('img.md-img')) {
+    const src = img.getAttribute('src') || '';
+    if (!src.startsWith('/files/')) continue;
+    try { out.add(decodeURIComponent(src.split('?')[0].slice('/files/'.length))); }
+    catch { /* a src we did not build; not ours to claim */ }
+  }
+  return out;
+}
+
+const medSize = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB`
+                      : n >= 1024 ? `${Math.round(n / 1024)} KB` : `${n} B`);
+
+// Same URL imgTag() builds, for the same reason: an <img> cannot send a header.
+const medSrc = (name) => `/files/${encodeURIComponent(name)}`
+                       + (S.token ? `?token=${encodeURIComponent(S.token)}` : '');
+
+function renderMedia(data) {
+  mediaData = data;
+  const all = data.files || [];
+  const canDelete = data.can_delete !== false;
+  $('#med-path').textContent = data.dir || '';
+  const body = $('#med-body');
+  body.innerHTML = '';
+
+  const filtering = $('#med-session').checked;
+  // Scanned once, not inside the filter: with the listing at its 500 cap that
+  // would be 500 passes over the log.
+  const onScreen = filtering ? sessionImageNames() : null;
+  const shown = filtering ? all.filter((f) => onScreen.has(f.name)) : all;
+
+  // Three empty states, because they are three different problems: nothing has
+  // ever been put here, nothing from *this* conversation, or the directory is
+  // gone. One "no media" for all three sends you looking in the wrong place.
+  if (!shown.length) {
+    body.append(cfgEl('div', 'med-empty', filtering && all.length
+      ? 'Nothing from this conversation. Untick “this session” to see the rest.'
+      : 'Nothing here yet. Ask for a plot — the agent puts pictures here with show_image.'));
+    return;
+  }
+
+  const grid = cfgEl('div');
+  grid.className = 'med-grid';
+  for (const f of shown) {
+    const tile = cfgEl('div');
+    tile.className = 'med-tile';
+    tile.dataset.name = f.name;
+
+    // Full images scaled by CSS: there is no thumbnailer and Pillow is not a
+    // dependency this core can assume. loading=lazy and the aspect-ratio in
+    // the stylesheet are what keep that affordable; the server's cap is the
+    // backstop when they are not.
+    const img = cfgEl('img');
+    img.className = 'med-thumb';
+    img.src = medSrc(f.name);
+    img.alt = f.name;
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    img.title = `${f.name} — click to view full size`;
+    img.onclick = () => showLightbox(img.src, f.name);
+
+    const cap = cfgEl('div');
+    cap.className = 'med-cap';
+    cap.textContent = f.name;
+    cap.title = f.name;
+
+    const foot = cfgEl('div');
+    foot.className = 'med-foot';
+    const meta = cfgEl('span');
+    meta.className = 'med-meta';
+    meta.textContent = `${medSize(f.size)} · ${new Date(f.mtime * 1000).toLocaleString()}`;
+    foot.append(meta);
+    if (canDelete) {
+      const del = cfgEl('button');
+      del.className = 'med-del';
+      del.textContent = '🗑';
+      del.title = `delete ${f.name}`;
+      del.onclick = () => deleteMedia(f);
+      foot.append(del);
+    }
+
+    tile.append(img, cap, foot);
+    grid.append(tile);
+  }
+  body.append(grid);
+
+  if (data.truncated) {
+    const el = cfgEl('div', 'med-note',
+      `Showing the ${all.length} newest of ${data.total} files in this directory.`);
+    body.insertBefore(el, grid);
+  }
+}
+
+async function fetchMedia() {
+  const r = await fetch('/files', { headers: authHeaders() });
+  if (r.status === 401) { location.reload(); return null; }
+  if (!r.ok) throw new Error(`/files → ${r.status}`);
+  return r.json();
+}
+
+async function mediaRefresh() {
+  try {
+    const d = await fetchMedia();
+    if (d) renderMedia(d);
+  } catch (e) {
+    $('#med-body').innerHTML = '';
+    medNotice(`could not list the media directory: ${e.message}`, 'err');
+  }
+}
+
+// Native confirm(), like deleteSession() — the project's idiom for "this cannot
+// be undone", and a hand-rolled inline one here would be a second idiom for the
+// same question.
+async function deleteMedia(f) {
+  if (!confirm(`Delete ${f.name}?\n\n${medSize(f.size)}, from `
+             + `${new Date(f.mtime * 1000).toLocaleString()}.`
+             + '\n\nIt is removed from the directory on disk. This cannot be undone.'
+             + '\nAny message already showing it will show a broken image.')) return;
+  try {
+    const r = await fetch(`/files/${encodeURIComponent(f.name)}`,
+                          { method: 'DELETE', headers: authHeaders() });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { medNotice(`could not delete ${f.name}: ${d.error || r.status}`, 'err'); return; }
+  } catch {
+    medNotice(`could not delete ${f.name}: the core is unreachable`, 'err');
+    return;
+  }
+  // Re-fetch rather than splice the tile out: the directory is shared by every
+  // session, so what is left is a question only the server can answer.
+  await mediaRefresh();
+}
+
+if ($('#side-media')) {
+  $('#side-media').onclick = async () => {
+    mediaOpen = true;
+    $('#media').hidden = false;
+    $('#med-body').innerHTML = '<div class="med-note">loading…</div>';
+    await mediaRefresh();
+  };
+  // Emptying #med-body is not housekeeping: every src in it carries the token,
+  // for the reason showLightbox gives about itself. It also drops a grid of
+  // decoded bitmaps the page has no further use for.
+  const closeMedia = () => {
+    mediaOpen = false;
+    $('#media').hidden = true;
+    $('#med-body').innerHTML = '';
+  };
+  $('#med-close').onclick = closeMedia;
+  $('#media').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeMedia(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && mediaOpen) closeMedia(); });
+  // Per browser, not per session: it is a way of looking at the panel.
+  const box = $('#med-session');
+  box.checked = localStorage.getItem('letsclaw.mediaSession') === '1';
+  box.onchange = () => {
+    localStorage.setItem('letsclaw.mediaSession', box.checked ? '1' : '0');
+    if (mediaData) renderMedia(mediaData);
+  };
+}
+
 /* Poll, because the list shows *other* sessions and our socket only ever hears
    about this one. Cheap (a small JSON read against a local core), and paused
    while the tab is hidden so a backgrounded window costs nothing. */
@@ -2202,7 +2529,7 @@ function showModel(name) {
 }
 
 async function boot() {
-  $('#btn-reasoning').classList.toggle('on', S.showReasoning);
+  showReasonMode();
   $('#side').hidden = localStorage.getItem('letsclaw.side') === '0';
   $('#side').style.width = S.sideW + 'px';
   document.title = `${S.session} · letsClaw`;

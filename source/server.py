@@ -8,6 +8,7 @@ Start this first; the terminal, a WebUI and a Discord bot are all just clients:
 
 HTTP:  GET /health  GET /models  GET /sessions  DELETE /sessions/<name>
        GET /sessions/<name>/history  POST /sessions/<name>/rename
+       GET /files  GET /files/<name>  DELETE /files/<name>
 WS:    /ws?session=<name>&last_seq=<n>
 
 The reader never runs a turn inline — turns are tasks, so the socket stays
@@ -40,17 +41,16 @@ logger = logging.getLogger("letclaw.server")
 # The browser assets stay at the repo root, beside the code rather than inside it.
 WEB_DIR = paths.REPO_ROOT / "web"
 
-# Where the agent puts pictures it wants shown. Not under web/: that directory is
-# the app's own source, served unauthenticated to anyone who loads the page, and
-# generated output does not belong in it. state/ is already gitignored.
-DEFAULT_FILES_DIR = "state/files"
-# Served by extension, so a mistyped path cannot turn this into a general
-# arbitrary-file-read route for anyone holding the token.
-IMAGE_TYPES = {
-    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-    ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
-    ".bmp": "image/bmp", ".ico": "image/x-icon", ".avif": "image/avif",
-}
+# Re-exported rather than defined here: the show_image tool needs the same
+# extension map and the same root, and tools.py cannot import this module
+# (server -> core -> tools). See paths.py for the reasoning.
+from paths import DEFAULT_FILES_DIR, IMAGE_TYPES, files_root  # noqa: E402,F401
+
+# Newest first and capped, for the same reason /sessions/<name>/history is
+# capped: the Media panel wants the plot the agent just wrote, not a slow JSON
+# of a directory somebody pointed at their photo library. The browser builds one
+# full-size <img> per entry, so this is a real backstop and not a formality.
+MEDIA_LIST_MAX = 500
 
 
 def _configure_logging(config):
@@ -461,10 +461,125 @@ async def theme(request):
     return _theme_css(request.app["config"])
 
 
-def files_root(config):
-    """The directory /files serves, as an absolute path."""
-    configured = (config.get("webui", {}) or {}).get("files_dir") or DEFAULT_FILES_DIR
-    return paths.resolve(configured).resolve()
+def _files_target(request, name):
+    """The one file `name` may mean under files_root, or 404.
+
+    Both guards in one place, because three routes now ask the same question and
+    they must not be able to disagree: a listing that shows a file the read route
+    would refuse is a tile that is broken forever, and a delete that resolves a
+    path the read route would not is a hole. Returns (path, content type).
+    """
+    root = files_root(request.app["config"])
+    try:
+        target = (root / name).resolve()
+    except (OSError, ValueError):
+        raise web.HTTPNotFound()
+    # is_relative_to: the resolved path must still be inside the root. This
+    # defeats both ../ and a symlink pointing out of it.
+    if not target.is_relative_to(root) or not target.is_file():
+        raise web.HTTPNotFound()
+    ctype = IMAGE_TYPES.get(target.suffix.lower())
+    if not ctype:
+        raise web.HTTPNotFound()
+    return target, ctype
+
+
+def files_delete_allowed(config):
+    """Whether the WebUI may unlink from files_dir. Default: yes.
+
+    Off by default would protect nothing — the same core.token already reaches
+    an unconfined `exec` and `write_file`, so anyone who can press the button
+    can already remove the directory. The key exists for the other case: a
+    files_dir pointed at a photo library or a shared mount, where the pictures
+    are not disposable and a stray click is not recoverable.
+    """
+    return bool((config.get("webui", {}) or {}).get("files_delete", True))
+
+
+def _scan_files(root):
+    """Blocking: one scandir plus a stat per entry. Called via to_thread."""
+    out = []
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        # No directory yet is an empty gallery, not an error. The agent creates
+        # it the first time show_image runs.
+        return out
+    for e in entries:
+        ctype = IMAGE_TYPES.get(Path(e.name).suffix.lower())
+        if not ctype:
+            continue
+        try:
+            # resolve(), not e.is_file(): scandir follows a symlink happily, and
+            # a link in the root pointing at /etc/ssl/cert.png has to vanish
+            # from the listing exactly as /files/<name> refuses to serve it.
+            if not Path(e.path).resolve().is_relative_to(root):
+                continue
+            st = e.stat()
+        except OSError:
+            continue
+        if not os.path.isfile(e.path):
+            continue
+        out.append({"name": e.name, "size": st.st_size,
+                    "mtime": int(st.st_mtime), "type": ctype})
+    out.sort(key=lambda f: (-f["mtime"], f["name"]))
+    return out
+
+
+async def files_list(request):
+    """What is in webui.files_dir, for the WebUI's Media panel.
+
+    Read-only, so _authorised alone — the same gate /sessions and /config take,
+    and for the same reason: no CORS headers go out, so a hostile page can fire
+    this GET and cannot read what comes back (see _guard).
+
+    Flat, deliberately. /files/<name> will serve state/files/sub/deep.png,
+    because confinement is all that route needs, but the renderer's IMG_OK
+    accepts no slashes — so no answer can ever reference a nested file. Listing
+    them would fill the panel with tiles the conversation cannot produce, and
+    would let a directory the agent created decide the size of this response.
+
+    Off the event loop: a cold directory of a few hundred entries is a stat per
+    file, and the core is shared.
+    """
+    if not _authorised(request):
+        raise web.HTTPUnauthorized()
+    root = files_root(request.app["config"])
+    found = await asyncio.to_thread(_scan_files, root)
+    return web.json_response({
+        "ok": True,
+        "dir": str(root),
+        "total": len(found),
+        "truncated": len(found) > MEDIA_LIST_MAX,
+        "can_delete": files_delete_allowed(request.app["config"]),
+        "files": found[:MEDIA_LIST_MAX],
+    }, headers={"Cache-Control": "no-cache"})
+
+
+async def files_delete(request):
+    """Remove one image from webui.files_dir.
+
+    _guard, not _authorised: this is a write, so it takes both checks the way
+    delete_session and config_save do. The token may still arrive by query —
+    _authorised accepts either — but the gate that matters for a browser is
+    _same_origin, and a fetch() can send the header, which is why the WebUI
+    does. The query form exists for <img>, which cannot; nothing else needs it.
+    """
+    _guard(request)
+    if not files_delete_allowed(request.app["config"]):
+        # 403, not 404: the file is there and the operator turned the feature
+        # off. A 404 would send the WebUI looking for a bug that is a setting.
+        raise web.HTTPForbidden(reason="webui.files_delete is off")
+    target, _ = _files_target(request, request.match_info["name"])
+    try:
+        await asyncio.to_thread(target.unlink)
+    except OSError as e:
+        # A read-only mount or a permission problem has to say so: silence here
+        # is a tile that refuses to disappear and no reason why.
+        logger.warning("could not delete %s: %s", target, e)
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+    logger.info("deleted %s at the WebUI's request", target)
+    return web.json_response({"ok": True, "name": target.name})
 
 
 async def files(request):
@@ -479,21 +594,12 @@ async def files(request):
     model output into a filesystem read: the name is resolved and then required
     to sit under the root, which defeats both ../ and a symlink pointing out of
     it, and the extension must be an image. A model that writes a path into its
-    own answer cannot make either of those pass for /etc/shadow.
+    own answer cannot make either of those pass for /etc/shadow. Both live in
+    _files_target now, so the listing and the delete cannot drift from this.
     """
     if not _authorised(request):
         raise web.HTTPUnauthorized()
-    root = files_root(request.app["config"])
-    try:
-        target = (root / request.match_info["name"]).resolve()
-    except (OSError, ValueError):
-        raise web.HTTPNotFound()
-    # is_relative_to: the resolved path must still be inside the root.
-    if not target.is_relative_to(root) or not target.is_file():
-        raise web.HTTPNotFound()
-    ctype = IMAGE_TYPES.get(target.suffix.lower())
-    if not ctype:
-        raise web.HTTPNotFound()
+    target, ctype = _files_target(request, request.match_info["name"])
     return web.FileResponse(target, headers={
         "Content-Type": ctype,
         # An SVG opened in its own tab is a document and could carry script; in
@@ -915,7 +1021,13 @@ def build_app(config, config_path=None, bind=None):
         web.get("/config", config_get),
         web.post("/config", config_save),
         web.get("/theme.css", theme),
+        # Adjacent on purpose: registered apart, aiohttp builds a second
+        # resource for the same pattern rather than adding the method to the
+        # first. It resolves either way, but one resource is what a reader of
+        # this list assumes. /files is a PlainResource and cannot collide.
+        web.get("/files", files_list),
         web.get("/files/{name:.*}", files),
+        web.delete("/files/{name:.*}", files_delete),
         web.get("/ws", ws_handler),
     ])
     if (WEB_DIR / "index.html").exists():

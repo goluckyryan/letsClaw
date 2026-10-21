@@ -4,6 +4,52 @@ A stripped-down agent: a long-lived **core service** holding the conversations, 
 thin clients — a terminal REPL, a browser UI and a Discord bot — that attach to it
 over a WebSocket. Behavior is plain MD files — everything visible, nothing hidden.
 
+## Contents
+
+<!-- Generated list, and pinned: tests/test_doc_pointers.py fails if a
+     heading is added, renamed or removed without its line here. -->
+
+- [Philosophy / features](#philosophy--features)
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+  - [Repo layout](#repo-layout)
+- [Terminology](#terminology)
+  - [Session, turn, round](#session-turn-round)
+  - [The kinds of round](#the-kinds-of-round)
+  - [The paper](#the-paper)
+  - [Limits](#limits)
+  - [Wiring](#wiring)
+- [Behavior Files](#behavior-files)
+  - [What the base file commits the model to](#what-the-base-file-commits-the-model-to)
+- [Agent Tools](#agent-tools)
+- [Context Rollover](#context-rollover)
+  - [Collapsing a finished turn (`digest_turns`)](#collapsing-a-finished-turn-digest_turns)
+  - [The journal](#the-journal)
+- [Reasoning: the Notepad and the Answer Sheet](#reasoning-the-notepad-and-the-answer-sheet)
+  - [The picture](#the-picture)
+  - [How the notepad works](#how-the-notepad-works)
+  - [How the answer sheet works](#how-the-answer-sheet-works)
+  - [Thinking room and answer room](#thinking-room-and-answer-room)
+  - [Can it use tools while thinking?](#can-it-use-tools-while-thinking)
+  - [When does the thinking stop?](#when-does-the-thinking-stop)
+  - [Making the notepad effectively unlimited](#making-the-notepad-effectively-unlimited)
+  - [What the notepad costs afterwards](#what-the-notepad-costs-afterwards)
+  - [The settings](#the-settings)
+  - [Which servers can do this](#which-servers-can-do-this)
+- [Token Counting](#token-counting)
+- [The Core](#the-core)
+  - [Reloading config](#reloading-config)
+  - [`/restart` — for the keys reload cannot reach](#restart--for-the-keys-reload-cannot-reach)
+- [Terminal Client](#terminal-client)
+- [WebUI](#webui)
+- [Discord Client](#discord-client)
+- [Installing as a service](#installing-as-a-service)
+- [Future Features](#future-features)
+- [Config](#config)
+
+The developer half — module map, the WebSocket reference, the design
+principles — is in [`docs/`](docs/README.md).
+
 ## Philosophy / features
 
 **The principles**
@@ -333,9 +379,44 @@ and two directives in it are lifted out by the core and used as machinery.
 |---|---|
 | **How you work** | check with a tool rather than answer from memory; **decide rather than ask**; finish the whole task before answering |
 | **Tools** | how to read a large file — `grep -n` then `sed -n`, because `read_file` has no offset and truncates |
-| **Earlier windows** | search the previous window's [journal](#the-journal) before re-investigating anything |
-| `## Checkpoint` | the text sent when a full notepad is about to be compacted — extracted by `extract_checkpoint_directive` |
-| `## Forced conclusion` | the text sent when a server cannot resume a cut-off thought — extracted by `extract_conclude_directive` |
+| **The record on disk** | search the previous window's [journal](#the-journal), and the `grep` line a turn digest ends with, before re-investigating anything |
+| **Directives → `## Checkpoint`** | the text sent when a full notepad is about to be compacted — extracted by `extract_checkpoint_directive` |
+| **Directives → `## Forced conclusion`** | the text sent when a server cannot resume a cut-off thought — extracted by `extract_conclude_directive` |
+
+#### The two directives
+
+The last section of `base.md`, `# Directives`, is machinery rather than
+behavior, and it is the one part of the file the core treats specially.
+`behavior.py` matches each `## ` heading under it literally, lifts out the
+paragraph beneath (HTML comments dropped — they are notes to whoever edits the
+file, not words for the model), and sends it as a **`user` message at the one
+moment it applies**: the checkpoint when a notepad has filled the context and
+is about to be condensed, the forced conclusion when a cut-off round cannot be
+resumed. They live in Markdown rather than in source so the wording is yours to
+tune with `/reload`, no code change and no restart. Delete a heading and the
+core falls back, silently, to a short built-in sentence in `behavior.py`.
+
+**The group never reaches the system prompt.** `strip_directive_sections()`
+cuts everything from `# Directives` to the next `# ` heading out of the base
+layer before the prompt is assembled — every model, every turn. The prompt
+should carry behavior and nothing else, and a standing copy of a directive is
+worse than redundant: a model that reads its whole prompt as instruction will
+simply obey it. Claude Opus 5 over Argo, told on every turn that "this is not
+the final answer", answers nothing at all. Stripping used to be opt-in per
+model (`strip_directives: true`); that key is gone, because no model benefited
+from the copy and the ones that merely ignored it were still paying for it in
+tokens. An old `config.yaml` carrying the key still loads — unknown model keys
+are ignored.
+
+Stripping and extraction read the file independently, which is what lets both
+be true at once: `extract_*_directive()` works on the base **as written**, so
+the directives still arrive at the moment they are meant to.
+
+Two constraints if you edit the file. The `## ` headings are matched on the
+literal string, so the level and the spelling are both load-bearing. And a
+bare `## Checkpoint` or `## Forced conclusion` with no `# Directives` group
+around it — the layout the file used before the group existed — is still
+stripped, but only as far as the next heading of either level.
 
 The **decide rather than ask** rule is the one to know about. Faced with a fork —
 two designs, two libraries, two readings of your request — the model is told to
@@ -366,7 +447,8 @@ graph TD
     M -.->|rounds exhausted — one more call with no tool schemas| A
 ```
 
-Built-in tools: `exec` (shell), `read_file`, `write_file`, `list_dir`.
+Built-in tools: `exec` (shell), `read_file`, `write_file`, `list_dir`,
+`show_image`.
 Add a tool: define a `Tool(name, description, json_schema, async_handler)`
 entry in `tools.py` and list its name in `tools.allow`.
 
@@ -594,8 +676,8 @@ sed -n '820,900p'        state/sessions/a3f91c2e_letsClaw_*.md  # read one block
 ```
 
 That is exactly what the carryover block in the new window's system prompt tells
-the model to do, and what the `## Earlier windows` rule in `base.md` tells it to
-do *before* starting any investigation the handoff does not already answer.
+the model to do, and what the `## The record on disk` rule in `base.md` tells it
+to do *before* starting any investigation the handoff does not already answer.
 
 The segment is stamped at its **first write**, not at construction, so a session
 nobody speaks in leaves nothing behind; a rollover closes it and the next turn
@@ -1078,7 +1160,9 @@ Start `./serve.sh` once; clients come and go around it.
 | `GET /config` | the live config for the Settings panel, with `core.token`, `discord.token` and every `models.<name>.api_key` replaced by a placeholder — redacted rather than dropped, so the panel can still tell "set" from "unset" |
 | `POST /config` | save `{"webui": {…}}` back into `config.yaml` and apply it. Only that section is accepted: it is the one a browser has any business editing, and the only one whose change needs no restart |
 | `GET /theme.css` | the `webui.pin` styling as CSS custom properties, generated from the config so `/reload` re-themes without a restart |
+| `GET /files` | what is in `webui.files_dir`, for the WebUI's Media panel: `{name, size, mtime, type}` per entry, newest first, capped at 500 with `total` and `truncated` beside them. Top level only — the read route below will serve `sub/deep.png`, but the renderer refuses any `src` with a slash in it, so a nested file is one no answer could ever display |
 | `GET /files/<name>` | an image the agent wrote into `webui.files_dir`, for the WebUI to show inline — see [WebUI](#webui) |
+| `DELETE /files/<name>` | remove one picture from `webui.files_dir`. Token **and** same-origin, like the other writes; `403` when `webui.files_delete` is off |
 | `WS /ws?session=<name>` | the live stream |
 | `GET /` , `GET /static/*` | the WebUI, from `web/` |
 
@@ -1100,9 +1184,10 @@ When `core.token` is set every route above needs it — as `Authorization: Beare
 or `?token=` — **except** `GET /health`, which stays open so a monitor can check
 liveness without holding the secret, and the WebUI itself (`GET /`, `/static/*` and the
 generated `/theme.css`), which holds no secrets and is the thing that asks for the
-token. `/files/<name>` is the one route that takes the token *only* by query
+token. `GET /files/<name>` is the one route that takes the token *only* by query
 parameter, because it is fetched by the browser's own `<img>` loader, which cannot be
-given a header. Each client carries it its own way: the WebUI in the
+given a header. The listing and the delete beside it take a header like everything
+else — they are called from `fetch`, which can send one. Each client carries it its own way: the WebUI in the
 token gate (kept in the browser's `localStorage`), the Discord bot from `core.token` in
 the config it loads (or `discord.core_token` when it runs elsewhere), and the terminal
 client from `--token`, the `CLAW_TOKEN` env var, or — when it runs on the same machine
@@ -1324,8 +1409,19 @@ input rather than state and belongs to the name, not the conversation.
 Everything the terminal client can
 do is there: streaming answers with markdown and copyable code blocks, tool calls
 appearing *before* they run, the context gauge with the rollover threshold marked,
-the `🧠 think` toggle, the rollover prompt with its live countdown, and the same
+the `🧠 think` control, the rollover prompt with its live countdown, and the same
 slash commands with `/`-triggered autocomplete.
+
+The thinking is the one place it does more than the terminal. `🧠 think` has
+three states rather than two — off, shown folded (`▸`), shown open (`▾`) —
+cycled by clicking it or by a bare `/reasoning`, and `/reasoning off`,
+`/reasoning collapsed` or `/reasoning expanded` jumps straight to one. The
+setting decides how a *new* block of thinking arrives; each block is a
+`<details>` the reader can open or shut on its own from there, and changing
+the setting reaches the blocks already on screen too. A folded block still
+shows what the think cost, because the `🧠 thought … tok in …s` stamp rides in
+the summary. Like the rest of the WebUI's per-browser preferences it lives in
+`localStorage` (`letsclaw.reasoning`), so it is per browser, not per session.
 
 Two things worth knowing about how it behaves:
 
@@ -1350,6 +1446,37 @@ own literal text rather than quietly dropped, and a file that is not there becom
 a visible note instead of a broken-image icon. There is no upload: pictures go
 agent → you, not the other way.
 
+The agent gets a picture there with the `show_image` tool: hand it any path on
+disk and it copies the file into `webui.files_dir` and replies with the name to
+write in the `![…]()`. It copies rather than serving the original path, which is
+the whole point — `exec` and `read_file` already reach anything this process
+can, and `show_image` is the single place a file crosses from that unconfined
+side to the side anyone holding `core.token` can fetch over HTTP. Keeping
+"what is servable" equal to "what is in one directory" is the invariant the
+`/files` route is built on. It refuses a non-image extension (saying which ones
+work, rather than leaving you a thumbnail that will not load) and anything over
+25 MB, and it never overwrites: a name already taken by *different* bytes gets
+`-2`, because the directory is shared by every session and a silent clobber
+would cross conversations. Re-copying the identical file reuses what is there.
+It costs 121 tokens of schema on every request of every tool-enabled session —
+see [docs/tokens.md](docs/tokens.md) — so drop it from `tools.allow` if you
+never want pictures.
+
+**🖼️ media.** The button under the session list opens a grid of everything in
+`webui.files_dir`, newest first: a plot from a conversation you cleared, or one
+scrolled past the log's node cap, is still on disk and still here. Click a tile
+for the same full-size view as an inline image. `this session` narrows it to
+the pictures the transcript on screen is showing — a scan of the log when the
+panel opens, not a list kept as the session runs, so it cannot go stale; its
+one limit is that an image trimmed away by the log cap is no longer "on
+screen". 🗑 deletes the file itself, after a confirm, and `webui.files_delete:
+false` takes the button away for a `files_dir` whose contents are not
+disposable. The tiles are the full images scaled by CSS: there is no
+thumbnailer, because that means a dependency on a machine this core cannot
+assume is online. Lazy loading, a reserved tile height and a 500-file cap keep
+that affordable, but the first open of a large directory is slow — the fix if
+it ever bites is a thumbnail route, not more JavaScript.
+
 **Maths.** `$…$` and `\(…\)` render inline, `$$…$$` and `\[…\]` as a centred block,
 via KaTeX. Formulas are lifted out before the markdown pass, so `*` and `_` in an
 exponent stay maths instead of turning into emphasis, and `$` inside a code span or a
@@ -1369,8 +1496,13 @@ and they will not default to your real one. Individually:
 `node tests/test_math.mjs` does the same against the real vendored KaTeX,
 `.venv/bin/python tests/test_math_render.py` checks the rendered maths in a real
 browser (fonts, metrics, colour, overflow) without sending a turn,
-`.venv/bin/python tests/test_files.py` covers the `/files` route's confinement with
-no core or browser at all, and `.venv/bin/python tests/test_image.py` checks that an
+`.venv/bin/python tests/test_files.py` covers all three `/files` routes —
+confinement, the extension gate, auth, and that the listing agrees with the read
+route about what is servable — with no core or browser at all,
+`.venv/bin/python tests/test_show_image.py` checks the tool that puts pictures
+there (hermetic, and it runs every name the tool invents through the renderer's
+own pattern), `.venv/bin/python tests/test_media.py` drives the Media panel in a
+real browser, and `.venv/bin/python tests/test_image.py` checks that an
 image actually decodes, paints, stays inside its column and does not break the
 auto-scroll.
 `.venv/bin/python tests/test_browser.py` drives real headless Chrome over the DevTools
@@ -1574,7 +1706,7 @@ refuses to install one flavour while the other is present — uninstall first.
 - **Semantic search** — embed past messages/sessions and search them by meaning, not just keyword match
 - **Memory system** — nothing reads `state/memory_store/long_term.md` back. Rollover appends every handoff to it, but a new window is seeded only from the one window before it, so the accumulated file is a record for you to grep rather than something the agent recalls
 - **Discord draft streaming** — live-edited messages as the answer builds, instead of one post at `turn_end`
-- **Sub-agents** — a tool that runs a nested agent loop on a short fresh prompt and returns only its conclusion, so a big search never enters the parent's window. For context, not parallelism — see [todo.md](models/todo.md#wanted-not-built) for the measurements and the caveat about prefix-cache eviction
+- **Sub-agents** — a tool that runs a nested agent loop on a short fresh prompt and returns only its conclusion, so a big search never enters the parent's window. For context, not parallelism. The caveat to design around is prefix-cache eviction: on llama.cpp a sub-agent built from a *forked* prompt can evict the slot holding the parent's conversation, so it gets a short fresh prompt and never a fork (SGLang shares prefixes and is free of this)
 
 ## Config
 

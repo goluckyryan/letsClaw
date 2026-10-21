@@ -23,12 +23,12 @@ are used strictly from here on.
 |---|---|
 | **history** | the list of messages **letsClaw** keeps on its own side: the system message, then every question, answer, tool call and tool result. It lives in the core's memory and on disk. It is the only part letsClaw can edit, trim or collapse. |
 | **prompt** | what is actually **sent to the model on one request**: the history, plus the tool schemas, rendered into one block of text. The model gets this and nothing else — it remembers nothing between requests. |
-| **tool schema** | the machine-readable description of one tool — its name, what it is for, and the arguments it takes. The model's menu. See the box below; there are four of them here, costing **595 tokens** on every round that offers tools. |
+| **tool schema** | the machine-readable description of one tool — its name, what it is for, and the arguments it takes. The model's menu. See the box below; there are five of them here, costing **715 tokens** on every round that offers tools. |
 | **window** | the model's hard ceiling on how big a prompt can be. Here, **262,144 tokens** (`context_length` in `config.yaml`; the clients call it `budget`). Fixed by the model, not by letsClaw. |
 | **used** | how much of the window the current prompt would take. This is what the `⚡` line and the WebUI gauge show as `used/budget`. |
 | **turn** | one question from you and the final answer back. |
 | **round** | one request-and-reply with the model. **A turn can take several rounds** — one per tool call, plus any resumed thinking. This distinction is the single most important idea on this page. |
-| **floor** | what `used` reads with **no conversation at all** — the system message plus the tool schemas. The starting tax: **1,859 tokens** here, paid on every round, which you can never get below. See the box below. |
+| **floor** | what `used` reads with **no conversation at all** — the system message plus the tool schemas. The starting tax: **1,979 tokens** here, paid on every round, which you can never get below. See the box below. |
 | **bill** | how many input tokens a turn, or a whole session, actually **sent**. Not the same as `used`: `used` is the window measured once, while every round of a turn re-sends the whole of it. The bill is the larger number, always, and on a tool-heavy turn it is several times larger. `/info` shows the session's as `📥 Input`. |
 | **cache hit rate** | the share of the bill the server answered out of its KV cache instead of re-reading. A **cost and speed** figure, never a space figure — see section 4. `/info` shows it as `💾 Cache`, and omits the line when the server reports nothing. |
 | **tokenizer** | the thing that chops text into tokens. Every model has its own, with its own vocabulary, so *the same sentence is a different number of tokens to different models*. There is no universal token. |
@@ -85,23 +85,32 @@ is if that block is in front of it *right now*. Leave the schemas out of a
 request and the model is blind to its tools for that round — which is exactly
 what letsClaw does on purpose during a thinking-pad resume.
 
-What the four cost:
+What the five cost:
 
 | tool | our count | |
 |---|---|---|
-| `exec` | 119 tok | |
+| `exec` | 118 tok | |
 | `read_file` | 65 tok | |
 | `write_file` | 89 tok | |
 | `list_dir` | 75 tok | |
-| sum of the JSON | ~353 tok | what letsClaw counts |
-| **what the server charges** | **595 tok** | measured |
+| `show_image` | 109 tok | |
+| sum of the JSON | ~462 tok | what letsClaw counts |
+| **what the server charges** | **715 tok** | measured |
+
+`show_image` is the newest and the one worth watching, because it is the one
+whose schema was written after this page existed. It adds **121 tokens to every
+request of every tool-enabled session, forever** — measured by diffing
+`prompt_tokens` for the same prompt with and without it. That is why its
+description is one sentence: four tools cost 594 at the server, five cost 715,
+and the gap is paid on every round whether a picture is wanted or not. Drop it
+from `tools.allow` and you get those 121 back.
 
 The gap is not a rounding error, and it is why the schema term in section 8
 is measured from the server rather than counted locally. The server does not
 pass your JSON through — it **re-renders** the schemas into Qwen's own
 chat-template format, wrapping them in section markers and instructions on how
 to emit a tool call. None of that scaffolding is visible to a counter that only
-looks at `json.dumps()`, so letsClaw sees 353 where the model sees 595.
+looks at `json.dumps()`, so letsClaw sees 462 where the model sees 715.
 
 ### The floor: what an empty session already costs
 
@@ -109,12 +118,12 @@ Add the two always-present pieces together and you get the floor:
 
 ```
   system message (your behavior .md files) ....... 1,264
-  tool schemas (the 4 tools above) ...............   595
+  tool schemas (the 5 tools above) ...............   715
   ───────────────────────────────────────────────────────
-  the floor — what an empty session already uses . 1,859
+  the floor — what an empty session already uses . 1,979
 ```
 
-A session with nothing in it already reads `1859/262144`. And `/clear` does not
+A session with nothing in it already reads `1979/262144`. And `/clear` does not
 clear it: wiping the conversation returns you *to* the floor, not to zero,
 because the behavior files and schemas reload immediately.
 
@@ -142,7 +151,7 @@ Four things move it:
 |---|---|
 | **a rollover** | **raises** it — the handoff joins the system message, up to ~1,500 tokens. It does **not** stack: each handoff is written from the previous one and **replaces** it, so the floor steps up once and then stays roughly flat however many times you roll over. |
 | **`/model`** | **changes** it — `use_model()` rebuilds the system message, and the middle layer *is* the model's own behavior file. A different model is a different layer 2. |
-| **`strip_directives`** on a model entry | **lowers** it — `strip_directive_sections()` cuts sections out of base.md for models that do not need them. |
+| **the `# Directives` group in base.md** | **does not raise it** — `strip_directive_sections()` cuts the group out of the base layer for every model, so the two directive templates cost nothing in the prompt and are billed only on the turn the core actually sends one. |
 | **`/reload`** | **changes the schema half only.** See below. |
 
 **The reload asymmetry is worth knowing.** A reload updates `tools_tok` on every
@@ -188,9 +197,9 @@ before it is used for anything.
 | | |
 |---|---|
 | $S$ | tokens in the system message (your behavior files) |
-| $T$ | tokens the server **charges** for the tool schemas — **595** |
-| $\tau$ | tokens letsClaw **counts** for those schemas — **353**. Not a typo; see below |
-| $N$ | how many tools are offered — **4** here |
+| $T$ | tokens the server **charges** for the tool schemas — **715** |
+| $\tau$ | tokens letsClaw **counts** for those schemas — **462**. Not a typo; see below |
+| $N$ | how many tools are offered — **5** here |
 | $h(n)$ | true size of the history after turn $n$ |
 | $m(n)$ | letsClaw's `tiktoken` count of that same history |
 | $q(n),\ a(n)$ | the question and the final answer at turn $n$ |
@@ -217,16 +226,17 @@ $T$ is what the server bills. They differ for **two independent reasons**:
 2. **letsClaw is counting with the wrong tokenizer** — `tiktoken`, not Qwen's.
    Even on identical text the two disagree.
 
-Sending the four tools one at a time and watching `prompt_tokens` separates
+Sending the tools one at a time and watching `prompt_tokens` separates
 them, and the structure is sharper than a single ratio suggests:
 
 | tools sent | $\tau$ | server charges | difference |
 |---|---|---|---|
 | none at all | 0 | **0** | — |
-| `exec` | 121 | 330 | +209 |
-| `+ read_file` | 187 | 407 | +220 |
-| `+ write_file` | 277 | 508 | +231 |
-| `+ list_dir` | 353 | **595** | +242 |
+| `exec` | 120 | 329 | +209 |
+| `+ read_file` | 186 | 406 | +220 |
+| `+ write_file` | 276 | 507 | +231 |
+| `+ list_dir` | 352 | 594 | +242 |
+| `+ show_image` | 462 | **715** | +253 |
 
 The difference is not proportional — it starts at +209 for *one* tool and
 creeps up by only ~11 per tool after that. Fitting those gives
@@ -237,6 +247,13 @@ which reproduces every subset tested — any single tool, pairs, and both
 orderings of all four — to **within 2 tokens**. (Order does not matter; an
 empty tool list costs exactly 0, so the fixed block appears only once at least
 one tool is present.)
+
+The last row is the fit's best evidence: `show_image` was added long after
+those constants were measured, and the formula called its 715 **exactly**,
+with nothing refitted. A fifth tool was never part of the data, so this is a
+prediction the server confirmed rather than a curve drawn through its own
+points. The earlier rows moved by 1 since they were first taken — `exec`'s
+schema quotes the `exec_timeout` default, which changed from 1200 to 120.
 
 **So the ratio $T/\tau = 1.69$ is not a property of the tokenizer or the
 template. It is an artifact of having four smallish tools.** That 198-token
@@ -311,6 +328,14 @@ None of the above is worth anything if it does not reproduce reality. Taking
 $F = 1859$ and the measured questions, tool exchanges and answers from the
 session in section 3, the recurrence predicts every prompt the server actually
 received:
+
+> **These are the figures from that session, not from today's install.** It ran
+> on the four-tool configuration, so its floor was $1264 + 594$, not the
+> $1264 + 715$ a fifth schema makes it now. They are left as they were measured
+> rather than shifted by 121 — a recorded run that is adjusted to match a later
+> config is no longer evidence of anything. What the recurrence claims is that
+> it reproduces the server *whatever* $F$ is, and the only way to show that is
+> to let a real $F$ stand with its own numbers.
 
 | quantity | by the formula | the server said |
 |---|---|---|
@@ -438,6 +463,14 @@ rejected.
 Rather than describe it, here is a real session, turn by turn. Every number
 below was measured against the live server — a real request was sent and the
 server's own `prompt_tokens` recorded. Nothing here is calculated or guessed.
+
+It ran when `tools.allow` held four tools, so its floor is 1,859 rather than
+the 1,979 a fifth schema makes it today. Every figure in this section is 120
+tokens below what the same session would cost now, and they are left that way
+on purpose: these are measurements, and a measurement edited to match a later
+config stops being one. The shapes are what the section is for — the floor,
+the round multiplier, the quadratic — and none of them depend on which number
+$F$ happens to be.
 
 ### Turn 0 — the floor, before anyone has said anything
 
@@ -631,7 +664,7 @@ part of the prompt that varies:
 | a thinking-pad resume | no — tools are never offered mid-thought |
 | a forced conclusion / checkpoint round | no |
 
-Rounds that skip the schemas are ~595 tokens cheaper here. None of this is
+Rounds that skip the schemas are ~715 tokens cheaper here. None of this is
 visible in the `⚡` line, which reports the window *size* once per turn rather
 than the sum of the prompts the turn actually sent. `/info`'s input odometer is
 where that sum lands, across the whole session (section 8).
@@ -726,20 +759,21 @@ Measured against the real tokenizer, same messages, with and without tools:
 | what | letsClaw's local count | server's truth | truth ÷ local |
 |---|---|---|---|
 | conversation text only | 1,201 | 1,265 | **1.05** |
-| the 4 tool schemas | 353 | 595 | **1.69** |
-| both together | 1,554 | 1,860 | 1.20 |
+| the 5 tool schemas | 462 | 715 | **1.55** |
+| both together | 1,663 | 1,980 | 1.19 |
 
 The tokenizer substitution is nearly harmless: `cl100k_base` is within **5%**
 of Qwen's tokenizer on prose. **Most of the gap is in the tool schemas**, where
 `json.dumps(specs)` misses the chat template's rendering scaffolding and comes
-in **41% low** — the server's figure is 1.69× ours.
+in **35% low** — the server's figure is 1.55× ours.
 
-Read that 1.69 as a measurement of *this install*, not a constant: section 2
+Read that 1.55 as a measurement of *this install*, not a constant: section 2
 breaks the gap down tool by tool and finds it is $198 + 11N$ — a fixed block
 plus a small per-tool cost — so the ratio depends on how many tools you offer
-and falls toward 1.13 as you add them.
+and falls toward ~1.12 as you add them. It was 1.69 at four tools and 1.55 at
+five, which is the point: the ratio moved while the formula did not.
 
-This is why the schema term is an **offset and not a ratio**. A fixed ~242-token
+This is why the schema term is an **offset and not a ratio**. A fixed ~253-token
 shortfall corrected by a multiplier grows without bound as the conversation
 does, and it is the full window — not the empty one — where the number is
 load-bearing.
@@ -790,8 +824,11 @@ and its tool-heavy continuation:
 | after turn 8 | 14,704 | **14,672** (−0.2%) |
 | after turn 9 | 16,635 | **16,575** (−0.4%) |
 
-**Worst case 0.5%.** The schema block on this install: formula says 595, the
-server charges 595 — exact.
+**Worst case 0.5%.** The schema block on this install: formula says 715, the
+server charges 715 — exact. (Those checkpoints were taken on the four-tool
+configuration — see section 3 — so each is 120 tokens below today's. The
+percentages are what the table is for, and a uniform shift in $F$ leaves them
+where they are.)
 
 #### What was rejected, and why
 

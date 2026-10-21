@@ -147,12 +147,14 @@ def api_messages(history):
 
     The `at` stamp is for the clients' clocks, not the prompt: it would ride
     in every request as invisible overhead, and a server that echoes unknown
-    keys could surface it in the answer. `digest` marks a message as a turn
-    summary rather than something the assistant said, which the clients draw
-    differently and the model has no use for. Anything added here must be
-    added to this filter too — the default is to send it.
+    keys could surface it in the answer. `turn` and `round` are the same kind
+    of thing — where the record sits in the session, drawn in the clients'
+    gutters. `digest` marks a message as a turn summary rather than something
+    the assistant said, which the clients draw differently and the model has
+    no use for. Anything added here must be added to this filter too — the
+    default is to send it.
     """
-    drop = ("at", "digest")
+    drop = ("at", "digest", "turn", "round")
     return [{k: v for k, v in m.items() if k not in drop} for m in history]
 
 
@@ -367,6 +369,13 @@ class Session:
         self.last_seq = 0
         self.turn_events = []   # current turn only; history serves fresh attaches
         self.turn_id = 0
+        # Which model round inside the current turn: 1 for the first, bumped by
+        # every round the tool loop, a thinking-pad resume or the conclusion
+        # adds. 0 between turns and before the first round, which is where the
+        # user's own question sits — so a prompt is "turn 47" and the work
+        # under it is "turn 47, round 3". Not persisted: a restart kills any
+        # turn in flight, so there is no round to come back to.
+        self.round_id = 0
         self.pending_ask = None  # (request_id, Future)
         # The turn in flight, if any. On the session rather than on whichever
         # socket happened to start it: a turn belongs to the conversation, and
@@ -403,11 +412,28 @@ class Session:
 
     # ---- events ----------------------------------------------------------
 
+    def mark(self):
+        """Where a record sits in the session: which turn, which round.
+
+        The same pair the journal tags its blocks with (`## turn 47 round 3`),
+        so a line a client draws in its gutter is greppable in the record.
+        Display-only, like the `at` beside it — api_messages() drops all three.
+        """
+        return {"turn": self.turn_id, "round": self.round_id}
+
     def emit(self, event):
         """Fan out one event. Synchronous and non-blocking, by contract."""
         self.last_seq = next(self._seq)
         event["seq"] = self.last_seq
         event["session"] = self.name
+        # Where in the session this happened, stamped here so every event
+        # carries it by construction rather than at each of the thirty-odd
+        # call sites. setdefault, not assignment, so a call site that knows
+        # better than "whatever is in flight" still wins. turn_start and
+        # turn_end also carry turn_id: the older key, same number, kept
+        # because it is part of the wire contract clients were written to.
+        event.setdefault("turn", self.turn_id)
+        event.setdefault("round", self.round_id)
         # Deltas are append-only, so coalescing a backlog is lossless and keeps
         # a 2000-delta turn from replaying token by token.
         if event["t"] == "text":
@@ -978,6 +1004,7 @@ class Session:
             return
         async with self.lock:
             self.turn_id += 1
+            self.round_id = 0      # the question is under no round yet
             self.turn_events.clear()
             # One stamp for the turn: the event and the history message that
             # draw the same question must agree, or a replay across a second
@@ -1021,6 +1048,10 @@ class Session:
                     await self.persist()
                 finally:
                     self.emit(ev("turn_end", turn_id=self.turn_id))
+                # Nothing after this belongs to a round — a rollover, a trim or
+                # a reload applied below would otherwise be stamped with
+                # whatever the last round happened to be.
+                self.round_id = 0
                 # A /steering that landed in the last instant — after _turn finished
                 # but before the turn was announced over: nothing is running any
                 # more, so say so rather than let it queue into the next turn.
@@ -1051,7 +1082,8 @@ class Session:
         # turn begins after the tool loop and repair_history have both reshaped
         # the list around it.
         user_msg = {"role": "user", "content": text,
-                    "at": getattr(self, "_turn_at", None) or now_stamp()}
+                    "at": getattr(self, "_turn_at", None) or now_stamp(),
+                    **self.mark()}
         self.history.append(user_msg)
         # The journal's high-water mark before this turn wrote anything, so the
         # digest can tell "recorded" from "the write failed silently".
@@ -1153,6 +1185,9 @@ class Session:
             nonlocal in_tok, in_reported, cache_tok, cache_base, srv_reason
             nonlocal reason_tok   # re-synced below, on the round boundary
             rounds += 1
+            # Mirrored onto the session so emit() and the history appends can
+            # reach it; `rounds` itself is a local the accounting below owns.
+            self.round_id = rounds
             # Before the history_shaped gate below, deliberately: what this
             # round cost does not depend on whether its prompt resembles the
             # window afterwards.
@@ -1318,6 +1353,7 @@ class Session:
                 "role": "assistant",
                 "content": result.text or "",
                 "at": now_stamp(),
+                **self.mark(),
                 "tool_calls": [
                     {"id": tc["id"], "type": "function",
                      "function": {"name": tc["name"],
@@ -1332,7 +1368,8 @@ class Session:
                 # Reserved before running: the stamp is the reservation moment,
                 # rewritten when the result lands (run_tools below).
                 msg = {"role": "tool", "tool_call_id": tc["id"],
-                       "content": "error: cancelled", "at": now_stamp()}
+                       "content": "error: cancelled", "at": now_stamp(),
+                       **self.mark()}
                 slots[tc["id"]] = msg
                 self.history.append(msg)
 
@@ -1386,7 +1423,8 @@ class Session:
             queued, self._steering = self._steering, []
             for text in queued:
                 at = now_stamp()
-                self.history.append({"role": "user", "content": text, "at": at})
+                self.history.append({"role": "user", "content": text, "at": at,
+                                     **self.mark()})
                 self.emit(ev("steering", text=text, turn_id=self.turn_id, at=at))
                 await self.jot(f"turn {self.turn_id} steering", text)
 
@@ -1405,7 +1443,7 @@ class Session:
             partial = "".join(emitted)
             if partial.strip():
                 self.history.append({"role": "assistant", "content": partial,
-                                     "at": now_stamp()})
+                                     "at": now_stamp(), **self.mark()})
                 await self.jot(f"turn {self.turn_id} partial (steering)", partial)
 
         try:
@@ -1471,7 +1509,7 @@ class Session:
                         if result.text:
                             self.history.append(
                                 {"role": "assistant", "content": result.text,
-                                 "at": now_stamp()})
+                                 "at": now_stamp(), **self.mark()})
                         await drain_steering()
                         continue
                     full_response = result.text
@@ -1542,7 +1580,7 @@ class Session:
 
         if not had_error and full_response:
             self.history.append({"role": "assistant", "content": full_response,
-                                 "at": now_stamp()})
+                                 "at": now_stamp(), **self.mark()})
             # How full the window is = what the NEXT prompt will cost: the prompt
             # just sent, plus the answer we appended. Deliberately not
             # prompt+completion — completion includes reasoning, which is thrown
@@ -2022,7 +2060,7 @@ class Session:
                          text=f"reasoning was cut off and this server cannot resume it "
                               f"— forcing a conclusion under {cap or 'the model default'} tok"))
             self.history.append({"role": "user", "content": directive,
-                                  "at": now_stamp()})
+                                  "at": now_stamp(), **self.mark()})
             try:
                 result = await call_round(overrides={"max_tokens": cap} if cap else None)
             except BaseException:
@@ -2144,7 +2182,7 @@ class Session:
             + spoken
             + ([answer] if answer else [])
             + [{"role": "assistant", "content": digest,
-                "at": now_stamp(), "digest": True}])
+                "at": now_stamp(), **self.mark(), "digest": True}])
         # The window just got much smaller, so the measured prompt size
         # describes a history that no longer exists — same reason as the
         # max_history trim below and roll_over's own reset. Leaving it set
@@ -2628,7 +2666,8 @@ class SessionManager:
         from tools import build_tools
         # Built once: Tool objects are stateless, and the schemas are identical
         # for every session, so count_tools is paid once rather than per session.
-        self._tools = build_tools(tools_cfg, workdir=workdir)
+        self._tools = build_tools(tools_cfg, workdir=workdir,
+                                  files_dir=paths.files_root(config))
         self._schemas = [t.spec for t in self._tools]
         self._tools_tok = count_tools(self._schemas)
 
@@ -2958,7 +2997,8 @@ class SessionManager:
             tools_cfg = fresh.get("tools") or {}
             workdir = tools_cfg.get("workdir") or str(paths.REPO_ROOT)
             from tools import build_tools
-            new_tools_list = build_tools(tools_cfg, workdir=workdir)
+            new_tools_list = build_tools(tools_cfg, workdir=workdir,
+                                         files_dir=paths.files_root(fresh))
             new_schemas = [t.spec for t in new_tools_list]
             new_tools_tok = count_tools(new_schemas)
         # TypeError/AttributeError/KeyError alongside the rest: a half-finished

@@ -25,6 +25,9 @@ Routes registered in `build_app()`.
 | `POST /reload` | yes | re-reads `config.yaml` in place; **400 and no change** if it will not load |
 | `GET /config` | yes | `{path, config}` — the live config dict, for the WebUI Settings panel. Authenticated because `core.token` and `discord.token` are in it |
 | `POST /config` | yes | body `{"webui": {...}}` — rewrites **only the `webui:` block** of `config.yaml` (comments and every other byte untouched; the block is appended if missing), then applies it via the ordinary reload. 400 malformed or unserialisable |
+| `GET /files` | yes | `{ok, dir, total, truncated, can_delete, files[]}` — what is in `webui.files_dir`, newest first, capped at 500. Each entry is `{name, size, mtime, type}`. Top level only: the read route below serves a nested path, but no answer can reference one |
+| `GET /files/{name}` | yes | one image from `webui.files_dir`. Confined to that directory (a traversal or a symlink out of it is 404) and restricted to an image extension. **The one route that also takes the token by `?token=`**, because an `<img>` cannot send a header |
+| `DELETE /files/{name}` | yes + same-origin | unlink one image. Same guards as the read; **403** when `webui.files_delete` is false, 404 for anything the read route would also refuse, 500 with the message if the unlink fails |
 | `GET /ws` | yes | the stream (below) |
 | `GET /` , `GET /static/*` | **no** | the WebUI from `web/` — registered only if `web/index.html` exists |
 | `GET /theme.css` | **no** | generated CSS from `webui.pin` in config.yaml — the style of the pinned prompt; `/reload` re-themes it |

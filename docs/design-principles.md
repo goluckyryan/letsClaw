@@ -79,10 +79,13 @@ So the wording of the machinery is tunable without touching code. That is the
 principle: **anything that is really a prompt should live in a file the user
 can edit and `/reload`, not in the source.**
 
-`strip_directives` (per model) keeps those two blocks *out* of the prompt while
-leaving extraction working — because a hosted assistant reads the whole prompt
-as standing instruction and obeys "this is not the final answer" every turn,
-whereas a local thinking model ignores it.
+The corollary is that machinery must not *also* be prompt.
+`strip_directive_sections()` cuts the whole `# Directives` group out of the
+base layer for every model, leaving extraction working — because a hosted
+assistant reads the whole prompt as standing instruction and obeys "this is not
+the final answer" every turn, and because a local thinking model that merely
+ignores the copy is still paying for it in tokens. It was once opt-in
+(`strip_directives` per model); the key is gone.
 
 ## 3. No hidden token injection
 

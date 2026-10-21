@@ -360,6 +360,19 @@ main {
   user-select: none;
   padding-top: 3px;
 }
+/* Third line of the gutter: the turn, and the round inside it — #47, or
+   #47.3. Fainter than the clock above it, because it is a coordinate you look
+   up when you need it rather than something to read on every block. A block,
+   so it takes its own line under the two the \n in the clock makes; tabular
+   figures so the numbers stay in column as they grow. Faded with color-mix
+   rather than opacity: opacity would give every gutter its own stacking
+   context, which is the trap the pinned bubble's z-index note describes. */
+.ts-turn {
+  display: block;
+  color: color-mix(in srgb, var(--dim) 72%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
 .who { flex: 0 0 22px; font-size: 15px; user-select: none; padding-top: 2px; }
 .body { flex: 1; min-width: 0; }        /* min-width:0 lets <pre> scroll instead of stretching the page */
 
@@ -379,6 +392,14 @@ main {
 .msg.user.pin {
   position: sticky;
   top: 0;
+  /* Above the log, or the turn streams *through* the band. The pin is sticky
+     with z-index:auto, which paints in the same step as any later sibling that
+     opacity has given its own stacking context — .msg.reasoning .body at .85,
+     the .thought stamps, the hover copy button. Tree order decides that step,
+     and all of them come after the pin, so without this the thinking shows
+     through the bubble and over the icon. Stays under #side (5), the
+     settings panel (20) and the lightbox (100). */
+  z-index: 2;
   /* The band is the page's own background (--pin-background, from webui.pin in
      config.yaml, via /theme.css — var(--bg) by default), at --pin-transparency:
      opaque by default so the streaming below never bleeds through the side
@@ -399,6 +420,26 @@ main {
   border-color: color-mix(in srgb, var(--pin-fg) 30%, var(--pin-bg));
 }
 
+/* A long question makes a tall band, and the band is what the rest of the turn
+   streams under — pin a forty-line prompt and it owns the pane. So a pinned
+   prompt shows its first four lines and ellipsises the rest; clicking the
+   bubble opens it, clicking again puts it back. `.long` is set by layoutPins(),
+   which measures the wrapped height, so "four lines" tracks the pane width. */
+.msg.user.pin.long .body { cursor: pointer; }
+.msg.user.pin.long:not(.open) .body {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  line-clamp: 4;
+  overflow: hidden;
+  /* overflow:hidden clips at the *padding* box, so the fifth line draws into
+     the bubble's 8px of bottom padding and a sliver of it shows under the
+     ellipsis. Move that 8px out of the padding and into the border, which is
+     outside the clip: the same gap under the text, nothing peeking through. */
+  padding-bottom: 0;
+  border-bottom: 9px solid var(--pin-bg);
+}
+
 /* A /steering is a user message that landed mid-turn: the correction the model
    re-plans around. Same shape as a question, marked so it reads as an
    interruption rather than a new turn. */
@@ -415,6 +456,33 @@ main {
   padding-left: 10px;
   opacity: .85;
 }
+
+/* The thinking folds. The handle has to stay a single line however many pages
+   the model wrote, so pre-wrap and the 13.5px of the block above are both
+   undone here — they belong to .think-text, which is where the stream lands. */
+.think > summary {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  white-space: normal;
+  font: 12px var(--sans);
+}
+.think > summary::-webkit-details-marker { display: none; }
+/* list-style:none above took the native triangle, so the block draws its own:
+   ▸ shut, ▾ open. A geometric shape rather than an emoji — this core runs on
+   lab boxes with no emoji font, where ▸ still draws and 🔽 is tofu. */
+.think > summary::before { content: '▸'; font-size: 10px; }
+.think[open] > summary::before { content: '▾'; }
+.think > summary:hover { color: var(--accent); }
+.think-text { margin-top: 5px; }
+/* The cost stamp rides in the summary (see stampThinking), where a shut block
+   still shows what it was worth. Beside the label rather than pushed to the
+   far edge with margin-left:auto, which over the width of the log left the
+   figure stranded on the right with nothing to read it against. */
+.think > summary > .thought { opacity: .85; }
 
 /* ---------- markdown ---------- */
 
@@ -807,14 +875,17 @@ footer {
   cursor: pointer;
 }
 
-/* ---------- settings sidebar button ---------- */
+/* ---------- settings and media sidebar buttons ---------- */
 
 #side-foot {
   flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   padding: 8px 12px 10px;
   border-top: 1px solid var(--line);
 }
-#side-settings {
+#side-settings, #side-media {
   width: 100%;
   padding: 7px 10px;
   font: 12px var(--sans);
@@ -825,11 +896,11 @@ footer {
   border-radius: 7px;
   cursor: pointer;
 }
-#side-settings:hover { border-color: var(--accent); }
+#side-settings:hover, #side-media:hover { border-color: var(--accent); }
 
-/* ---------- settings overlay ---------- */
+/* ---------- settings and media overlays ---------- */
 
-#settings {
+#settings, #media {
   position: fixed;
   inset: 0;
   background: rgba(0,0,0,.6);
@@ -839,7 +910,7 @@ footer {
   z-index: 20;
 }
 /* Same trap as #gate: an explicit display: beats the hidden attribute. */
-#settings[hidden] { display: none; }
+#settings[hidden], #media[hidden] { display: none; }
 .set-box {
   display: flex;
   flex-direction: column;
@@ -1010,3 +1081,89 @@ footer {
 .set-notice { font: 12px var(--sans); color: var(--dim); }
 .set-notice.ok { color: var(--ok); }
 .set-notice.err { color: var(--err); }
+
+/* ---------- media grid ---------- */
+
+.med-filter {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font: 12px var(--sans);
+  color: var(--dim);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.med-filter input { cursor: pointer; }
+
+.med-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+}
+.med-tile {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.med-tile:hover { border-color: var(--accent); }
+/* aspect-ratio is not cosmetic: it is what makes loading=lazy work. A tile with
+   no intrinsic height is zero-high, every tile is therefore "near the viewport",
+   and the browser fetches the whole directory at once. contain, not cover --
+   a plot cropped square loses the axes you opened the panel to read. */
+.med-thumb {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: contain;
+  background: var(--bg);
+  cursor: zoom-in;
+  display: block;
+}
+.med-cap {
+  padding: 6px 8px 0;
+  font: 11px var(--mono);
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.med-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px 7px;
+}
+.med-meta {
+  flex: 1;
+  font: 10px var(--sans);
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.med-del {
+  padding: 2px 6px;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.med-del:hover { color: var(--err); border-color: var(--line); }
+
+.med-empty {
+  padding: 24px 4px;
+  font: 13px var(--sans);
+  color: var(--dim);
+  text-align: center;
+}
+.med-note {
+  font: 12px var(--sans);
+  color: var(--dim);
+  padding-bottom: 10px;
+}
+.med-note.err { color: var(--err); }

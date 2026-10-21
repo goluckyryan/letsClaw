@@ -240,7 +240,7 @@ array-input workaround — pinning `av<15` fails to build on Python 3.14.)
 | 2 | `cam_client.py` skeleton: attach, TTS on turn_end | speak a canned turn_end |
 | 3 | voice: wake loop + PTT → whisper → submit | TTS→mic→whisper round trip; wake on a recorded "Hey Dudu" |
 | 4 | camera: CamControl lifecycle + frame poller → vision turn | synthetic frame dropped in `frames/` triggers a turn (vision model = live SGLang; mark `LIVE` like `test_discord_live.py`) |
-| 5 | config, `run_cam.sh`, README section, `decisions/` record | full pass: steering/browser/settings baselines unchanged |
+| 5 | config, `run_cam.sh`, README section | full pass: steering/browser/settings baselines unchanged |
 
 Phase 1 is independently shippable (the WebUI could grow an image-attach
 button on the same seam) — but nothing else does until it lands.

@@ -29,24 +29,24 @@ conversation state — see
 
 | file | lines | owns |
 |---|---|---|
-| `source/core.py` | ~3100 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
-| `source/session.py` | ~700 | **the disk layer.** Live store, archives, the journal, the handoff summariser, the id registry |
-| `source/server.py` | ~850 | **the transport.** aiohttp routes, the WebSocket handler, the Host and Origin guards, auth, backpressure |
-| `source/llm_engine.py` | ~580 | **the model.** Two transports (`chat` and `raw`), streaming, tool-call parsing, resume |
-| `source/config.py` | ~480 | **config.yaml → engines.** Loading, the webui presentation keys, number coercion, `build_all_engines` (which doubles as the validator), and the reload diff. Touches no `Session`, which is why it is not in `core` |
+| `source/core.py` | ~3450 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
+| `source/session.py` | ~790 | **the disk layer.** Live store, archives, the journal, the handoff summariser, the id registry |
+| `source/server.py` | ~1090 | **the transport.** aiohttp routes, the WebSocket handler, the Host and Origin guards, auth, backpressure |
+| `source/llm_engine.py` | ~980 | **the model.** Two transports (`chat` and `raw`), streaming, tool-call parsing, resume |
+| `source/config.py` | ~520 | **config.yaml → engines.** Loading, the webui presentation keys, number coercion, `build_all_engines` (which doubles as the validator), and the reload diff. Touches no `Session`, which is why it is not in `core` |
 | `source/behavior.py` | ~300 | **the behavior layers.** `BehaviorStore`, the read-through cache behind a lock, and the two directives extracted out of `base.md` |
 | `source/config_edit.py` | ~290 | rewriting the `webui:` block of `config.yaml` **as text**, so the file's comments survive a save |
-| `source/ssh_forward.py` | ~560 | **model servers over ssh.** One supervised `ssh -N -L` child per model entry that names an `ssh_forward`, on a port the core picks itself |
-| `source/tools.py` | ~210 | `exec`, `read_file`, `write_file`, `list_dir`, … and their JSON schemas |
+| `source/ssh_forward.py` | ~570 | **model servers over ssh.** One supervised `ssh -N -L` child per model entry that names an `ssh_forward`, on a port the core picks itself |
+| `source/tools.py` | ~300 | `exec`, `read_file`, `write_file`, `list_dir`, `show_image`, … and their JSON schemas |
 | `source/logging_setup.py` | ~110 | one rotating log file **per writer** (`letclaw-core.log`, `letclaw-discord.log`), because two processes sharing one file cannot rotate it safely |
-| `source/token_counter.py` | ~115 | counts with tiktoken's `cl100k_base`, cached under `state/tiktoken/` so it is fetched once ever rather than once per reboot; degrades loudly to 4-chars-per-token if the vocab cannot be loaded at all |
-| `source/paths.py` | ~75 | `REPO_ROOT` and `resolve()` — [principle 15](design-principles.md#15-one-definition-of-where-the-repo-is) |
+| `source/token_counter.py` | ~230 | counts with tiktoken's `cl100k_base`, cached under `state/tiktoken/` so it is fetched once ever rather than once per reboot; degrades loudly to 4-chars-per-token if the vocab cannot be loaded at all |
+| `source/paths.py` | ~70 | `REPO_ROOT` and `resolve()` — [principle 15](design-principles.md#15-one-definition-of-where-the-repo-is) |
 | `source/chunker.py` | ~310 | fence-aware message splitting; separate so it tests without `discord.py` |
-| `source/chat.py` | ~610 | the terminal client |
+| `source/chat.py` | ~640 | the terminal client |
 | `source/ui.py` | ~90 | the terminal client's spinner and TTFT line |
-| `source/discord_client.py` | ~2300 | the Discord client |
+| `source/discord_client.py` | ~2310 | the Discord client |
 | `source/discord_probe.py` | ~50 | **"should the bot be started?", answered once.** `serve.sh` and `install.sh` both run it and read the verdict off the exit code; they used to each carry their own copy of the question and the copies drifted |
-| `web/` | ~2170 (`app.js`) | the browser client (`index.html`, `app.js`, `style.css`) — vanilla JS, no build step |
+| `web/` | ~2220 (`app.js`) | the browser client (`index.html`, `app.js`, `style.css`) — vanilla JS, no build step |
 
 `session.py` is imported as `store` and **never imports
 `core`** — the dependency runs one way. Neither do `config.py`, `behavior.py`
@@ -123,7 +123,8 @@ Three free functions worth knowing before you touch the turn loop:
 1. **Busy check.** `if self.lock.locked()` → emit `busy` and return. A second
    submit is **refused, never queued**: running it would execute against a
    context its sender never saw.
-2. Take the lock, bump `turn_id`, clear the replay buffer, emit `turn_start`.
+2. Take the lock, bump `turn_id`, reset `round_id` to 0, clear the replay
+   buffer, emit `turn_start`.
 3. `await asyncio.wait_for(self._turn(text), engine.turn_timeout)`.
 4. Timeout / cancellation / exception → `repair_history()` and a notice.
    `CancelledError` is **re-raised**, after the `finally`.
@@ -285,11 +286,17 @@ session its KV cache for a behavior edit it did not ask for. An edited file
 is picked up instead by `refresh_behavior()` at the next rollover, `/clear`
 or `/new` — the paths that were going to replace the prefix anyway.
 
-Directives are computed from the **unstripped** base, so `strip_directives`
-removes them from the prompt without removing the core's ability to send them
-at the right moment.
+Directives are computed from the **unstripped** base, which is why stripping
+the `# Directives` group out of every prompt does not remove the core's ability
+to send them at the right moment.
 
-Full story: [decisions/2026-09-30-session-behavior-layer.md](decisions/2026-09-30-session-behavior-layer.md).
+The rules this layer follows, each with its reasoning, are
+[principle 2](design-principles.md#2-behavior-is-markdown-and-some-of-that-markdown-is-machinery)
+(behavior is Markdown, and the two directive sections are machinery),
+[principle 4](design-principles.md#4-key-on-the-session-name-not-on-the-clients-identity)
+(key on the session name, not the client's identity) and
+[principle 5](design-principles.md#5-identity-is-the-session-id-the-name-is-a-label)
+(id is the identity, the name is a label).
 
 ---
 
@@ -427,6 +434,12 @@ one-header-per-line file is reachable at any size via `grep`/`sed`. The header
 convention (`## turn 12 round 3 tool_call exec call_a1b2  [16:04:11]`) makes
 `grep -n '^## turn'` a table of contents.
 
+That `turn`/`round` pair is the same one the clients draw in their left gutter
+(`#12.3`), because `emit()` stamps every event with it and every history record
+carries it — so a block on screen is greppable in the journal by the number
+printed beside it. Both keys are display-only and `api_messages()` strips them,
+alongside `at`, before anything is sent to the model.
+
 `write()` never raises, and **a single `OSError` closes the segment for good**
 rather than warning once per block. Unlike `save_transcript`, `Journal._open`
 **does disambiguate** with a `-2` suffix: a rollover closes one segment and
@@ -469,7 +482,8 @@ points:
   must not run per request, plus whatever `core.allowed_hosts` adds for a
   reverse proxy. It is a middleware rather than part of `_guard` because
   rebinding pays off on the *read* routes too: `/sessions`, `/config` and
-  `/sessions/<name>/history` are whole conversations. `/health` is the one
+  `/sessions/<name>/history` are whole conversations, and `/files` is the
+  directory the agent's pictures land in. `/health` is the one
   exemption, since a container probe calls it under whatever name the
   orchestrator invented.
 

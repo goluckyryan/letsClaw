@@ -11,7 +11,7 @@ is built, why it is built that way, and where the edges are.
    the thinking pad, rollover, config reload, the disk layer. Start here. It
    ends with a numbered list of traps that is worth reading even if you skip
    the rest.
-2. **[design-principles.md](design-principles.md)** — the 18 rules the codebase
+2. **[design-principles.md](design-principles.md)** — the 20 rules the codebase
    actually follows, each with its evidence, plus an honest section on where
    they are strained. Read this before proposing a change, so it lands with the
    grain.
@@ -33,9 +33,12 @@ is built, why it is built that way, and where the edges are.
    estimates, and how accurate the estimates are. Written to be readable
    without the source open.
 
-[`decisions/`](decisions/) holds dated records of features that shipped: what
-was decided, what was rejected, and what deliberately was not built. They were
-moved out of `models/todo.md` when the work landed.
+There is no separate record of decisions. A feature's *why* lives with its
+*what*: the shipped explanation is the doc section that describes the code, and
+[design-principles.md](design-principles.md) is where a rule and its reasoning
+are kept together. What is not built stays in `models/todo.md`, and the commit
+message is the record of why something was rejected — so a decision worth
+keeping is worth writing into a doc.
 
 ## The shortest possible orientation
 

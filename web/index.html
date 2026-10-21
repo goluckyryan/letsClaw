@@ -30,7 +30,12 @@
   </form>
   <div id="side-list"></div>
   <!-- After #side-list, so the flex:1 list pushes it to the bottom of the bar. -->
+  <!-- Stacked, not side by side: the sidebar drags down to 160px, where a row
+       of two would clip both labels. Labelled rather than icon-only for the
+       same reason the others are — the emoji is tofu on a box with no emoji
+       font, and a tofu square with no word beside it is an unlabelled button. -->
   <div id="side-foot">
+    <button id="side-media" title="media — every picture in the files directory">🖼️ media</button>
     <button id="side-settings" title="settings — everything in config.yaml">⚙️ settings</button>
   </div>
   <!-- Right edge of the sidebar: drag to resize, double-click to reset. -->
@@ -57,6 +62,8 @@
 
   <!-- Labelled, not icon-only: the emoji fall back to tofu on a machine without an
        emoji font, and a lab box is exactly such a machine. -->
+  <!-- Three states, cycled by clicking: off, shown folded (▸), shown open (▾).
+       The label and title are rewritten by showReasonMode() on every change. -->
   <button id="btn-reasoning" class="tog" title="show the model's thinking (/reasoning)">🧠 think</button>
   <button id="btn-info"      title="context and recent history (/info)">ℹ️ info</button>
   <button id="btn-behavior"  title="print the loaded behavior file (/behavior)">📄 behavior</button>
@@ -101,9 +108,26 @@
     <div class="set-head">
       <h2>⚙️ Settings</h2>
       <span class="set-path" id="set-path"></span>
-      <button id="set-close" title="close">✕</button>
+      <button id="set-close" class="set-close" title="close">✕</button>
     </div>
     <div class="set-body" id="set-body"></div>
+  </div>
+</div>
+
+<!-- Media: every picture in webui.files_dir, which is where show_image puts
+     them. Same .set-* box as Settings on purpose — two hand-rolled modals
+     drift apart on the first theme tweak. -->
+<div id="media" hidden>
+  <div class="set-box">
+    <div class="set-head">
+      <h2>🖼️ Media</h2>
+      <span class="set-path" id="med-path"></span>
+      <label class="med-filter" title="only pictures this conversation has shown">
+        <input type="checkbox" id="med-session"> this session
+      </label>
+      <button id="med-close" class="set-close" title="close">✕</button>
+    </div>
+    <div class="set-body" id="med-body"></div>
   </div>
 </div>
 

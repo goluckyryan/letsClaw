@@ -6,9 +6,9 @@ what they render and how hard they try to stay connected.
 
 | | `source/chat.py` | `web/app.js` | `source/discord_client.py` |
 |---|---|---|---|
-| lines | ~600 | ~1600 | ~1300 |
+| lines | ~640 | ~2220 | ~2310 |
 | default session | `terminal` | `web` | `<server>-<channel>` |
-| reasoning | live, dimmed | live, collapsible | **off** (`reasoning=0`) |
+| reasoning | live, dimmed | live, foldable — off / `▸` / `▾` | **off** (`reasoning=0`) |
 | stats `⚡` | yes | yes | no |
 | tool calls | yes | yes | no |
 | reconnect | **none** | auto, backoff | auto, plus idle-detach |
@@ -55,8 +55,24 @@ editable — its Save button posts to `POST /config`, which rewrites just that
 block and reloads it live, so the rest of the file, comments included, is
 never touched by the browser.
 
+A **Media** panel (🖼️, beside it in the same sidebar foot, backed by
+`GET /files`) grids every picture in `webui.files_dir` — where the agent's
+`show_image` tool puts them — newest first and capped at 500. Clicking a tile
+opens the same lightbox an inline image does; a `this session` toggle narrows
+the grid to what the open transcript is showing, read off the log rather than
+tracked as the session runs; and 🗑 deletes the file through
+`DELETE /files/<name>`, unless `webui.files_delete` is false. It is a second
+overlay built from the Settings panel's own box and close button, deliberately:
+two hand-rolled modals drift apart on the first theme change.
+
+Neither panel exists in the terminal or on Discord, and neither is a slash
+command. They are buttons, like the sidebar's `+`, `✎` and `✕` — a WebUI
+affordance over an HTTP route, not a protocol feature two of the three clients
+would have to refuse.
+
 Does the most: session sidebar (polling `GET /sessions` every 5 s), markdown
-rendering, collapsible thinking blocks with a live token count, rename and
+rendering, foldable thinking blocks with a live token count (`🧠 think` cycles
+off / folded / open, and each block overrides it), rename and
 delete, the model picker, the rollover prompt, and auto-reconnect with
 exponential backoff that replays from `last_seq`.
 
@@ -100,7 +116,9 @@ Slash commands are registered as a real `app_commands.CommandTree`
 for DMs, up to an hour to propagate), guarded to run once per process rather
 than per reconnect.
 
-Full record: [decisions/2026-09-25-discord-client.md](decisions/2026-09-25-discord-client.md).
+Full record: the [Discord Client section of the
+README](../README.md#discord-client) — what it does, what it refuses, and how
+to configure it.
 
 ---
 

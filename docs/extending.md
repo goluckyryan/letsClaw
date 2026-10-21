@@ -66,13 +66,16 @@ caught and turned into a string the model can read.
 CPU-bound — it must go **off the event loop**. The core is shared; one slow
 read stalls every session's token stream
 ([principle 14](design-principles.md#14-the-core-is-shared-so-nothing-may-block-it)).
-The three file tools use `to_thread` for exactly this. If you spawn a process,
+The four file tools use `to_thread` for exactly this. If you spawn a process,
 copy `exec`'s `start_new_session=True` and `_kill_group` handling so a
 cancellation does not leave it detached.
 
 Tool schemas are counted into the prompt budget **once per core**
 (`SessionManager.__init__`), not per session. A verbose description is paid for
-by every session, every turn.
+by every session, every turn. Measure it rather than guessing: send the same
+prompt to the server with and without the new schema and diff `prompt_tokens`.
+`show_image`, one sentence of description and two parameters, costs **121** —
+see [tokens.md](tokens.md).
 
 ## Add a command
 
@@ -108,6 +111,49 @@ ones a test will catch for you. See
 
 If the command mutates session state that other attached clients should see,
 emit a `session_state` event as well as returning the reply.
+
+## Add an HTTP route
+
+**`build_app()` in `source/server.py`**, plus a handler beside the others.
+
+Pick the guard before you write the handler, because it is the decision the
+reviewer will check first:
+
+| | |
+|---|---|
+| read-only | `if not _authorised(request): raise web.HTTPUnauthorized()` |
+| anything that writes | `_guard(request)` — auth **and** same-origin |
+| open on purpose | neither, and say in the docstring why it holds no secrets |
+
+`_authorised` is the project's single answer to "who is asking". Do not write a
+header-only or query-only variant for one route: a second definition is how two
+of them end up disagreeing about the same request. The query-token form exists
+because an `<img>` cannot send a header; a browser-driven write is gated by
+`_same_origin` instead.
+
+If two routes answer the same question about a path, extract it. `/files` has
+three — read, list, delete — and they share `_files_target()` for exactly this
+reason: a listing that offers a file the read route refuses is a tile that is
+broken forever, and a delete that resolves a path the read route would not is a
+hole. One function, three callers, no way for them to drift apart.
+
+**The trap, the same shape as the command one above:** a route is not one
+listing either. Nothing tells you if you miss one:
+
+| | |
+|---|---|
+| `source/server.py` | `build_app`'s `add_routes` — register a path's methods **adjacently**, or aiohttp builds a second resource for the same pattern. It resolves either way, which is what makes this easy to leave wrong |
+| `source/server.py` | the module docstring's HTTP line |
+| `docs/protocol.md` | the route table — method, auth, and what it returns |
+| `README.md` | the route table, and the auth paragraph under it if the route is an exception to how the token travels |
+| `docs/architecture.md` | the `_host_guard` paragraph, if it is a read route that exposes anything |
+| `tests/` | `test_files.py` is the model: an aiohttp test server, no core and no browser. Every refusal is a case, and a delete test asserts the **disk**, not just the status — a 404 from a handler that already unlinked passes a status-only check |
+
+Blocking work goes through `asyncio.to_thread`, like everywhere else: a
+`scandir` over someone's photo library stalls every session's token stream
+([principle 14](design-principles.md#14-the-core-is-shared-so-nothing-may-block-it)).
+Cap anything that returns a list, and say so in the body — `/files` sends
+`total` and `truncated` beside its 500.
 
 ## Add a client
 
@@ -146,10 +192,11 @@ nothing. That is where to add a ninth.
 Schema quirk: `default_model` is a **sibling** of the model entries, not a
 top-level key, and `known_models` filters it out by name.
 
-If the model is a hosted assistant rather than a local thinking model, consider
-`strip_directives: true` — the `## Forced conclusion` text reads as a standing
-instruction to some hosted models and can suppress the answer entirely
+Nothing extra is needed for a hosted assistant: the `# Directives` group in
+`base.md` is stripped from every model's prompt, so the `## Forced conclusion`
+text cannot be read as a standing instruction and suppress the answer
 ([principle 2](design-principles.md#2-behavior-is-markdown-and-some-of-that-markdown-is-machinery)).
+The per-model `strip_directives` key that used to arrange this is gone.
 
 ## Change the behavior prompt
 
@@ -198,5 +245,8 @@ and read it in `load_state()` with a default.
   configuration go in `config.example.yaml`.
 - `models/sessions/*.md` are gitignored too (except the README) — their
   contents go straight into system prompts.
-- If you changed a decision rather than an implementation, add a record under
-  [`decisions/`](decisions/) rather than only a commit message.
+- If you changed a *decision* rather than an implementation, say the why in
+  the doc section that describes the behaviour — not only in the commit
+  message. There is no `decisions/` directory: a decision lives beside the
+  thing it decided, in [design-principles.md](design-principles.md) or the
+  relevant page, or it is lost.

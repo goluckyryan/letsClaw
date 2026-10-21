@@ -65,15 +65,6 @@ models:
     # it, or until a round comes back having written nothing.
     # false = no pad: a cut-off round falls back to the base.md directive.
     reasoning: true
-    # Keep the "## Checkpoint" and "## Forced conclusion" blocks out of the
-    # system prompt for this model. They are templates the core sends as user
-    # messages at the moment each applies, and they sit in base.md only so they
-    # can be tuned; a local thinking model ignores the copy in its prompt, but a
-    # hosted assistant reads the whole prompt as standing instruction and obeys
-    # it — Claude via ANL's Argo, told every turn that "this is not the final
-    # answer", replies with nothing at all. Extraction is unaffected either way.
-    # Leave false for local models; set true for a hosted API.
-    strip_directives: false
     # Hard wall for one turn, in seconds — a limit on a round, thinking model or
     # not. It also sets the HTTP client's read timeout, so a round that runs
     # longer is cut off and the turn cancelled (the conversation is saved).
@@ -252,7 +243,13 @@ core:
 # Agent tools
 tools:
   enabled: true
-  allow: [exec, read_file, write_file, list_dir]   # anything not listed is denied
+  allow: [exec, read_file, write_file, list_dir, show_image]  # anything not listed is denied
+                              # show_image copies a picture from anywhere on disk
+                              # into webui.files_dir so an answer can display it.
+                              # It is the only tool that moves a file onto the
+                              # side reachable over HTTP by anyone holding
+                              # core.token — drop it from this list and the agent
+                              # can still read and plot, it just cannot show you.
   exec_timeout: 120           # seconds
   max_output_chars: 8000      # tool output truncation
   # workdir: "/home/you/project"  # base dir for exec and relative paths.
@@ -333,7 +330,19 @@ webui:
   # (a traversal or a symlink out of it is refused) and must name an image
   # extension, because this is the one route that turns model output into a
   # filesystem read. Repo-relative unless absolute. Default: state/files
+  #
+  # The show_image tool copies pictures in here, and the WebUI's 🖼️ media panel
+  # lists and deletes what is here — so this directory is shared by every
+  # session and is not a place to point at anything you would miss.
   files_dir: "state/files"
+  # Whether the media panel's 🗑 button may unlink from files_dir. Default: true.
+  # This is not a security control: the same core.token already reaches an
+  # unconfined exec, so anyone who can press the button can already remove the
+  # directory. It is here for the other case — a files_dir pointed at a photo
+  # library or a shared mount, where the pictures are not disposable and a
+  # stray click is not recoverable. Off = the button is not rendered, and the
+  # route answers 403 if something calls it anyway.
+  files_delete: true
   # Page theme: auto = follow the OS (default), dark, or light. A typo falls
   # back to auto. /reload re-themes every open tab immediately (it rides the
   # reloaded event — a stylesheet cannot be re-fetched under a live tab).

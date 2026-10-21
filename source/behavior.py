@@ -20,6 +20,11 @@ import paths
 
 logger = logging.getLogger("letclaw.behavior")
 
+# The heading base.md gathers the two directives under. Everything from here to
+# the next "# " heading is machinery, not behavior, and never reaches the system
+# prompt — see strip_directive_sections.
+DIRECTIVES_MARKER = "# Directives"
+
 CONCLUDE_MARKER = "## Forced conclusion"
 CONCLUDE_FALLBACK = ("Your reasoning was cut off at the token limit. Stop "
                      "reasoning now and give your best final answer. If you "
@@ -46,26 +51,49 @@ DEFAULT_BASE_FILE = "models/base.md"
 
 
 def strip_directive_sections(base_behavior):
-    """The base behavior minus the two blocks the core sends on its own.
+    """The base behavior minus the blocks the core sends on its own.
 
     "## Checkpoint" and "## Forced conclusion" are templates, not behavior: each
     is extracted and sent as a *user* message at the one moment it applies. They
-    live in base.md so they can be tuned without a code change, but they are
-    also, redundantly, part of every system prompt — and a model that reads its
-    whole system prompt as standing instruction will simply obey them. Claude
+    live in base.md so they can be tuned without a code change, but a copy in
+    the system prompt is at best redundant and at worst obeyed — a model that
+    reads its whole prompt as standing instruction simply follows them. Claude
     Opus 5 over Argo answers nothing at all, having been told on every turn that
     "This is not the final answer".
 
-    Local thinking models ignore them, so stripping is opt-in per model
-    (models.<name>.strip_directives) rather than done for everyone. Extraction
-    is unaffected: the directives still reach the model when they are meant to.
+    So this runs for every model, not just the ones known to trip over it: the
+    prompt should carry behavior and nothing else, and a local model that merely
+    ignores the copy was still paying for it in tokens. Extraction is
+    unaffected — it reads the file as written, so the directives still reach the
+    model at the moment they are meant to.
+
+    Two shapes are recognised. A "# Directives" group runs to the next "# "
+    heading, which in practice is the end of the file; that is what base.md
+    uses, and it takes the group's own preamble out of the prompt along with the
+    two sections. A bare "## Checkpoint" or "## Forced conclusion" with no group
+    around it runs to the next heading of either level, which is how the file
+    was laid out before the group existed.
     """
-    out, skipping = [], False
+    out, skipping, in_group, cut = [], False, False, False
     for line in base_behavior.splitlines(keepends=True):
-        if line.startswith("## "):
+        if line.startswith("# "):
+            in_group = line.strip() == DIRECTIVES_MARKER
+            skipping = in_group
+        elif line.startswith("## ") and not in_group:
+            # Inside the group these are already being skipped, and letting them
+            # reset `skipping` would end the group at its own first subsection.
             skipping = line.strip() in (CHECKPOINT_MARKER, CONCLUDE_MARKER)
-        if not skipping:
+        if skipping:
+            cut = True
+        else:
             out.append(line)
+    # Byte-for-byte when there was nothing to cut. This runs for every model
+    # now, so the base file of an install that has no directive sections must
+    # come through untouched — the rstrip below is tidying after a removal, not
+    # a reformat anyone asked for, and the prompt it would change is the
+    # tokenised prefix of every live session.
+    if not cut:
+        return base_behavior
     return "".join(out).rstrip() + "\n"
 
 
@@ -218,11 +246,14 @@ class BehaviorStore:
         """
         base = self.read(
             self.config.get("behavior", {}).get("base_file") or DEFAULT_BASE_FILE)
-        # Per model, because it is a property of how the model reads a prompt,
-        # not of the prompt. Applied after the cached read so the cache still
-        # holds the file as written.
-        if entry.get("strip_directives"):
-            base = strip_directive_sections(base)
+        # Applied after the cached read, so the cache still holds the file as
+        # written and extraction keeps seeing the directives. Unconditional:
+        # they are machinery the core sends when it sends them, and no model
+        # needs a standing copy in its prompt. This was once opt-in per model
+        # (models.<name>.strip_directives); that key is gone, and an old
+        # config.yaml carrying it still loads, since unknown model keys are
+        # ignored.
+        base = strip_directive_sections(base)
         model = self.read(entry.get("behavior_file", "models/default.md"))
 
         session = ""

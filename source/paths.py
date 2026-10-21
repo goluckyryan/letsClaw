@@ -70,5 +70,31 @@ def resolve(path, default=None):
     return _abs(Path(path or default).expanduser())
 
 
+# Where the agent puts pictures it wants shown. Not under web/: that directory is
+# the app's own source, served unauthenticated to anyone who loads the page, and
+# generated output does not belong in it. state/ is already gitignored.
+DEFAULT_FILES_DIR = "state/files"
+
+# Served by extension, so a mistyped path cannot turn /files into a general
+# arbitrary-file-read route for anyone holding the token.
+#
+# Here rather than in server.py because three modules now need the same answer:
+# the route that serves a picture, the route that lists them, and the show_image
+# tool that puts one there. tools.py cannot import server (server -> core ->
+# tools), and two copies of this map would drift the first time one gained a
+# format the other refused.
+IMAGE_TYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+    ".bmp": "image/bmp", ".ico": "image/x-icon", ".avif": "image/avif",
+}
+
+
+def files_root(config):
+    """The directory /files serves, as an absolute path."""
+    configured = (config.get("webui", {}) or {}).get("files_dir") or DEFAULT_FILES_DIR
+    return resolve(configured).resolve()
+
+
 def _abs(p: Path) -> Path:
     return p if p.is_absolute() else REPO_ROOT / p

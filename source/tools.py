@@ -15,12 +15,24 @@ searching the journal needs the matches that fell in the middle.
 import asyncio
 import json
 import os
+import re
+import shutil
 import signal
 from pathlib import Path
 
 import config as config_lib
+import paths
 
 DEFAULT_MAX_OUTPUT = 8000
+
+# A picture bigger than this is not a plot, and state/ is not where it belongs.
+MAX_IMAGE_BYTES = 25 * 1024 * 1024
+
+# The name show_image hands back has to be one the WebUI's renderer will accept,
+# and that renderer (IMG_OK in web/app.js) takes word characters, dots and
+# hyphens only. Keeping the same shape here means a name this tool invents can
+# never be a name the browser then refuses to draw.
+_SAFE_NAME = re.compile(r"[^\w.-]+")
 
 
 def _truncate(s: str, limit: int) -> str:
@@ -78,18 +90,25 @@ def _kill_group(proc):
             pass
 
 
-def build_tools(cfg: dict | None = None, workdir: str | None = None) -> list:
+def build_tools(cfg: dict | None = None, workdir: str | None = None,
+                files_dir=None) -> list:
     """Create the enabled tools from the config's tools: section.
 
     workdir is the default working directory for exec and the base the model is
     told about. It matters in the core: the daemon's own cwd is not the shell cwd
     the user was in, so relative paths would otherwise resolve somewhere else.
+
+    files_dir is webui.files_dir, resolved. It arrives as a parameter rather
+    than being read here because this function is handed only the tools:
+    section, and the one caller that has the whole config is the core.
     """
     cfg = cfg or {}
     base = str(Path(workdir).expanduser()) if workdir else "."
+    pics = Path(files_dir) if files_dir else paths.resolve(paths.DEFAULT_FILES_DIR)
     if not cfg.get("enabled", False):
         return []
-    allow = cfg.get("allow", ["exec", "read_file", "write_file", "list_dir"])
+    allow = cfg.get("allow", ["exec", "read_file", "write_file", "list_dir",
+                              "show_image"])
     # `allow: exec` is the natural way to write a one-item list and YAML hands
     # it back as a string, which set() would spell out into {'e','x','c'} —
     # four tool names that do not exist, and every real tool quietly gone.
@@ -167,6 +186,59 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None) -> list:
     async def list_dir(path: str = ".") -> str:
         return await asyncio.to_thread(_list_dir, path)
 
+    def _show_image(path: str, name: str | None = None) -> str:
+        """Copy an image into files_dir so the WebUI can serve it.
+
+        This is the boundary. `exec` and `read_file` already reach any path this
+        process can; this is the only tool that moves a file from that
+        unconfined side to the side reachable over HTTP by anyone holding
+        core.token. That is the whole reason it copies rather than, say,
+        registering a path: what is servable stays exactly "what is in one
+        directory", which is the invariant /files is built on.
+        """
+        src = Path(path).expanduser()
+        try:
+            src = src.resolve()
+        except (OSError, ValueError):
+            return f"error: cannot resolve {path}"
+        if not src.is_file():
+            return f"error: not a file: {path}"
+        ext = src.suffix.lower()
+        if ext not in paths.IMAGE_TYPES:
+            # Refused here rather than at the route, where it would surface as
+            # a tile that will not load and no reason why.
+            return (f"error: {src.name} is not a servable image. "
+                    f"Convert it first — these work: "
+                    f"{', '.join(sorted(paths.IMAGE_TYPES))}")
+        size = src.stat().st_size
+        if size > MAX_IMAGE_BYTES:
+            return (f"error: {src.name} is {size // 1048576} MB, over the "
+                    f"{MAX_IMAGE_BYTES // 1048576} MB limit. Downsample it first.")
+
+        stem = _SAFE_NAME.sub("-", Path(name).name if name else src.name).strip(".-")
+        if not stem:
+            stem = "image"
+        if not stem.lower().endswith(ext):
+            stem += ext
+        pics.mkdir(parents=True, exist_ok=True)
+        dest = pics / stem
+        # files_dir is shared by every session, so overwriting a name that is
+        # already taken would let one conversation silently replace a picture
+        # another is still showing. Suffix instead -- unless it is byte-identical,
+        # in which case the copy that is already there is the answer.
+        if dest.exists():
+            if dest.stat().st_size == size and dest.read_bytes() == src.read_bytes():
+                return f"{dest.name} (already there) — now write ![…]({dest.name}) to show it"
+            base, n = dest.stem, 2
+            while dest.exists():
+                dest = pics / f"{base}-{n}{ext}"
+                n += 1
+        shutil.copyfile(src, dest)
+        return f"{dest.name} — now write ![a caption]({dest.name}) to show it"
+
+    async def show_image(path: str, name: str | None = None) -> str:
+        return await asyncio.to_thread(_show_image, path, name)
+
     tools = {
         "exec": Tool(
             "exec",
@@ -207,6 +279,21 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None) -> list:
                                      "description": "Directory path (default: current dir)"}},
              "required": []},
             list_dir, max_out,
+        ),
+        # Terse on purpose: every tool schema is paid by every session on every
+        # turn, so a sentence here costs more over a week than the handler does
+        # in a year. See docs/tokens.md.
+        "show_image": Tool(
+            "show_image",
+            "Copy an image file where the user can see it. Returns the name to "
+            "put in ![caption](name) in your answer.",
+            {"type": "object",
+             "properties": {
+                 "path": {"type": "string", "description": "Path to the image"},
+                 "name": {"type": "string",
+                          "description": "Name to show it under (default: its own)"}},
+             "required": ["path"]},
+            show_image, max_out,
         ),
     }
     return [tools[k] for k in tools if k in allow]
