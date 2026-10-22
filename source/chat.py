@@ -246,6 +246,15 @@ class Renderer:
                 for ln in e["handoff_text"].splitlines() or [""]:
                     self.line(f"     {ln}")
             self.line(f"   ✨ New session  {e['used']}/{e['budget']} tok")
+        elif t == "digest_done":
+            # Laid out like the handoff above it, because it is the same kind
+            # of thing one scale down: a model-written summary that has already
+            # replaced what it summarises. The grep line pointing at the
+            # journal is the digest's own last line, so it needs no row here.
+            self.line(f"\n   🗜️  Turn {e['turn_id']} collapsed to a "
+                      f"{e['tokens']} tok digest:")
+            for ln in (e.get("digest_text") or "").splitlines():
+                self.line(f"     {ln}")
         elif t == "session_state":
             if e["what"] == "cleared":
                 self.line("\n🧹 History cleared (/rollover archives it instead).")

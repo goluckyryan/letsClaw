@@ -10,7 +10,7 @@ what they render and how hard they try to stay connected.
 | default session | `terminal` | `web` | `<server>-<channel>` |
 | reasoning | live, dimmed | live, foldable — off / `▸` / `▾` | **off** (`reasoning=0`) |
 | stats `⚡` | yes | yes | no |
-| tool calls | yes | yes | no |
+| tool calls | yes | yes | one grey line each (`show_tools`) |
 | reconnect | **none** | auto, backoff | auto, plus idle-detach |
 | `last_seq` | **not sent** | yes | yes |
 | auth | env/config | token in the page | config |
@@ -48,7 +48,11 @@ immediately. **Vanilla JS, no build step, no dependencies** — edit and reload.
 
 A **Settings** panel (⚙️ at the bottom of the session sidebar, backed by
 `GET /config`) shows every parameter in `config.yaml`, grouped by section,
-with secrets masked behind a reveal toggle and the restart-only keys
+with secrets never shown at all — `/config` replaces `core.token`,
+`discord.token` and every `models.*.api_key` with `********` before the response
+leaves the core, so the panel prints `•••••••• set — in config.yaml` where a
+secret lives (there used to be a reveal toggle; it could only ever reveal the
+placeholder, so it was removed) — and the restart-only keys
 (`core.bind`, `core.port`, `logging.file`, `discord.enabled`) badged.
 Only the `webui` section is
 editable — its Save button posts to `POST /config`, which rewrites just that
@@ -94,8 +98,19 @@ channel snowflake as the key in `state/discord_names.json` so a channel rename
 follows rather than forking the conversation. `migrate_names()` brings existing
 sessions across at startup.
 
-Renders text only. No reasoning, no stats, no tool traffic — and it is still a
-complete client, which is the useful thing to know if you are writing a fourth.
+Renders text and one small grey line per tool call. No reasoning and no
+stats — and it is still a complete client, which is the useful thing to know
+if you are writing a fourth.
+
+**The tool line is not progress reporting.** A turn is posted once, at
+`turn_end`, so nothing here is live; the line exists because a tool round
+would otherwise be a *gap*. The `<tool_call>` block is lifted out of the text
+stream by `ToolMarkupFilter`, but the newlines around it are not, so a round
+the model did not introduce arrived as a blank band in the middle of the
+answer. `_tool_call()` closes that band and writes what the call was for —
+the `reason` every tool schema asks for (`tools.py:REASON_KEY`), or the
+tool's name when the model did not give one. `show_tools: false` drops the
+line and keeps the trimming: the blank was a bug, not a setting.
 
 **Answers are chunked** by `source/chunker.py` (fence-aware, so a code block is
 never split mid-fence). Past `max_messages` chunks the opening chunks go out

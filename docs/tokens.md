@@ -23,7 +23,7 @@ are used strictly from here on.
 |---|---|
 | **history** | the list of messages **letsClaw** keeps on its own side: the system message, then every question, answer, tool call and tool result. It lives in the core's memory and on disk. It is the only part letsClaw can edit, trim or collapse. |
 | **prompt** | what is actually **sent to the model on one request**: the history, plus the tool schemas, rendered into one block of text. The model gets this and nothing else — it remembers nothing between requests. |
-| **tool schema** | the machine-readable description of one tool — its name, what it is for, and the arguments it takes. The model's menu. See the box below; there are five of them here, costing **715 tokens** on every round that offers tools. |
+| **tool schema** | the machine-readable description of one tool — its name, what it is for, and the arguments it takes. The model's menu. See the box below; there are five of them here, costing **~577 tokens** locally on every round that offers tools (more at the server — see the box below). |
 | **window** | the model's hard ceiling on how big a prompt can be. Here, **262,144 tokens** (`context_length` in `config.yaml`; the clients call it `budget`). Fixed by the model, not by letsClaw. |
 | **used** | how much of the window the current prompt would take. This is what the `⚡` line and the WebUI gauge show as `used/budget`. |
 | **turn** | one question from you and the final answer back. |
@@ -68,9 +68,10 @@ then **dropped**; it never joins the history and is never re-sent.
       "properties": {
         "command": {"type": "string",  "description": "Shell command to run"},
         "workdir": {"type": "string",  "description": "Working directory (default: current dir)"},
-        "timeout": {"type": "integer", "description": "Max seconds to wait (default: 1200)"}
+        "timeout": {"type": "integer", "description": "Max seconds to wait (default: 1200)"},
+        "reason":  {"type": "string",  "description": "Why, in one short phrase"}
       },
-      "required": ["command"]
+      "required": ["command", "reason"]
     }
   }
 }
@@ -87,30 +88,50 @@ what letsClaw does on purpose during a thinking-pad resume.
 
 What the five cost:
 
-| tool | our count | |
+| tool | our count | of which `reason` |
 |---|---|---|
-| `exec` | 118 tok | |
-| `read_file` | 65 tok | |
-| `write_file` | 89 tok | |
-| `list_dir` | 75 tok | |
-| `show_image` | 109 tok | |
-| sum of the JSON | ~462 tok | what letsClaw counts |
-| **what the server charges** | **715 tok** | measured |
+| `exec` | 144 tok | 23 |
+| `read_file` | 90 tok | 23 |
+| `write_file` | 114 tok | 23 |
+| `list_dir` | 99 tok | 22 |
+| `show_image` | 134 tok | 23 |
+| sum of the JSON | ~577 tok | what letsClaw counts |
+| **what the server charges** | **not re-measured** | was 715 at ~462 local |
+
+**`reason` is the other one worth watching.** Every tool carries it
+(`tools.py:REASON_KEY`) and no handler ever receives it: it exists so a client
+that will not show the command can still say why the call was made, which is
+what the Discord bot does with it. The field is four words of description and
+one `required` entry, and it still costs **114 tokens on every request of every
+tool-enabled session** — 463 → 577 — because it is paid once per tool, five
+times over. Spelling out what a good reason looks like *here* instead of in
+`models/base.md` cost 174. That is the whole lesson of this page in one field:
+the per-tool slot is the expensive place to explain anything, and the system
+message, sent once, is the cheap one.
+
+The server figure below has **not** been re-measured since. 715 was the charge
+when the local count was 462; the re-render scales with the JSON, so expect
+roughly 880–900, but do not quote it until someone diffs `prompt_tokens` for
+real. Measured numbers and extrapolated ones do not go in the same table.
 
 `show_image` is the newest and the one worth watching, because it is the one
 whose schema was written after this page existed. It adds **121 tokens to every
 request of every tool-enabled session, forever** — measured by diffing
 `prompt_tokens` for the same prompt with and without it. That is why its
-description is one sentence: four tools cost 594 at the server, five cost 715,
-and the gap is paid on every round whether a picture is wanted or not. Drop it
-from `tools.allow` and you get those 121 back.
+description is one sentence: four tools cost 594 at the server, five cost 715
+— both measured before `reason` existed — and the gap is paid on every round
+whether a picture is wanted or not. Drop it from `tools.allow` and you get
+those 121 back.
 
 The gap is not a rounding error, and it is why the schema term in section 8
 is measured from the server rather than counted locally. The server does not
 pass your JSON through — it **re-renders** the schemas into Qwen's own
 chat-template format, wrapping them in section markers and instructions on how
 to emit a tool call. None of that scaffolding is visible to a counter that only
-looks at `json.dumps()`, so letsClaw sees 462 where the model sees 715.
+looks at `json.dumps()`, so letsClaw saw 462 where the model saw 715. Those
+two are the pre-`reason` pair, and they are quoted together on purpose: the
+ratio is the useful part, and it is the only part that survives a change to
+the schemas.
 
 ### The floor: what an empty session already costs
 
@@ -118,12 +139,22 @@ Add the two always-present pieces together and you get the floor:
 
 ```
   system message (your behavior .md files) ....... 1,264
-  tool schemas (the 5 tools above) ...............   715
+  tool schemas (the 5 tools above) ...............   715   ← pre-`reason`
   ───────────────────────────────────────────────────────
   the floor — what an empty session already uses . 1,979
 ```
 
-A session with nothing in it already reads `1979/262144`. And `/clear` does not
+Both figures are server-measured and **both are out of date**, because
+`reason` moved both of them: the schemas gained 114 locally (462 → 577) and
+`models/base.md` gained 82 explaining what a good reason reads like
+(1,292 → 1,374, counted with `token_counter.count_text`). Those are the local
+counts; the floor has risen by whatever the pair re-renders to. The arithmetic above is kept as it was
+rather than quietly patched with a guess — a floor is the one number on this
+page that is worth nothing if it is estimated. Re-measure it the way section 8
+says to, by reading `prompt_tokens` off an empty session, and replace both
+lines at once.
+
+A session with nothing in it read `1979/262144` when that was measured. And `/clear` does not
 clear it: wiping the conversation returns you *to* the floor, not to zero,
 because the behavior files and schemas reload immediately.
 

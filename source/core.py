@@ -2191,9 +2191,21 @@ class Session:
         # would have the very next check roll over to relieve pressure this
         # just relieved.
         self._last_used = None
-        self.emit(ev("notice", level="info",
-                     text=f"turn {self.turn_id} collapsed to a {count_text(digest)} tok "
-                          f"digest (the full record is in the journal)"))
+        # digest_text is the summary itself and not merely its size, for the
+        # same reason rollover_done carries handoff_text: from here on this is
+        # what the model is shown in place of the turn, and a token count
+        # cannot be checked against the work it replaced. A reader who can see
+        # the digest can tell a faithful one from a lossy one while the turn it
+        # describes is still in mind; a reader who cannot find out at the point
+        # the model acts on the gap.
+        #
+        # Its own event rather than the `info` notice this replaces, on both
+        # counts that made that notice the wrong carrier: a notice is one line
+        # of text, and Discord drops every notice that is not a warning
+        # (discord_client.handle), so the one client with no other window into
+        # the session was told nothing at all.
+        self.emit(ev("digest_done", turn_id=self.turn_id,
+                     tokens=count_text(digest), digest_text=digest))
 
     async def _after_turn(self, measured_used):
         trip = int(self.budget * self.rollover_pct / 100) if self.budget and self.rollover_pct else 0
@@ -2539,6 +2551,20 @@ class Session:
                 self.rollover_count = 0
                 self.rollover_pct = self._configured_rollover_pct()
                 self._last_used = None
+                # Turn numbering starts over with the rest of it. It is not
+                # part of the history, so wiping the history left turn 214
+                # sitting on a session with no turns in it — and the number is
+                # load-bearing twice over: it labels the journal blocks and the
+                # `[full record: grep -n '^## turn N ' ...]` pointer, so a
+                # surviving high count makes the first turn of the new window
+                # point at a grep that matches nothing. /clear keeps it on
+                # purpose: those archives still exist, and their numbering has
+                # to keep matching. last_seq deliberately does not reset —
+                # restoring it is how a client with an old cursor learns it
+                # missed something rather than being handed a sequence that
+                # quietly restarted underneath it.
+                self.turn_id = 0
+                self.round_id = 0
                 await self.close_journal()
                 files, freed = await store.purge_archives(self.session_id,
                                                           self.config)

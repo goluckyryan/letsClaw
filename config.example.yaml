@@ -228,6 +228,12 @@ core:
 #   #       the reason to keep a limit; a private one is the reason not to.
 #   max_messages: 8
 #   max_lines: 17         # soft cap per message; Discord collapses tall ones
+#   # A turn is posted once, at the end, so a tool round shows up as nothing at
+#   # all — and the newlines that sat around the call survive as a blank gap in
+#   # the middle of the answer. On, one small grey line per call says why it was
+#   # made (the `reason` the model puts in every call's arguments, falling back
+#   # to the tool's name). Off keeps the gap closed but drops the lines.
+#   show_tools: true
 #   # Name sessions after the server and channel — "dudus-den-solaris" — rather
 #   # than the raw snowflake, so the WebUI sidebar reads like Discord does.
 #   # The snowflake is still the key: the bot records the name it gave each
@@ -288,6 +294,8 @@ conversation:
   # watched a few turns and confirmed the model greps the journal rather than
   # redoing the work. It requires `journal: true` and silently declines on any
   # turn the journal did not record — the context must never be the only copy.
+  # That watching is literal: every digest is printed as the turn closes, so
+  # you read the text that replaced the turn rather than a count of its size.
   #
   # A model entry may override this, and it is the only conversation setting
   # that may: the digest is an extra round billed to whichever model the

@@ -232,24 +232,23 @@ header {
 .brand { font-size: 16px; white-space: nowrap; }
 .spacer { flex: 1; }
 
-/* Keep the header on one row wherever one row actually fits. The sidebar takes
-   210px off it, leaving 1070 at the 1280 default for 1155 of content, and the
-   status pill was the bit that wrapped off the end. flex-wrap places items at
-   their base size *before* shrinking any of them, so permitting shrink is not
-   enough — the wrap itself has to go, and then something has to yield.
-   Not the buttons: they are labelled on purpose (index.html says why).
-   Not the gauge: its trip marker sits at 90% of its width and the label has to
-   stay clear of it, so narrowing it collides the two.
-   That leaves the model select, which truncates harmlessly. It floors at 90px,
-   which puts the narrowest one-row layout at 1048 + 210 of sidebar — hence the
-   1260 breakpoint. Below it, wrapping is still the honest answer: better a
-   second row than a clipped one. */
-@media (min-width: 1260px) {
-  header { flex-wrap: nowrap; }
-  header > button, .brand, .gauge, #status, #side-toggle { flex-shrink: 0; }
-  .field { min-width: 0; }
-  .field select { min-width: 90px; width: 100%; }
-}
+/* The header wraps rather than clipping, and nothing in it shrinks.
+
+   flex-wrap places items at their base size *before* it shrinks any of them,
+   so a shrinkable .field is a trap: it collapses toward 0 while #model's own
+   200px floor holds, the select spills out of its label, and whatever comes
+   later in DOM order — the gauge — paints on top of it. Rigid items make wrap
+   do the only honest job it can: measure the header's real width and start a
+   second row when the row is genuinely full.
+
+   A viewport media query cannot decide that. The header only gets the width
+   the sidebar leaves it, and the drag handle lets the user change that from
+   160px to 480px, so any breakpoint baked from the 210px default is wrong for
+   someone else's session list. Measured: with the default sidebar the header
+   needs 1492px of viewport for one row; at the 480px maximum it needs 1750px.
+   Wrapping handles both without knowing either. */
+header > button, .brand, .gauge, #status, #side-toggle, .field { flex-shrink: 0; }
+.field select { width: 100%; }
 
 .field {
   display: flex;
@@ -267,6 +266,15 @@ header {
   border-radius: 6px;
   padding: 4px 7px;
   max-width: 220px;
+}
+
+/* The model selector gets a floor: a model id is long
+   (qwen38-flash-spark0) and at the narrow widths the header shrink rule above
+   allows, it truncated to something unreadable. max-width: none lifts the
+   shared 220px cap so the control can still grow to fit a long id. */
+#model {
+  min-width: 200px;
+  max-width: none;
 }
 
 header button {
@@ -738,6 +746,25 @@ main {
 }
 .roll button.yes { background: var(--warn); border-color: var(--warn); color: #12141a; }
 .roll .slab-box[data-answered] button { display: none; }
+
+/* The turn digest: the handoff's little sibling, and drawn like one. Dim and
+   folded shut by default, because one of these lands at the end of every turn
+   — see the digest_done case in app.js. */
+.digest summary {
+  cursor: pointer;
+  color: var(--dim);
+  font: 12px var(--sans);
+}
+.digest pre {
+  margin: 6px 0 0;
+  padding: 6px 10px;
+  background: var(--bg3);
+  border-radius: 5px;
+  font: 12px/1.5 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--fg);
+}
 
 .sep {
   max-width: 900px;

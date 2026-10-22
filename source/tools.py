@@ -25,6 +25,24 @@ import paths
 
 DEFAULT_MAX_OUTPUT = 8000
 
+# Every tool takes this, and no handler ever sees it: it is there so a client
+# can say what the agent is doing while it does it. The Discord bridge is the
+# one that needs it — it posts a turn once, at the end, so a tool round that
+# the model did not introduce arrives as a blank gap between two paragraphs
+# and no sign of what happened in between.
+#
+# Four words, because this one is paid five times over: every tool schema goes
+# into every prompt of every session, so a description that reads nicely here
+# costs more in a week than the whole feature is worth. What a good reason
+# looks like is said once, in models/base.md, which is sent once. Spelling it
+# out here as well cost 174 tok/turn against the 114 this does, across the five
+# default tools. Most of that 114 is not the wording at all — it is the key, the
+# type and the `required` entry, five times over, and no phrasing gets it back.
+# The absolute figures live in docs/tokens.md and nowhere else, because they
+# move with `exec_timeout` and with every tool added.
+REASON_KEY = "reason"
+REASON_PARAM = {"type": "string", "description": "Why, in one short phrase"}
+
 # A picture bigger than this is not a plot, and state/ is not where it belongs.
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
 
@@ -42,18 +60,38 @@ def _truncate(s: str, limit: int) -> str:
     return f"{s[:half]}\n...[truncated {len(s) - limit} chars]...\n{s[-half:]}"
 
 
+def _with_reason(parameters):
+    """`parameters` plus the reason field, without touching the original.
+
+    Required, which is the only lever there is: nothing validates a tool call's
+    arguments, so listing it is a request to the model rather than a rule. A
+    model that ignores it costs nothing — the clients fall back to the tool's
+    name — which is why a missing reason is not an error anywhere.
+    """
+    out = dict(parameters)
+    out["properties"] = {**(parameters.get("properties") or {}),
+                         REASON_KEY: REASON_PARAM}
+    out["required"] = [*(parameters.get("required") or []), REASON_KEY]
+    return out
+
+
 class Tool:
     def __init__(self, name, description, parameters, handler,
                  max_output=DEFAULT_MAX_OUTPUT):
         self.name = name
         self.handler = handler
         self.max_output = int(max_output)
+        # A tool that declares its own `reason` means something by it and keeps
+        # it; for every other tool this is the presentation-only one above, and
+        # run_full drops it before the handler is called.
+        self.drops_reason = REASON_KEY not in (parameters.get("properties") or {})
         self.spec = {
             "type": "function",
             "function": {
                 "name": name,
                 "description": description,
-                "parameters": parameters,
+                "parameters": _with_reason(parameters) if self.drops_reason
+                              else parameters,
             },
         }
 
@@ -67,6 +105,10 @@ class Tool:
             kwargs = json.loads(arguments) if arguments else {}
             if not isinstance(kwargs, dict):
                 raise ValueError("arguments must be a JSON object")
+            if self.drops_reason:
+                # Presentation only. The handler has no parameter for it, so
+                # leaving it in would turn every call into a TypeError.
+                kwargs.pop(REASON_KEY, None)
             out = str(await self.handler(**kwargs))
         except (json.JSONDecodeError, TypeError, ValueError) as e:
             out = f"invalid arguments: {e}"

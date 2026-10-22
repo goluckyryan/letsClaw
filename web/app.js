@@ -1389,6 +1389,22 @@ function handle(e) {
     if (S.busy) setWaiting('thinking');
     return;
 
+  case 'digest_done': {
+    // Same shape as the handoff above, one scale down — but folded shut, where
+    // the handoff opens. A rollover is something you asked for and read once;
+    // a digest happens at the end of every turn, and a block of it unfolded
+    // each time would push the conversation off the screen. The headline is
+    // the line the old notice used to be, so nothing is lost by leaving it
+    // closed.
+    if (S.busy) clearWaiting();
+    slab('digest',
+      `<details><summary>🗜️ turn ${e.turn_id} collapsed to a ` +
+      `${num(e.tokens)} tok digest</summary>` +
+      `<pre>${esc(e.digest_text || '')}</pre></details>`, e);
+    if (S.busy) setWaiting('thinking');
+    return;
+  }
+
   case 'error':
     clearWaiting();
     setBusy(false);

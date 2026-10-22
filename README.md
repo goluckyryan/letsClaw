@@ -444,7 +444,7 @@ graph TD
     E --> R[Results back to model]
     R -->|next round| M
     Q -->|no| A[Final answer]
-    M -.->|rounds exhausted — one more call with no tool schemas| A
+    M -.->|no room for another tool round — one more call with no tool schemas| A
 ```
 
 Built-in tools: `exec` (shell), `read_file`, `write_file`, `list_dir`,
@@ -565,6 +565,16 @@ Each digest ends with the line that reaches what it replaced:
 and `models/base.md` tells the model to run it rather than re-derive — the
 same instruction a rolled-over window already gets, pointed at the segment it
 is still inside instead of a closed one.
+
+**You are shown the digest, not just told one happened.** Every client prints
+it as the turn closes — folded shut under a one-line headline in the WebUI,
+indented under the answer in the terminal, posted after the answer on Discord.
+It is the same treatment the rollover handoff gets, for the same reason: this
+text is what the model sees from here on in place of the turn, so a digest
+that quietly dropped the finding the turn existed to produce should be
+visible while the turn is still fresh in your mind, rather than inferred two
+turns later from an answer that has forgotten it. A token count could not
+have told you that.
 
 Three caps bound the digest, smallest wins, mirroring the handoff's: 600
 tokens absolute, `context_length / 50`, and what is free in the call itself.
@@ -764,9 +774,15 @@ from an older file keeps the id minted at startup and persists it on its next
 save.
 
 The trigger reads the server's own `usage.prompt_tokens`, so the percentage is exact.
-Servers that withhold usage fall back to a local estimate, scaled up deliberately —
-rolling over early costs a summary, rolling over late costs a rejected request. The
-`~` in the stats line marks an estimated figure.
+Servers that withhold usage fall back to a local estimate carrying three separately
+fitted corrections — `PROSE_SCALE` for the encoding difference, `MESSAGE_FRAMING_TOKENS`
+per message, and the tool block measured from a reported `prompt_tokens` where one
+exists (`schema_cost()` as the fallback formula). Not one upward multiplier: the single
+`×1.6` this replaced read +34% on an empty window and +47% on a full one, because it
+applied a ratio to errors that were not ratios ([`docs/tokens.md`](docs/tokens.md)).
+The direction it does err in is deliberate — rolling over early costs a summary,
+rolling over late costs a rejected request. The `~` in the stats line marks an
+estimated figure.
 
 ## Reasoning: the Notepad and the Answer Sheet
 
@@ -1174,8 +1190,8 @@ created on demand. `last_seq` replays what was missed while detached.
 session** — re-attaching never switches a live one, since that would move the
 conversation out from under anyone else attached to it.
 
-Client → core messages are `submit`, `command`, `rollover_reply`, `stop` and
-`ping`. `submit` may carry an `origin` naming who is speaking, for a client
+Client → core messages are `submit`, `command`, `rollover_reply`, `stop`,
+`steering` and `ping`. `submit` may carry an `origin` naming who is speaking, for a client
 where the session name does not say: the Discord bot sends
 `discord:<username>`, so one channel's shared session still records who typed.
 It is clamped to 64 characters and falls back to the session name.
@@ -1248,7 +1264,7 @@ Three tiers:
 |---|---|
 | **Live already** | `core.token`, `core.allowed_hosts`, the `state/` paths, and the model list `GET /models` serves — these are read per request, so the reload is what updates the file, not what plumbs it through |
 | **Reload picks it up** | **every setting in every model entry** — the engines are rebuilt from scratch, so `context_length`, `base_url`, `provider_name`, the sampling parameters, and all of the reasoning settings (`reasoning`, `max_tokens`, `max_output_tokens`, `max_pad_compactions`, `turn_timeout`, `answer_time_reserve`, `resume_mode`, `reasoning_effort`) come across; added and removed models; behavior files including `base.md`; the tool allowlist and `exec_timeout`; every `conversation.*` setting; `logging.level`; and, in the bot's own process, the Discord allowlist (`discord.users`, `mention_only`, `mention_list`) — see [Discord Client](#discord-client) |
-| **Restart-only** | `core.bind` and `core.port` — the socket is already bound, and rebinding drops every client, which is the thing being avoided — and the three keys that are read once when the log handlers are installed: `logging.file`, `logging.max_bytes`, `logging.backups`. **`/restart` applies these from any client** (see below); it is no longer a trip to the core's host. On the bot's side, **everything in `discord:` except the allowlist trio above** — `enabled` (`serve.sh` reads it before deciding to launch at all), the three that say *where* the bot logs in (`token`, `core`, `core_token`), and the four it reads once when it builds its `Settings` (`idle_detach_min`, `max_messages`, `max_lines`, `auto_names`). All of them restart the *bot*, which `/restart` does not touch — the bot is a sibling process, so restart it yourself |
+| **Restart-only** | `core.bind` and `core.port` — the socket is already bound, and rebinding drops every client, which is the thing being avoided — and the three keys that are read once when the log handlers are installed: `logging.file`, `logging.max_bytes`, `logging.backups`. **`/restart` applies these from any client** (see below); it is no longer a trip to the core's host. On the bot's side, **everything in `discord:` except the allowlist trio above** — `enabled` (`serve.sh` reads it before deciding to launch at all), the three that say *where* the bot logs in (`token`, `core`, `core_token`), and the five it reads once when it builds its `Settings` (`idle_detach_min`, `max_messages`, `max_lines`, `show_tools`, `auto_names`). All of them restart the *bot*, which `/restart` does not touch — the bot is a sibling process, so restart it yourself |
 
 An idle session takes the change immediately; one mid-turn takes it the moment that turn
 ends, and the reply says how many of each. **A setting a session changed for itself is
@@ -1299,10 +1315,12 @@ stop the turn. Reattach and the output you missed is replayed, then the conversa
 carries on. One turn at a time per session: a second submit is refused with `busy`
 rather than silently queued behind a context its sender never saw.
 
-**Events** (core → client): `hello` `turn_start` `text` `reasoning` `tool_call`
-`tool_result` `stats` `turn_end` `rollover_start` `rollover_ask` `rollover_done`
+**Events** (core → client): `hello` `turn_start` `text` `reasoning`
+`reasoning_stat` `tool_call` `tool_result` `stats` `turn_end` `steering`
+`rollover_start` `rollover_ask` `rollover_done` `rollover_failed`
 `session_state` `notice` `busy` `error` `response` `pong`.
-**Messages** (client → core): `submit` `command` `rollover_reply` `stop` `ping`.
+**Messages** (client → core): `submit` `command` `rollover_reply` `stop`
+`steering` `ping`.
 
 There is no attach message: the session name is a query parameter on the socket, and
 `hello` — the first event on every connection — carries the snapshot back. So attaching
@@ -1618,6 +1636,35 @@ send the thinking at all (`reasoning=0`), so none of it crosses the wire.
 **The answer arrives once, at the end.** Nothing is streamed: deltas are
 buffered and posted on `turn_end`, which keeps the reader loop off the Discord
 API so a slow Discord can never stall a turn. A typing indicator runs meanwhile.
+
+**A tool round leaves a line, not a hole.** Buffering the whole turn used to
+mean a tool round contributed nothing to it — worse than nothing, in fact: the
+`<tool_call>` block is lifted out of the text stream by `ToolMarkupFilter` but
+the newlines that surrounded it are not, so a round the model did not introduce
+in words arrived as a blank band in the middle of the answer. Now the band is
+trimmed and one line of Discord subtext goes in its place:
+
+```
+Let me check the bus.
+
+⚙️ checking the USB bus ↳ 412 chars
+
+No CAEN 21e1 device on dcs0's buses.
+```
+
+What it says is the **`reason`** — every tool's schema carries one
+(`tools.py:REASON_KEY`), a phrase the model fills in saying what it is about to
+find out, which never reaches the handler and exists only to be shown. A model
+that leaves it out costs nothing; the line falls back to the tool's name.
+That choice is deliberate: a reader on a phone wants to know *why* the agent
+went away for ninety seconds, and the command itself is both longer and, on a
+`cd … && grep -n … | sed -n …`, much less informative. The command is still
+there in the WebUI and the terminal, which show the raw arguments.
+
+The line is part of the answer, not a message of its own, so a turn that ran
+twenty commands is still one post and still bounded by `max_messages`.
+`show_tools: false` drops the lines but keeps the trimming — the blank band was
+a bug, not a setting.
 The answer is then split by `chunker.py` — 2000 characters, a soft 17-line cap,
 and fences closed and reopened so a code block never leaks into the next
 message. Past `max_messages` (default 8) the opening chunks go out and the whole
@@ -1722,6 +1769,6 @@ gitignored — it holds the API key and the bot token).
 - `core` — The service itself: `bind` (loopback by default — see the security note above), `port` (the WebUI is on the same one), `token`, an optional shared secret, and `allowed_hosts`, extra `Host` header values to accept for a reverse proxy in front of the core (loopback, the bind, this machine's hostname and FQDN and the addresses they resolve to are already accepted). `--bind` / `--port` / `--config` on `./serve.sh` override the first three.
 - `tools` — Agent tools: enable flag, allowlist, `exec_timeout`, `max_output_chars`, and `workdir` — the base directory `exec` runs in and relative paths resolve against, defaulting to the letsClaw directory.
 - `conversation` — `max_history_messages`, a backstop that trims the oldest messages (never opening on an orphaned tool result) and only applies on turns where no rollover happened — rollover is the real mechanism, this just stops an unbounded session with rollover switched off. Then rollover policy: `rollover_at_percent` (0 disables), `rollover_mode` (`auto`/`ask`/`off`), `prompt_timeout` (seconds to wait for an answer in `ask` mode before keeping the session). Two directories: `live_dir` holds the running conversations and is reloaded at startup, `sessions_dir` holds archived transcripts and the journal segments beside them. Then the journal itself: `journal` (default true — the `.md` record of every round's reasoning and every untruncated tool result, which is what stops a rolled-over window repeating work; see [The journal](#the-journal)) and `journal_max_block_chars` (default 1,000,000, the cap on one recorded block). The context window itself is per model, under `models`.
-- `discord` — the Discord bot, and only ever read by it: `enabled` (the off switch — `false` keeps the bot from starting and makes `./run_discord.sh` refuse to run; absent means enabled), `token` (the bot token), `core`/`core_token` (where the core is and its shared secret, both defaulting to the `core` section above), `users` — the **required** allowlist of snowflake IDs, empty meaning nobody — `mention_only` (`true`/`false`/`white`/`black`) with `mention_list`, `idle_detach_min` (`0` = never, the default — the channel stays attached so a WebUI turn still posts to Discord), `max_messages`/`max_lines` for how an answer is split (`max_messages: 0` = unlimited), and `auto_names` (sessions named `<server>-<channel>`, renamed to follow Discord). Omit the whole section if you do not want a bot. See [Discord Client](#discord-client) for the security note that goes with it.
+- `discord` — the Discord bot, and only ever read by it: `enabled` (the off switch — `false` keeps the bot from starting and makes `./run_discord.sh` refuse to run; absent means enabled), `token` (the bot token), `core`/`core_token` (where the core is and its shared secret, both defaulting to the `core` section above), `users` — the **required** allowlist of snowflake IDs, empty meaning nobody — `mention_only` (`true`/`false`/`white`/`black`) with `mention_list`, `idle_detach_min` (`0` = never, the default — the channel stays attached so a WebUI turn still posts to Discord), `max_messages`/`max_lines` for how an answer is split (`max_messages: 0` = unlimited), `show_tools` (one grey line per tool call saying why it was made; `false` drops the line but still closes the blank a tool round leaves in the answer), and `auto_names` (sessions named `<server>-<channel>`, renamed to follow Discord). Omit the whole section if you do not want a bot. See [Discord Client](#discord-client) for the security note that goes with it.
 - `memory` — `long_term_file`, where rollover handoffs accumulate
 - `logging` — `level`, `file`, and the rotation ceiling, `max_bytes` (default 10 MB, and anything under a 1 MB floor is not believed, because `0` would mean "never rotate") with `backups` (default 5). Each process logs to stderr and to a file of its own: the writer's name goes into the stem, so `logs/letclaw.log` becomes `letclaw-core.log` and `letclaw-discord.log`. Two processes appending to one file interleave their lines, and worse, whichever one rotated it would rename the file out from under the other — one file per writer is what makes the ceiling safe, not a tidiness on top of it. Every session event of consequence (restore, rename, delete, rollover, a dropped tool-call turn) is one line in there.

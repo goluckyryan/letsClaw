@@ -17,9 +17,10 @@ Routes registered in `build_app()`.
 
 | Method + path | Auth | Returns |
 |---|---|---|
-| `GET /health` | **no** | `{ok, proto, version, sessions}` — open so a monitor can check liveness without holding the secret. `version` is the core's release (`source/version.py`), `proto` the wire version below |
-| `GET /models` | yes | `{default, configured[]}` |
+| `GET /health` | **no** | `{ok, proto, version, sessions, restarting}` — open so a monitor can check liveness without holding the secret. `version` is the core's release (`source/version.py`), `proto` the wire version below, `restarting` true only inside the tenth-of-a-second grace window, so a poller that catches it has something to connect a healthy read to the refused connection after it |
+| `GET /models` | yes | `{default, configured[], forwards}` — `forwards` is one entry per ssh tunnel the core owns, each `{target, jump, remote, local, pid}`, with `pid` null when the tunnel is down. No shipped client renders it: the WebUI and the bot read `configured` only, so it is there for a person at a terminal deciding whether a refused connection is the model or the tunnel |
 | `GET /sessions` | yes | `{sessions: [...]}` — the WebUI polls this every 5 s |
+| `GET /sessions/{name}/history` | yes | `{ok, session, messages[]}` — the conversation's tail, newest last, `?limit=` (10 by default, `limit<1` clamped to 1), system message omitted. `404` for an unknown session. Read-only and capped deliberately: its one caller is the Discord bot's switch digest, which posts the last three lines when a channel moves sessions, and an unbounded copy of a long session would be a slow JSON for no one |
 | `DELETE /sessions/{name}` | yes | 404 if no such session, 409 if a turn is running |
 | `POST /sessions/{name}/rename` | yes | body `{"to": "..."}`. 400 malformed / bad name, 404 missing, 409 busy or taken |
 | `POST /reload` | yes | re-reads `config.yaml` in place; **400 and no change** if it will not load |
@@ -79,7 +80,7 @@ The order in `ws_handler()` is load-bearing:
 
 ### Client → core
 
-Five verbs, all JSON text frames keyed on `"t"`. Malformed JSON gets a
+Six verbs, all JSON text frames keyed on `"t"`. Malformed JSON gets a
 non-fatal `error`; non-text frames are ignored.
 
 | `t` | fields | notes |
@@ -126,15 +127,17 @@ Every event carries `seq` and `session`, stamped by `Session.emit`
 | `text` | `delta` | |
 | `reasoning` | `delta` | **live only, never replayed**; suppressed for `reasoning=0` |
 | `reasoning_stat` | `tokens, …` | **live only**; a reconnect would replay hundreds of superseded counts |
-| `tool_call` | `id, name, …` | emitted **before** the tool runs, so a slow `exec` is visible |
+| `tool_call` | `id, name, arguments, …` | emitted **before** the tool runs, so a slow `exec` is visible. `arguments` is the raw JSON string; every tool's schema carries a `reason` key (`tools.py:REASON_KEY`) holding one phrase on why the call was made, which is what a client shows when it will not show the command |
 | `tool_result` | `id, name, size` | |
 | `stats` | token and timing figures | the `⚡` line |
 | `turn_end` | `turn_id` | |
-| `notice` | `level` (`info`/`warn`), `text` | ~30 emit sites |
+| `notice` | `level` (`info`/`warn`/`error`), `text` | the general "say this to the human" event; 40+ emit sites. `error` is rare and means the opposite of "informational": the thing that failed will keep failing every turn until a person acts (see `rollover_failed` below). **No shipped client distinguishes it today** — the mark dict in `ChatClient.handle()` has `warn`/`info` so `error` prints unmarked, the WebUI's `notice` case branches on `warn` so it renders as ordinary text even though `.notice.err` is styled, and `DiscordBridge.handle()` tests `== "warn"` and drops it outright. A known gap, not the contract |
+| `digest_done` | `turn_id, tokens, digest_text` | `conversation.digest_turns` collapsed the turn that just ended, and this is the digest that replaced it — the summary itself, as `rollover_done` carries `handoff_text`, and for the same reason: it is what the model is shown from here on, so a reader who cannot see it finds out about a lossy one only when the model acts on the gap. Emitted **inside** the turn, so it arrives *before* that turn's `turn_end`; a client that buffers its output until `turn_end` has to hold it back or it prints the summary above the answer it summarises (`DiscordBridge._post_digest()`). The digest's own last line is the `grep` that reaches the journal block it stands in for, so the full working-out is one command away |
 | `error` | `msg`, `fatal` | |
 | `busy` | `reason` | |
 | `session_state` | `what` ∈ `reloaded`/`cleared`/`wiped`/`model`/`renamed`/`deleted` | `reloaded` also carries `theme` (the new `webui.theme`); `wiped` and `deleted` also carry `files` + `bytes`: the archives that went with the conversation |
 | `rollover_start` / `rollover_ask` / `rollover_done` | | `rollover_ask` is the **only** server→client request |
+| `rollover_failed` | `reason, error, used, budget` | the window could not be archived, so nothing was rolled and the conversation is intact. Emitted on the one path where `roll_over()` returns `False`, right after a paired `error` notice. **No client renders the event itself** — it is the machine-readable half, for a monitor or a replay, and it is replayed like any other event so a reconnect still finds it. The human half reaches the terminal and the WebUI as an unmarked notice; on Discord neither half arrives, because that client drops non-`warn` notices (see the `notice` row above) |
 | `response` | `request_id` + the command's reply | unicast, not broadcast |
 | `pong` | — | |
 
@@ -184,8 +187,14 @@ The minimum is smaller than it looks:
    (`prompt_timeout`, which keeps the session).
 
 Everything else — `reasoning`, `tool_call`, `stats`, the sidebar — is
-presentation you can skip. The Discord bot ignores `stats`, `tool_call`,
-`tool_result` and all reasoning, and is a complete client.
+presentation you can skip. The Discord bot ignores `stats` and all reasoning,
+and is a complete client.
+
+It does read `tool_call` and `tool_result`, but not to render them live: it
+posts a turn once, at `turn_end`, so a tool round would otherwise be a blank
+gap in the answer — the `<tool_call>` block is lifted out of the text stream
+but the newlines around it are not. A client that buffers a turn has to
+handle the two events for that reason alone, even if it shows nothing.
 
 Things worth copying from the existing three:
 

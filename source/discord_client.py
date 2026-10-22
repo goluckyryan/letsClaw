@@ -72,6 +72,10 @@ import paths
 from chunker import chunk_discord_text
 from config import load_config
 from core import PROTOCOL_VERSION
+# Imported rather than spelled again here: the key this client reads out of a
+# call's arguments is the one tools.py puts into every schema, and two copies
+# of that string would drift the first time either side was renamed.
+from tools import REASON_KEY
 
 logger = logging.getLogger("letclaw.discord")
 
@@ -80,6 +84,9 @@ DEFAULT_IDLE_DETACH_MIN = 60
 DEFAULT_MAX_MESSAGES = 8        # before the answer goes up as a file instead
 MAX_MESSAGES_UNLIMITED = 0      # max_messages: 0 — never file it, always post in full
 DEFAULT_MAX_LINES = 17
+# A tool line is a margin note, so it has to fit on one. Past this the model
+# wrote a sentence where it was asked for a phrase, and the rest is cut.
+TOOL_LABEL_MAX = 110
 TYPING_REFRESH_S = 8            # Discord expires a typing indicator after 10
 RECONNECT_MIN_S = 1
 RECONNECT_MAX_S = 30
@@ -220,6 +227,46 @@ def _one_line(text):
     return " ".join(str(text or "").split())
 
 
+def _tool_reason(arguments):
+    """The `reason` the model put in a call's arguments, or None.
+
+    Dug out of the argument JSON rather than carried as its own event field:
+    the core already sends the whole of it, and one client wanting one key
+    out of it is not a reason to widen the protocol. A call cut off
+    mid-arguments does not parse, which is what the None is for.
+    """
+    try:
+        args = json.loads(arguments or "{}")
+    except (TypeError, ValueError):
+        return None
+    reason = args.get(REASON_KEY) if isinstance(args, dict) else None
+    return reason if isinstance(reason, str) and reason.strip() else None
+
+
+class _ToolMark:
+    """One tool round's line in the answer being built.
+
+    A mutable segment rather than a finished string, because the call and its
+    result arrive as two events and the result only adds the size to a line
+    the call already placed. The bridge holds the object itself, not an index
+    into self.answer — which is what lets _hello reslice that list on a replay
+    without losing track of the line a late tool_result belongs to.
+    """
+
+    __slots__ = ("label", "size")
+
+    def __init__(self, label):
+        self.label = label
+        self.size = None
+
+    def __str__(self):
+        # Discord's subtext: small and grey, so a turn that ran nine commands
+        # reads as an answer with a margin note per step rather than as a log
+        # with an answer somewhere in it.
+        done = f" ↳ {self.size:,} chars" if self.size is not None else ""
+        return f"-# ⚙️ {self.label}{done}"
+
+
 # ---- config ----------------------------------------------------------------
 
 
@@ -281,6 +328,10 @@ class Settings:
                 n = DEFAULT_MAX_MESSAGES
             self.max_messages = MAX_MESSAGES_UNLIMITED if n == 0 else max(1, n)
         self.max_lines = max(1, int(blob.get("max_lines") or DEFAULT_MAX_LINES))
+        # Absent means on. Off still collapses the blank the round leaves
+        # behind — that is a bug, not a feature anyone turns off — and only
+        # drops the line naming what ran. See ChannelBridge._tool_call.
+        self.show_tools = blob.get("show_tools", True) is not False
 
     def _read_security(self, blob):
         """Who may talk to the bot, and where it has to be addressed.
@@ -819,6 +870,21 @@ class ChannelBridge:
         # Set for the length of a replay, and cleared by the first text event
         # in it — see _hello for what that one event has to do differently.
         self._replay_first_text = False
+        # How much of self.answer predates the replay in progress, so the
+        # first replayed text can drop that and keep what the replay itself
+        # has added. See _hello and _text.
+        self._replay_base = 0
+        # tool_call id → the _ToolMark its tool_result completes.
+        self._tool_marks = {}
+        # A tool round just ended: the next text run opens with the newlines
+        # that sat around the <tool_call> block, and they are not an
+        # intentional paragraph break. See _text.
+        self._after_tool = False
+        # The turn digest, held from the digest_done that carries it until the
+        # turn_end that posts it. Deliberately not cleared by _reset_answer:
+        # _post_answer calls that on its way through, and clearing it there
+        # would drop the digest a line before it is posted. See _post_digest.
+        self._digest = None
         # request_id → future, for a slash command awaiting its own reply.
         self.waiters = {}
 
@@ -853,14 +919,117 @@ class ChannelBridge:
                 return False
         return True
 
-    async def _post_answer(self):
-        text = "".join(self.answer).strip()
+    def _reset_answer(self):
+        """Nothing of the last turn survives into the next one."""
         self.answer.clear()
+        self._tool_marks.clear()
+        self._after_tool = False
+
+    def _text(self, event):
+        delta = event.get("delta") or ""
+        if self._replay_first_text:
+            # The first text event of a replay is not a delta to add to what
+            # is already here: the core coalesces a whole run of text into one
+            # turn_events entry holding the run's full text, so this *is*
+            # everything said in that run, prefix included. Add it to the
+            # prefix already in self.answer and the answer goes out with its
+            # opening posted twice. Drop that prefix instead — but only it:
+            # anything the replay itself has put down (a tool mark, when the
+            # missed window opens on a call the model did not introduce) comes
+            # after the prefix and belongs to this answer. Later replayed
+            # entries are separate runs and append as usual.
+            self._replay_first_text = False
+            self.answer = self.answer[self._replay_base:]
+        if self._after_tool:
+            # The markup filter lifts the <tool_call> block out of the stream
+            # and leaves the newlines that surrounded it, so a run that only
+            # ever held a call forwards as whitespace. Posting that verbatim is
+            # what put a blank gap in the middle of every multi-round answer.
+            delta = delta.lstrip()
+            if not delta:
+                return
+            self._after_tool = False
+        self.answer.append(delta)
+
+    def _tool_call(self, event):
+        """Put the round's line in the answer, and close the gap it leaves.
+
+        The line goes into self.answer rather than out as its own message:
+        a turn that ran twenty commands would otherwise be twenty extra posts
+        past whatever max_messages says, and the ordering this client promises
+        — text and tools in the order the core sent them — comes free from
+        appending to the one list.
+
+        `show_tools: false` turns the line off but not the trimming above and
+        below it. A reader who does not want the steps narrated still does not
+        want the hole they left.
+        """
+        self._after_tool = True
+        # An id already on the books is this call coming round a second time:
+        # a handler cut short mid-event leaves handled_seq where it was, so the
+        # replay after the reconnect starts one event earlier than it needs to.
+        # Drawing the line twice is the visible half of that; ignoring the
+        # repeat keeps the mark the tool_result is still going to land on.
+        if not self.settings.show_tools or event.get("id") in self._tool_marks:
+            return
+        label = _one_line(_tool_reason(event.get("arguments"))
+                          or event.get("name") or "tool")
+        if len(label) > TOOL_LABEL_MAX:
+            label = label[:TOOL_LABEL_MAX - 1].rstrip() + "…"
+        self._trim_tail()
+        if self.answer:
+            self.answer.append("\n\n")
+        mark = _ToolMark(label)
+        self._tool_marks[event.get("id")] = mark
+        self.answer.extend((mark, "\n\n"))
+
+    def _tool_result(self, event):
+        """Stamp the size onto the line its call put down.
+
+        A mark with no size never got one — a cancelled turn, or a reconnect
+        whose missed window opened after the call — and prints without the
+        tail rather than claiming a result that never came back.
+        """
+        mark = self._tool_marks.pop(event.get("id"), None)
+        if mark is not None and isinstance(event.get("size"), int):
+            mark.size = event["size"]
+
+    def _trim_tail(self):
+        """Drop trailing whitespace from the answer so far, segment by segment.
+
+        Only the string segments: a _ToolMark at the end is a line, not
+        spacing, and two calls in one round sit one blank line apart like
+        everything else here.
+        """
+        while self.answer and isinstance(self.answer[-1], str):
+            trimmed = self.answer[-1].rstrip()
+            if trimmed:
+                self.answer[-1] = trimmed
+                return
+            self.answer.pop()
+
+    async def _post_answer(self):
+        text = "".join(str(seg) for seg in self.answer).strip()
+        self._reset_answer()
         if not text:
-            # A cancelled turn, or one that produced only tool calls. The notice
-            # or error that explains it has already gone out on its own.
+            # A cancelled turn that got nowhere. The notice or error that
+            # explains it has already gone out on its own. A turn that ran
+            # tools and then stopped is no longer empty — the marks are the
+            # answer, and where it got to is worth posting.
             return
         await self._post_text(text)
+
+    async def _post_digest(self):
+        """What the window kept of the turn that just ended, after the answer.
+
+        say() rather than _post_text(): a digest is capped at 600 tokens, so
+        it is one or two messages and needs none of the flood handling, and
+        _post_text's overflow path puts the text up as `answer.md` under a
+        note calling it the answer, which this is not.
+        """
+        text, self._digest = self._digest, None
+        if text:
+            await self.say(f"🗜️ *turn digest — what the window keeps:*\n{text}")
 
     async def _post_text(self, text):
         """Post text to the channel under the channel's own limits.
@@ -992,25 +1161,19 @@ class ChannelBridge:
             await self._hello(event)
         elif t == "turn_start":
             self.busy = True
-            self.answer.clear()
+            self._reset_answer()
             self._start_typing()
         elif t == "text":
-            if self._replay_first_text:
-                # The first text event of a replay is not a delta to add to
-                # what is already here: the core coalesces a whole run of text
-                # into one turn_events entry holding the run's full text, so
-                # this *is* everything said in that run, prefix included. Add
-                # it to the prefix already in self.answer and the answer goes
-                # out with its opening posted twice. Replace instead; later
-                # replayed entries are separate runs and append as usual.
-                self._replay_first_text = False
-                self.answer = [event.get("delta") or ""]
-            else:
-                self.answer.append(event.get("delta") or "")
+            self._text(event)
+        elif t == "tool_call":
+            self._tool_call(event)
+        elif t == "tool_result":
+            self._tool_result(event)
         elif t == "turn_end":
             self.busy = False
             self._stop_typing()
             await self._post_answer()
+            await self._post_digest()
         elif t == "busy":
             await self.say(f"⏳ {_one_line(event.get('reason')) or 'mid-turn'}")
         elif t == "error":
@@ -1018,6 +1181,13 @@ class ChannelBridge:
         elif t == "notice":
             if event.get("level") == "warn":
                 await self.say(f"_⚠️ {_one_line(event.get('text'))}_")
+        elif t == "digest_done":
+            # Held, not posted. The core emits this inside the turn, so it
+            # arrives before turn_end — and this client posts nothing until
+            # turn_end, holding the whole answer in self.answer. Posting it
+            # where it lands would put the summary of a turn above the answer
+            # that turn produced.
+            self._digest = event.get("digest_text")
         elif t == "rollover_start":
             await self.say(f"_🔄 rolling over — {_one_line(event.get('reason'))}_")
         elif t == "rollover_done":
@@ -1046,6 +1216,7 @@ class ChannelBridge:
         # that have to be read differently the second time around: text (see
         # handle) and rollover_ask (see _ask).
         self._replay_first_text = True
+        self._replay_base = len(self.answer)
         try:
             for missed in event.get("missed") or []:
                 await self.handle(missed, replayed=True)

@@ -445,6 +445,8 @@ Honest notes, not excuses:
   runs, and is accepted rather than guarded. The *journal* name is
   disambiguated with `-2`, because there a collision would silently append a
   new window to a closed segment.
-- **`/static/` serves the whole `web/` directory**, so the test helpers are
-  reachable under it. Harmless while loopback-bound; worth knowing before
-  exposing the port.
+- **`/static/` serves the whole `web/` directory** — `app.js`, `index.html`,
+  `style.css` and the vendored KaTeX, nothing else. The test helpers that used to
+  sit in `web/` (`test_md.mjs`, `browser_test.py`, `shot.py`) live in `tests/`,
+  which the core does not serve. Harmless while loopback-bound; worth knowing
+  before exposing the port.

@@ -140,24 +140,36 @@ _headroom_check()           ← BEFORE the user message lands, so a roll starts
 history.append(user)
 jot("turn N user", text)
 
-while _pad_headroom() >= MIN_TOOL_ROUND_ROOM:   ← room, not a round count: nothing
-    result = await call_round(tools=schemas)      mid-turn can roll over, so what the
-                                                  loop runs out of is window
+# room, not a round count — nothing mid-turn can roll over, so what the loop
+# runs out of is window
+while True:
+    if _pad_headroom() < MIN_TOOL_ROUND_ROOM:
+        notice                                   # "no room left for another tool round"
+        result = await call_round()              # no schemas: it must answer in words
+        if was_cut_off(result):                  # thought hit the cap, said nothing
+            result = await _think_pad(..., allow_tools=False)
+        answer = result.text; break
+    drain_steering()                             # a /steering queued during the last tool
+    try:
+        result = await call_round(tools=schemas)
+    except RoundInterrupted:                     # /steering landed mid-round
+        record_partial(); drain_steering(); continue
     if not result.wants_tool:
-        if was_cut_off(result):              # thought hit the cap, said nothing
-            result = await _think_pad(...)   # ← the notepad, below
+        if was_cut_off(result):
+            result = await _think_pad(...)       # ← the notepad, below
             if result.wants_tool:
                 await run_tools(result); continue
+        if self._steering:                       # answer finished as a correction landed
+            history.append(assistant of text); drain_steering(); continue
         answer = result.text; break
     await run_tools(result)
-else:                                        # rounds exhausted
-    notice; result = await call_round()      # no tools offered this time
-    ...
 
 history.append(assistant)
 emit(stats)
 _digest_turn(user_msg, reasoning, blocks_before)   ← collapses this turn's
                                                working set, BEFORE rollover
+                                               emit(digest_done) — note this
+                                               precedes turn_end
 _after_turn(used)                            ← rollover evaluated ONLY here
 ```
 
@@ -517,8 +529,6 @@ explaining it; this is the index.
    the one that asked.
 10. **An unknown command issued during a turn reports "a turn is running"**,
     not "unknown command" — the lock check precedes the fall-through.
-11. **The `for/else` in `record_partial()`** fires only when the tool-round
-    budget is exhausted without a `break`. Easy to misread as an error branch.
-12. **Session names are unvalidated at creation**; only `rename` validates.
+11. **Session names are unvalidated at creation**; only `rename` validates.
     `session_behavior_path` is the double guard. If you add another place where
     a session name becomes a read path, replicate it.
