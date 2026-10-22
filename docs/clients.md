@@ -80,6 +80,14 @@ off / folded / open, and each block overrides it), rename and
 delete, the model picker, the rollover prompt, and auto-reconnect with
 exponential backoff that replays from `last_seq`.
 
+Beside **Send**, `↑`/`↓` jump to the previous and next **question** in the
+transcript — the log, not the composer, so the answer stays below it. That is
+separate from `↑` in an empty box, which recalls what you last *typed*. A
+`/steering` correction is a user message but not a question, so it is stepped
+over. The jump accounts for the pinned band: the question you are on sticks to
+the top of the log for the whole turn, and reaching an earlier one releases it,
+which is why the target lands where it can be read.
+
 The token is entered in the page and kept in `localStorage`; it goes out as
 `?token=` because a browser cannot set a WebSocket header.
 

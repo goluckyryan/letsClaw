@@ -439,7 +439,8 @@ function stampThinking() {
 let follow = true;
 const FOLLOWS = 80;
 log.addEventListener('scroll', () => {
-  follow = log.scrollHeight - log.scrollTop - log.clientHeight < FOLLOWS;
+  follow = atBottom();
+  updateNavSoon();    // the arrows' idea of where you are moves with the view
 });
 
 /* An image settles its height only once it has decoded, which is always after
@@ -478,6 +479,7 @@ function batch(fn) {
   batching = true;
   try { fn(); } finally { batching = false; }
   layoutPins();
+  updateNav();       // a replayed session has a whole history to point at
   if (follow) log.scrollTop = log.scrollHeight;
 }
 
@@ -485,6 +487,7 @@ function append(el) {
   log.insertBefore(el, waitEl);          // the spinner stays last
   trimLog();
   if (follow && !batching) log.scrollTop = log.scrollHeight;
+  updateNavSoon();   // a new prompt changes what the arrows can reach
   return el;
 }
 
@@ -713,6 +716,117 @@ function measurePin(p) {
     p.classList.remove('open');         // it fits; nothing left to have opened
     body.removeAttribute('title');
   }
+}
+
+/* Prompt history arrows, next to Send.
+
+   Scroll-to, not recall-to: ↑ lands on the previous question in the log, ↓ on
+   the next. Recall (↑ in an empty box, above) puts the old text back in the
+   composer; these take you back to where it was asked and answered, with the
+   answer still below it. Both are useful and neither is the other.
+
+   The index is read from the DOM, not kept in a JS array: every block the core
+   stamps already sits in the log in order, and an array would need rebuilding
+   at all three sites that fill the log (live, replay, session switch) and go
+   stale at each. Steering interjections are excluded — a 📌 mid-turn correction
+   is not a question you would want to land on.
+
+   The limit is the *view*, not the session: LOG_MAX trims what is rendered, so
+   ↑ stops at the oldest prompt still on screen. Switching back to the session
+   replays the whole transcript, so nothing is lost, only out of reach. */
+function userPrompts() {
+  return [...log.querySelectorAll('.msg.user:not(.steering)')];
+}
+
+/* Where we are. Trust the jump we last made, fall back to geometry: `navEl`
+   records the prompt a press put on screen and the scroll position it was made
+   from; if the view has moved since — the user scrolled, the stream rode the
+   bottom, a session switched — that answer is stale and the position is read
+   off the log instead, as the last prompt whose top has reached the top.
+
+   Geometry alone would do for most of it, but not the walk off the end: the
+   oldest prompts cannot be brought all the way to the top, because there is
+   nothing above them to scroll against, so the view clamps and the prompt you
+   jumped to is left sitting *below* the line — where the reading then says you
+   are one prompt further down than you chose to be. The recorded jump knows
+   what it just did. */
+let navEl = null, navAnchor = -1;
+function promptIndex() {
+  const els = userPrompts();
+  if (!els.length) return { els, idx: -1 };
+  // The element, not an index: trimLog() drops blocks off the front of the
+  // view, which would shift every index while the view did not move.
+  if (navAnchor !== log.scrollTop || (navEl && !els.includes(navEl))) navEl = null;
+  if (navEl) return { els, idx: els.indexOf(navEl) };
+  // At the end of the log the question you are reading is the newest one, even
+  // when a short answer left it below the top line rather than past it.
+  if (atBottom()) return { els, idx: els.length - 1 };
+  const top = log.getBoundingClientRect().top;
+  let idx = -1;
+  for (let i = 0; i < els.length; i++)
+    if (els[i].getBoundingClientRect().top - top <= 1) idx = i;
+  return { els, idx };
+}
+
+function atBottom() {
+  return log.scrollHeight - log.scrollTop - log.clientHeight < FOLLOWS;
+}
+
+/* Bring `el` to the top of the pane. The padding edge, not the border edge:
+   that is where a block actually sits when the log is scrolled to it. True if
+   the view moved, i.e. the prompt was reachable.
+
+   No allowance for the pinned band, which is what the first version of this
+   did: the newest prompt is the pinned one, so every prompt ↑ can reach is
+   above it, and scrolling to any of them carries the pin's own flow position
+   below the top of the pane — where sticky releases it and it goes back to
+   being an ordinary block in the text. Measured: with the compensation and
+   without it, the landing is identical. */
+function scrollToPrompt(el) {
+  const from = log.scrollTop;
+  const edge = log.getBoundingClientRect().top
+             + parseFloat(getComputedStyle(log).paddingTop || 0);
+  const d = el.getBoundingClientRect().top - edge;
+  if (d) log.scrollTop += d;
+  return log.scrollTop !== from;
+}
+
+/* ↑ / ↓ one question.
+
+   Walk rather than jump once: a prompt in the last screenful of a log cannot
+   be brought to the top — there is nothing below it to scroll against — so a
+   naive jump leaves the view exactly where it was and the press looks dead.
+   Keep stepping until one moves, and if none can, take the end of the log in
+   that direction, which is what "the next one" means once you are out of
+   room. Either way a press that the buttons allowed always moves the view. */
+function goPrompt(step) {
+  const { els, idx } = promptIndex();
+  for (let to = idx + step; to >= 0 && to < els.length; to += step) {
+    if (!scrollToPrompt(els[to])) continue;
+    navEl = els[to]; navAnchor = log.scrollTop;
+    return updateNav();
+  }
+  if (step < 0) log.scrollTop = 0; else log.scrollTop = log.scrollHeight;
+  updateNav();
+}
+
+/* The scroll listener owns `follow` and nothing here writes it: landing mid-log
+   puts the view past FOLLOWS of the bottom, which turns following off and lets
+   the stream run on underneath without dragging you back into it. Land on the
+   newest prompt and it stays on, which is also right. */
+let navQueued = false;
+function updateNavSoon() {
+  if (navQueued) return;
+  navQueued = true;
+  requestAnimationFrame(() => { navQueued = false; updateNav(); });
+}
+
+function updateNav() {
+  // The view, not the index: goPrompt() falls back to the end of the log when
+  // no prompt is reachable, so "can still scroll that way" is exactly "a press
+  // will do something". Neither button is ever live and dead.
+  $('#nav-up').disabled = log.scrollTop <= 0;
+  $('#nav-down').disabled = atBottom();
 }
 
 /* Click the bubble to open a clamped prompt, click again to put it back.
@@ -1808,6 +1922,8 @@ function showReasonMode() {
 /* ------------------------------------------------------------------- wiring */
 
 $('#send').onclick = submit;
+$('#nav-up').onclick = () => goPrompt(-1);
+$('#nav-down').onclick = () => goPrompt(1);
 $('#stop').onclick = () => send({ t: 'stop' });
 $('#btn-reasoning').onclick = () => cycleReasoning();
 $('#btn-info').onclick = () => rpc('info').catch(() => {});

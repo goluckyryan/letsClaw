@@ -12,4 +12,4 @@ minor for features, patch for fixes. Bumped by hand here — there is no package
 metadata to keep in step, and this file is the only place the number lives.
 """
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"

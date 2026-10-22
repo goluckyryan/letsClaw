@@ -841,6 +841,31 @@ footer {
 .composer button:disabled { opacity: .45; cursor: default; }
 #stop { background: var(--err); border-color: var(--err); }
 
+/* Prompt history arrows, a column between the box and Send. They scroll the
+   log to the previous/next question, so they are navigation, not another way
+   to send — hence secondary: --bg3 like the textarea, --dim until hover, so
+   Send keeps the only accent-filled button in the row.
+
+   The column is 44px tall against Send's 39, and all three bottoms still line
+   up: .composer already sets align-items: flex-end, which is what aligns
+   them. Nothing here is tuned to achieve it, so do not "fix" the heights to
+   match — the arrows would then sit off the bottom edge of the row. */
+.navbtns {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.navbtns button {
+  padding: 0;
+  width: 34px;
+  height: 20px;
+  font: 12px/1 var(--sans);
+  background: var(--bg3);
+  color: var(--dim);
+}
+.navbtns button:hover:not(:disabled) { color: var(--fg); border-color: var(--accent); }
+.navbtns button:disabled { opacity: .3; }
+
 .hint {
   max-width: 900px;
   margin: 5px auto 0;
