@@ -154,6 +154,7 @@ source/discord_client.py the Discord bot (optional)
 source/discord_probe.py  "start the bot?" — serve.sh and install.sh both ask it
 source/chunker.py        fence-aware answer chunking (shared by the clients)
 source/version.py        `__version__` — the one place the release number lives
+                         (**every commit bumps it**; see the docstring for why)
 web/                     the WebUI (vanilla JS, no build)
 tests/                   every suite and helper, whatever it tests (gitignored)
 models/base.md           the base behavior file (committed)
