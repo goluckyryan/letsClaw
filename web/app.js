@@ -443,13 +443,62 @@ log.addEventListener('scroll', () => {
   updateNavSoon();    // the arrows' idea of where you are moves with the view
 });
 
+/* Room to scroll past the last message.
+
+   The prompts in the final screenful have nothing below them to scroll
+   against, so without this they can never be brought to the top line: ↑ either
+   leaves the view still and looks dead, or steps over them and leaves them
+   unreachable for the rest of the session. A tail of blank under the log
+   removes that clamp, and removing it is what lets promptIndex() below be
+   plain geometry — the prompt on the top line is the one you jumped to, so
+   nothing has to remember the jump.
+
+   Sized to what the newest prompt needs and no more: a turn already taller
+   than the pane gets a tail of zero, which is the common case for a long
+   answer and leaves the bottom of the log exactly as it was. */
+/* The top line: the log's padding edge, which is where a block comes to rest
+   once the view is scrolled to it — not the border edge, which sits `padding`
+   px higher. Reading, sizing and jumping all measure from here, because one
+   ruler is the whole reason the geometry can be trusted: measure the reading
+   from the border edge and every landing reports the prompt *before* the one
+   you jumped to, the full 18px of padding being more than the 1px tolerance. */
+function topLine() {
+  return log.getBoundingClientRect().top
+       + parseFloat(getComputedStyle(log).paddingTop || 0);
+}
+
+let tail = 0;
+function retail() {
+  const els = userPrompts();
+  const last = els[els.length - 1];
+  // Where the view would have to sit to put `last` on the top line, in content
+  // coordinates — which do not move when the log scrolls, rect.top falling as
+  // scrollTop rises by the same px.
+  const want = last ? log.scrollTop + last.getBoundingClientRect().top - topLine()
+                    : 0;
+  const grown = Math.max(0, Math.round(want + log.clientHeight
+                                       - (log.scrollHeight - tail)));
+  if (grown === tail) return;    // writing the variable every frame thrashes layout
+  tail = grown;
+  log.style.setProperty('--tail', tail + 'px');
+}
+
+/* The bottom of what was actually said, which is no longer the bottom of the
+   scroll box — that now runs `tail` px further into the blank. Seven sites
+   spelled this `log.scrollTop = log.scrollHeight` and would ride into the
+   tail, parking the newest text at the top of the pane mid-stream. */
+function toBottom() {
+  retail();
+  log.scrollTop = log.scrollHeight - tail - log.clientHeight;
+}
+
 /* An image settles its height only once it has decoded, which is always after
    the append that placed it scrolled the log. Without this the bottom of the
    view lands mid-plot and stays there. Capture phase, because `load` from an
    <img> does not bubble. A broken one is swapped for its alt text so a missing
    file reads as a missing file rather than a silent gap. */
 log.addEventListener('load', (e) => {
-  if (e.target.tagName === 'IMG' && follow) log.scrollTop = log.scrollHeight;
+  if (e.target.tagName === 'IMG' && follow) toBottom();
 }, true);
 log.addEventListener('error', (e) => {
   const img = e.target;
@@ -479,14 +528,15 @@ function batch(fn) {
   batching = true;
   try { fn(); } finally { batching = false; }
   layoutPins();
+  retail();          // the replay just changed what the last prompt is
   updateNav();       // a replayed session has a whole history to point at
-  if (follow) log.scrollTop = log.scrollHeight;
+  if (follow) toBottom();
 }
 
 function append(el) {
   log.insertBefore(el, waitEl);          // the spinner stays last
   trimLog();
-  if (follow && !batching) log.scrollTop = log.scrollHeight;
+  if (follow && !batching) toBottom();
   updateNavSoon();   // a new prompt changes what the arrows can reach
   return el;
 }
@@ -550,7 +600,7 @@ function scrollSoon() {
     // Re-read follow at paint time, not at queue time: the user may have
     // scrolled up in between, and this is the one place that would drag them
     // back down after they did.
-    if (follow) log.scrollTop = log.scrollHeight;
+    if (follow) toBottom();
   });
 }
 
@@ -691,7 +741,10 @@ function layoutPins() {
     top += p.offsetHeight;
   }
 }
-if (typeof ResizeObserver !== 'undefined') new ResizeObserver(layoutPins).observe(log);
+if (typeof ResizeObserver !== 'undefined')
+  // retail() too: the tail is measured against the pane's height, which is
+  // exactly what this observer fires on.
+  new ResizeObserver(() => { layoutPins(); retail(); }).observe(log);
 
 /* How much of a pinned prompt stays on screen. Four lines is enough to
    recognise what you asked without the band swallowing the answer. */
@@ -738,43 +791,46 @@ function userPrompts() {
   return [...log.querySelectorAll('.msg.user:not(.steering)')];
 }
 
-/* Where we are. Trust the jump we last made, fall back to geometry: `navEl`
-   records the prompt a press put on screen and the scroll position it was made
-   from; if the view has moved since — the user scrolled, the stream rode the
-   bottom, a session switched — that answer is stale and the position is read
-   off the log instead, as the last prompt whose top has reached the top.
+/* Where we are: the last prompt whose top has reached the top line.
 
-   Geometry alone would do for most of it, but not the walk off the end: the
-   oldest prompts cannot be brought all the way to the top, because there is
-   nothing above them to scroll against, so the view clamps and the prompt you
-   jumped to is left sitting *below* the line — where the reading then says you
-   are one prompt further down than you chose to be. The recorded jump knows
-   what it just did. */
-let navEl = null, navAnchor = -1;
+   Read off the log every time, with nothing remembered between presses. That
+   is only honest because of the tail retail() keeps under the log — every
+   prompt can be scrolled to the line, so the prompt sitting on it is always
+   the one the last press chose. An earlier version recorded the jump and the
+   scroll position it was made from, and invalidated the pair whenever the view
+   moved; all of that existed to paper over prompts that could not reach the
+   line, and none of it is needed once they can. */
 function promptIndex() {
   const els = userPrompts();
   if (!els.length) return { els, idx: -1 };
-  // The element, not an index: trimLog() drops blocks off the front of the
-  // view, which would shift every index while the view did not move.
-  if (navAnchor !== log.scrollTop || (navEl && !els.includes(navEl))) navEl = null;
-  if (navEl) return { els, idx: els.indexOf(navEl) };
-  // At the end of the log the question you are reading is the newest one, even
-  // when a short answer left it below the top line rather than past it.
-  if (atBottom()) return { els, idx: els.length - 1 };
-  const top = log.getBoundingClientRect().top;
-  let idx = -1;
-  for (let i = 0; i < els.length; i++)
-    if (els[i].getBoundingClientRect().top - top <= 1) idx = i;
+  const edge = topLine();
+  let idx = -1, resting = false;
+  for (let i = 0; i < els.length; i++) {
+    const d = els[i].getBoundingClientRect().top - edge;
+    if (d <= 1) { idx = i; resting = d >= -1; }
+  }
+  // A prompt resting *on* the line is there because a press put it there, and
+  // that reading is exact wherever in the log it happens to sit. Only when
+  // nothing is on the line does riding the bottom mean the newest question —
+  // the case a short final answer leaves below the line, where the scan above
+  // would otherwise point several questions further back.
+  //
+  // Position alone cannot tell these apart: a prompt jumped to near the end of
+  // the log can land inside FOLLOWS of the bottom, and reading that as "newest"
+  // is how ↑ would bounce back to the last question part-way up the log.
+  if (!resting && atBottom()) return { els, idx: els.length - 1 };
   return { els, idx };
 }
 
 function atBottom() {
-  return log.scrollHeight - log.scrollTop - log.clientHeight < FOLLOWS;
+  // Past the end still counts: reaching one of the newest prompts means
+  // scrolling beyond the last message into the tail, and that is not "scrolled
+  // up to read", which is the distinction `follow` is asking about.
+  return log.scrollHeight - tail - log.scrollTop - log.clientHeight < FOLLOWS;
 }
 
 /* Bring `el` to the top of the pane. The padding edge, not the border edge:
-   that is where a block actually sits when the log is scrolled to it. True if
-   the view moved, i.e. the prompt was reachable.
+   that is where a block actually sits when the log is scrolled to it.
 
    No allowance for the pinned band, which is what the first version of this
    did: the newest prompt is the pinned one, so every prompt ↑ can reach is
@@ -783,30 +839,24 @@ function atBottom() {
    being an ordinary block in the text. Measured: with the compensation and
    without it, the landing is identical. */
 function scrollToPrompt(el) {
-  const from = log.scrollTop;
-  const edge = log.getBoundingClientRect().top
-             + parseFloat(getComputedStyle(log).paddingTop || 0);
-  const d = el.getBoundingClientRect().top - edge;
-  if (d) log.scrollTop += d;
-  return log.scrollTop !== from;
+  log.scrollTop += el.getBoundingClientRect().top - topLine();
 }
 
-/* ↑ / ↓ one question.
-
-   Walk rather than jump once: a prompt in the last screenful of a log cannot
-   be brought to the top — there is nothing below it to scroll against — so a
-   naive jump leaves the view exactly where it was and the press looks dead.
-   Keep stepping until one moves, and if none can, take the end of the log in
-   that direction, which is what "the next one" means once you are out of
-   room. Either way a press that the buttons allowed always moves the view. */
+/* ↑ / ↓ one question. One step, every time — the tail under the log means the
+   step can always be taken, so there is nothing to walk past and no end-of-log
+   fallback to reach for. Past the last prompt in either direction, take the
+   end of the log, which is what "the next one" means once you are out of
+   questions. */
 function goPrompt(step) {
   const { els, idx } = promptIndex();
-  for (let to = idx + step; to >= 0 && to < els.length; to += step) {
-    if (!scrollToPrompt(els[to])) continue;
-    navEl = els[to]; navAnchor = log.scrollTop;
-    return updateNav();
-  }
-  if (step < 0) log.scrollTop = 0; else log.scrollTop = log.scrollHeight;
+  if (!els.length) return;
+  // At scrollTop 0 nothing has reached the top line, so idx is -1 — a real
+  // reading, not a miss. Clamping it into range would send ↑ *down* the log.
+  if (idx < 0 && step < 0) return;
+  const to = idx + step;
+  if (to < 0) log.scrollTop = 0;
+  else if (to >= els.length) toBottom();
+  else scrollToPrompt(els[to]);
   updateNav();
 }
 
@@ -818,13 +868,13 @@ let navQueued = false;
 function updateNavSoon() {
   if (navQueued) return;
   navQueued = true;
-  requestAnimationFrame(() => { navQueued = false; updateNav(); });
+  requestAnimationFrame(() => { navQueued = false; retail(); updateNav(); });
 }
 
 function updateNav() {
-  // The view, not the index: goPrompt() falls back to the end of the log when
-  // no prompt is reachable, so "can still scroll that way" is exactly "a press
-  // will do something". Neither button is ever live and dead.
+  // The view, not the index: at either end goPrompt() takes the end of the
+  // log, so "can still scroll that way" is exactly "a press will do
+  // something". Neither button is ever live and dead.
   $('#nav-up').disabled = log.scrollTop <= 0;
   $('#nav-down').disabled = atBottom();
 }
@@ -886,7 +936,7 @@ function flushStream(el) {
   // the next turn_start reads the view as "scrolled up" and never follows.
   // Synchronous, not scrollSoon(): turn_start can land in the same task as this
   // one, and it reads the view to decide whether to keep following.
-  if (follow) log.scrollTop = log.scrollHeight;
+  if (follow) toBottom();
   // Models routinely emit a bare "\n\n" before calling a tool. Rendered, that is an
   // avatar next to nothing; drop the whole message rather than leave a stray 🐱.
   if (!(el._raw || '').trim()) el.closest('.msg').remove();
@@ -909,7 +959,7 @@ function setWaiting(label) {
   };
   tick();
   waitTimer = setInterval(tick, 100);
-  if (follow) log.scrollTop = log.scrollHeight;
+  if (follow) toBottom();
 }
 
 function clearWaiting() {

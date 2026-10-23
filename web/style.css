@@ -357,6 +357,17 @@ main {
      the log judders. Sticking to the bottom has to be instant. */
 }
 
+/* Room to scroll past the last message, so the newest prompts can be brought
+   to the top line. A pseudo-element rather than a real block: it is always
+   last, where append() would otherwise have to keep putting it back. retail()
+   sizes it to exactly what the newest prompt needs — a turn that already fills
+   the pane gets none, and the bottom of the log looks as it always did. */
+main::after {
+  content: '';
+  display: block;
+  height: var(--tail, 0px);
+}
+
 .msg {
   max-width: 900px;
   margin: 0 auto 14px;
