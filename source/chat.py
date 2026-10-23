@@ -35,7 +35,7 @@ except ImportError:
 
 import aiohttp
 
-from config import known_models, load_config
+from config import core_url, known_models, load_config
 from core import PROTOCOL_VERSION
 from ui import thinking_indicator
 
@@ -615,8 +615,10 @@ def main():
         print(f"❌ {e}")
         sys.exit(1)
     core_cfg = config.get("core", {})
-    host = core_cfg.get("bind", "127.0.0.1")
-    url = args.url or f"http://{host}:{int(core_cfg.get('port', 8770))}"
+    # config.core_url, not a local f-string: this client used to hand-build the
+    # URL and so missed the wildcard-bind substitution the bot had, which broke
+    # it on exactly the config README documents for serving other machines.
+    url = args.url or core_url(core_cfg)
     # Same precedence the Discord bot uses: an explicit secret wins, then
     # the environment, then the core.token of the config this client just
     # read — a client on the same machine as its core needs no extra step.

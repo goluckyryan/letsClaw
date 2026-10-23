@@ -126,7 +126,7 @@ def _machine_hostnames(bind):
     whole point — see _host_ok.
     """
     names = {"localhost", "127.0.0.1", "::1"}
-    if bind and bind not in ("0.0.0.0", "::"):
+    if bind and bind not in configlib.WILDCARD_BINDS:
         names.add(bind.strip("[]").lower())
     try:
         hostname = socket.gethostname()
@@ -1067,7 +1067,7 @@ def _webui_host(bind):
     in, so it is printed as the LAN address instead. A bind on a specific IP
     is already the address, and loopback stays as it is.
     """
-    if bind in ("0.0.0.0", "::"):
+    if bind in configlib.WILDCARD_BINDS:
         return _lan_ip() or bind
     return bind
 

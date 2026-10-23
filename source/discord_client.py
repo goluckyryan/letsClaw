@@ -70,6 +70,7 @@ except ImportError:                                    # pragma: no cover
 import logging_setup
 import paths
 from chunker import chunk_discord_text
+import config as configlib
 from config import load_config
 from core import PROTOCOL_VERSION
 # Imported rather than spelled again here: the key this client reads out of a
@@ -387,12 +388,10 @@ class Settings:
     def _core_url(raw, core_cfg):
         """Accept ws:// or http://, or build one from the core's own bind/port."""
         if not raw:
-            host = core_cfg.get("bind") or "127.0.0.1"
-            # 0.0.0.0 is how a core says "every interface"; it is not an address
-            # a client can dial, so reach it the way any other local client does.
-            if host in ("0.0.0.0", "::"):
-                host = "127.0.0.1"
-            return f"ws://{host}:{int(core_cfg.get('port', 8770))}"
+            # The wildcard substitution and the valueless-bind fallback were
+            # worked out here first; they live in config.py now so the terminal
+            # client gets them too, which it had not been.
+            return configlib.core_url(core_cfg, "ws")
         url = str(raw).strip().rstrip("/")
         if url.startswith("http://"):
             return "ws://" + url[len("http://"):]

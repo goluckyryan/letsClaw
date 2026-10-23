@@ -261,6 +261,43 @@ def int_or(value, default):
         return default
 
 
+def _engine_int(entry, model, key, default):
+    """A number out of a model entry: `int(entry[key] or 0)` that cannot raise.
+
+    `int_or` exists so *"a bad number in a config file should cost a log line,
+    not the turn"*, and has call sites all over `session.py`, `tools.py` and
+    `core.py` — but `build_engine` was the one reader in the tree that used a
+    bare `int()`. That matters more here than anywhere else, not less:
+    `build_engine` is called **lazily, per session** (`core.engine_for`, reached
+    from a ws attach, `/model` and session restore), so the `ValueError` lands
+    mid-turn, on the turn, rather than at boot where a config error belongs.
+
+    Junk falls back to what an *absent* key gives, which is the only fallback
+    that reads the same way to the person who typed it: a value the config
+    cannot mean is treated as a value not given. That is deliberately not 0 —
+    for `turn_timeout` and `answer_time_reserve`, 0 means "no limit", and a
+    typo must not be a way to switch the wall off.
+
+    An empty value still means 0, as `or 0` did: `turn_timeout:` with nothing
+    after it is how the config spells "no wall".
+
+    Only None and "" count as that, though — not everything falsy. `or 0` also
+    swallowed `[]` and `{}`, which are a mis-indentation, not a way of saying
+    zero, and silently turning a broken block into "no wall" is the one outcome
+    this function exists to prevent. An explicit `0` or `false` still reaches
+    int() and still means 0.
+    """
+    raw = entry.get(key, default)
+    if raw is None or raw == "":     # `key:` with nothing after it
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning("model %s: %s is %r, which is not a number — using %s",
+                       model, key, raw, default)
+        return int(default)
+
+
 # --------------------------------------------------------------- presentation
 
 def config_theme(config):
@@ -341,31 +378,42 @@ def build_engine(config, model_name=None, forward=None):
     # forward is None here (sync builder); the async call sites pass it in.
     if forward is not None:
         base_url = forward.local_url(base_url)
+    # Parsed once and used twice — as the HTTP client's timeout and as the
+    # turn wall below. It was written out twice, identically, which is one
+    # expression too many for a value that must not be able to disagree.
+    turn_timeout = _engine_int(entry, name, "turn_timeout", 36000)
     engine = LLMEngine(
         base_url=base_url, api_key=entry.get("api_key", ""),
         default_model=entry.get("provider_name", name),
-        timeout=(int(entry.get("turn_timeout", 36000) or 0) or None),
+        timeout=(turn_timeout or None),
         temperature=entry.get("temperature"),
         max_tokens=entry.get("max_tokens"),
         top_p=entry.get("top_p"),
     )
-    engine.context_length = entry.get("context_length", DEFAULT_CONTEXT_LENGTH)
+    # Not `entry.get(...)` raw: this one was never parsed at all, so a quoted
+    # `context_length: "32768"` reached every token calculation as a string,
+    # where `budget * pct / 100` is a 90-fold string repetition followed by a
+    # TypeError. That is the whole rollover path down, from a config line YAML
+    # users write by accident. It takes the absent-key default, like the rest.
+    engine.context_length = (_engine_int(entry, name, "context_length",
+                                         DEFAULT_CONTEXT_LENGTH)
+                             or DEFAULT_CONTEXT_LENGTH)
     # The answer sheet: the cap the closing round runs under, once thinking has
     # been shut with </think>. Every token of it buys answer, not reasoning.
     # 0 = the closing round keeps the per-round max_tokens.
-    engine.max_output = int(entry.get("max_output_tokens", 32768) or 0)
+    engine.max_output = _engine_int(entry, name, "max_output_tokens", 32768)
     # Hard wall for one turn, in seconds — a limit on a round, thinking model or
     # not. 0 = no wall. It must reach the HTTP client too, whose 600 s read
     # timeout would otherwise kill a long round.
-    engine.turn_timeout = int(entry.get("turn_timeout", 36000) or 0)
+    engine.turn_timeout = turn_timeout
     # Whether a cut-off round is resumed at all. There is deliberately no round
     # budget: the pad grows until time or context stops it, both of which are
     # real limits. A round that reasons nothing ends it (see _think_pad).
     engine.reasoning = bool(entry.get("reasoning", True))
     # Seconds held back from turn_timeout so the answer still fits inside the
     # wall after a long think. Thinking stops at turn_timeout - this.
-    engine.answer_time_reserve = int(entry.get("answer_time_reserve",
-                                               DEFAULT_ANSWER_TIME_RESERVE) or 0)
+    engine.answer_time_reserve = _engine_int(entry, name, "answer_time_reserve",
+                                             DEFAULT_ANSWER_TIME_RESERVE)
     # How many times a pad that has filled the context may be distilled to a
     # checkpoint and carry on. Off by default: compaction is lossy, and for a
     # derivation that carries exact values through many steps, concluding from a
@@ -375,7 +423,7 @@ def build_engine(config, model_name=None, forward=None):
     # no spelling for "always" — the one setting a thought that must not be cut
     # short actually wants. Thinking is still bounded: by the turn clock, and by
     # the pad having to shrink on every cycle to continue at all.
-    engine.max_pad_compactions = int(entry.get("max_pad_compactions", 0) or 0)
+    engine.max_pad_compactions = _engine_int(entry, name, "max_pad_compactions", 0)
     mode = str(entry.get("resume_mode", "auto")).lower()
     if mode not in ("auto", "chat", "raw", "off"):
         logger.warning("model %s: bad resume_mode %r, using auto", name, mode)
@@ -415,6 +463,45 @@ def check_section_shapes(config):
 
 
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+# The two binds that mean "every interface". A bind is an instruction to the
+# listening socket, not an address, and these two are the ones with no address
+# behind them at all — nothing can dial 0.0.0.0. Four places need to know it:
+# the Host allowlist (which must not add them as names), the startup banner
+# (which prints the LAN address instead), and the two clients below.
+WILDCARD_BINDS = ("0.0.0.0", "::")
+
+
+def core_url(core_cfg, scheme="http"):
+    """Where a client on *this machine* dials the core, from core.bind/core.port.
+
+    One rule, because the terminal client and the bot were each answering it
+    and had drifted: the bot grew the wildcard substitution and the valueless-
+    key fallback, the terminal client did not, and so `core.bind: 0.0.0.0` —
+    the documented way to serve other machines — left `chat.py` dialling
+    `http://0.0.0.0:8770`, which works only by accident on Linux, while
+    `bind: ::` and a valueless `bind:` produced `http://:::8770` and
+    `http://None:8770`, which do not work at all.
+
+    `or`, not `.get(k, default)`: `bind:` with nothing after it parses as None,
+    and a None that reached the f-string was the literal text "None".
+
+    This is deliberately *not* the question `server._webui_host` answers. That
+    one is "what should a human type into a browser", and for a wildcard bind
+    it replies with the LAN address so the line is useful from another machine.
+    This one is "what does a process on this host connect to", and the answer
+    for a wildcard bind is loopback. Same input, different questions, different
+    answers — do not merge them.
+
+    The port keeps the bare int() both copies used, so this is the bind fix and
+    nothing else: a core whose port is junk fails boot_blockers first, and a
+    client that quietly dialled the default port instead would be reporting a
+    connection error against an address the user never configured.
+    """
+    host = core_cfg.get("bind") or "127.0.0.1"
+    if host in WILDCARD_BINDS:
+        host = "127.0.0.1"
+    return f"{scheme}://{host}:{int(core_cfg.get('port', 8770))}"
 
 
 def boot_blockers(config):
