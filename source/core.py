@@ -46,6 +46,101 @@ PROTOCOL_VERSION = 1
 
 DEFAULT_ROLLOVER_PCT = 90
 DEFAULT_ROLLOVER_MODE = "auto"
+ROLLOVER_MODES = ("auto", "ask", "off")
+
+
+# ---- the conversation scalars, in one place -------------------------------
+#
+# Each of these settings is read on two paths — Session.__init__ at startup and
+# _reload when the config changes under a running core — and for a long time
+# each path spelled out its own key, default and coercion. Nothing tied the two
+# spellings together, so they were free to disagree, and they did: the
+# auto|ask|off check below lived only on the __init__ copy, which meant a typo
+# in rollover_mode warned and fell back at startup but on /reload passed
+# straight through to every session, matched none of the three readers, and
+# silently disabled automatic rollover everywhere.
+#
+# So the fact lives once and both paths read it. The validation travels with
+# the key rather than with one of its readers, which is the part that matters:
+# there is no second place left for a new reader to forget it.
+#
+# `where` names whoever is asking, for the log line; None asks silently, which
+# _reload uses for the old-config side of its before/after pair — that value
+# exists only to be compared against, and warning twice about one typo is noise.
+
+def _as_int(raw, default, where):
+    # int() because YAML gives a string for `max_history_messages: "50"`, and
+    # `len(history) > "50"` raises on 3.x rather than comparing. int_or, not
+    # int: a bad number in a config file should cost a log line, not the turn.
+    return configlib.int_or(raw, default)
+
+
+def _as_pct(raw, default, where):
+    # `or 0` before the coercion: rollover_at_percent documents `0 = never`,
+    # and an explicit null in YAML means the same thing — without it int_or
+    # would see None, hand back the default, and switch rollover back on.
+    return configlib.int_or(raw or 0, default)
+
+
+def _as_bool(raw, default, where):
+    return bool(raw)
+
+
+def _as_mode(raw, default, where):
+    mode = str(raw).lower()
+    if mode not in ROLLOVER_MODES:
+        if where:
+            logger.warning("%s: bad rollover_mode %r, using %s", where, mode, default)
+        return default
+    return mode
+
+
+class _Scalar:
+    """One conversation setting: where it comes from and what it has to be."""
+
+    __slots__ = ("attr", "key", "default", "coerce", "note")
+
+    def __init__(self, attr, key, default, coerce, note=""):
+        self.attr, self.key, self.default = attr, key, default
+        self.coerce, self.note = coerce, note
+
+    def read(self, conv, where):
+        return self.coerce(conv.get(self.key, self.default), self.default, where)
+
+
+CONV_SCALARS = (
+    _Scalar("max_history", "max_history_messages", 100, _as_int,
+            # 0 — or a negative, or junk — means "never trim", matching
+            # rollover_at_percent's documented `0 = never`, and matching what
+            # the code accidentally did before: history[-0:] is the whole list,
+            # not the empty one the number literally asks for.
+            note="0 means never trim"),
+    _Scalar("rollover_pct", "rollover_at_percent", DEFAULT_ROLLOVER_PCT, _as_pct,
+            # Held per session, never written back to the shared config dict: a
+            # session that disables its own rollover must not disable everyone
+            # else's. Also a runtime brake — see _configured_rollover_pct.
+            note="0 means never roll over"),
+    _Scalar("rollover_mode", "rollover_mode", DEFAULT_ROLLOVER_MODE, _as_mode,
+            note="auto | ask | off"),
+    _Scalar("prompt_timeout", "prompt_timeout", 60, _as_int,
+            note="seconds to wait for an answer to a rollover prompt"),
+    _Scalar("rollover_before_think", "rollover_before_think", True, _as_bool,
+            # Roll over before a turn that has no room left to think in, rather
+            # than after one whose thinking was squeezed out. Auto mode only.
+            note="auto mode only"),
+    _Scalar("journal_on", "journal", True, _as_bool,
+            # Turning this off mid-session leaves the open segment where it is:
+            # it closes at the next rollover, holding what was recorded before.
+            note="the append-only record of what this session generates"),
+)
+
+# digest_turns is deliberately absent, and has to be: it is resolved per session
+# against that session's model entry, so there is no single config-wide value
+# this table could carry and no single old/new pair _reload could compare. Both
+# paths ask _configured_digest_turns() instead. If you add a setting here that
+# a model entry can override, it belongs with digest_turns, not in the table.
+
+_SCALAR_BY_ATTR = {sc.attr: sc for sc in CONV_SCALARS}
 # The handoff is the only thing that survives a rollover besides one exchange, so
 # it is the whole of the session's memory afterwards. Four sections now share it
 # (RULED OUT was added so dead ends are not re-walked), and 800 could not hold
@@ -270,24 +365,11 @@ class Session:
         self.schemas = []
         self.tools_tok = 0
 
-        # int() because YAML gives a string for `max_history_messages: "50"`,
-        # and `len(history) > "50"` raises on 3.x rather than comparing.
-        # 0 (or a negative, or junk) means "never trim", matching
-        # rollover_at_percent's documented `0 = never` — and matching what the
-        # code accidentally did before, since history[-0:] is the whole list,
-        # not the empty one the number literally asks for.
-        self.max_history = configlib.int_or(conv.get("max_history_messages", 100), 100)
-        # Per session, never on the shared config dict: a session that disables
-        # its own rollover must not disable everyone else's.
-        self.rollover_pct = self._configured_rollover_pct()
-        self.rollover_mode = str(conv.get("rollover_mode", DEFAULT_ROLLOVER_MODE)).lower()
-        if self.rollover_mode not in ("auto", "ask", "off"):
-            logger.warning("session %s: bad rollover_mode %r, using auto",
-                           name, self.rollover_mode)
-            self.rollover_mode = "auto"
-        # Roll over before a turn that has no room left to think in, rather than
-        # after one whose thinking was squeezed out. Auto mode only.
-        self.rollover_before_think = bool(conv.get("rollover_before_think", True))
+        # Every conversation scalar, read through the one table that owns the
+        # key, the default and the coercion — see CONV_SCALARS. /reload reads
+        # the same table, which is what keeps the two paths from drifting.
+        for sc in CONV_SCALARS:
+            setattr(self, sc.attr, sc.read(conv, f"session {name}"))
         # Collapse each finished turn's tool traffic to a digest, leaving the
         # question and the answer verbatim. Off by default: it is the first
         # thing here that discards context on purpose, and it is only safe
@@ -298,7 +380,6 @@ class Session:
         # model_name is still None here and use_model() sets it, which is why
         # use_model() asks again once it has.
         self.digest_turns = self._configured_digest_turns()
-        self.prompt_timeout = configlib.int_or(conv.get("prompt_timeout", 60), 60)
         self.declined_at = None
         self.warned_over = False
         # Said once per window when the pre-turn gate declines to act on a
@@ -405,10 +486,10 @@ class Session:
         # them, because it alone may move the history.
         self._steering = []
 
-        # The append-only record of what this session generates — reasoning
-        # included, tool output untruncated. Opened on the first thing worth
+        # journal_on — the append-only record of what this session generates,
+        # reasoning included, tool output untruncated — is set with the rest of
+        # the conversation scalars above. Opened on the first thing worth
         # recording and closed by a rollover; see store.Journal.
-        self.journal_on = bool(conv.get("journal", True))
         self._journal = None
 
     # ---- events ----------------------------------------------------------
@@ -483,6 +564,20 @@ class Session:
     @property
     def budget(self):
         return getattr(self.engine, "context_length", configlib.DEFAULT_CONTEXT_LENGTH)
+
+    @property
+    def trip(self):
+        """Used-token count at which this window rolls over. 0 means never.
+
+        One derived fact, and it used to be spelled out at four sites under
+        three different guard policies — one guarding both operands, two
+        guarding only rollover_pct, one guarding neither. All three agree:
+        a falsy budget makes the bare expression `int(0 * pct / 100)`, which
+        is 0, the same answer the guarded forms give. So the guard belongs
+        here once, and the callers ask.
+        """
+        return (int(self.budget * self.rollover_pct / 100)
+                if self.budget and self.rollover_pct else 0)
 
     @property
     def busy(self):
@@ -575,10 +670,8 @@ class Session:
         (/clear, /new) ask here for the configured value again instead of
         leaving automatic rollover off for the life of the session.
         """
-        conv = self.config.get("conversation", {})
-        return configlib.int_or(
-            conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0,
-            DEFAULT_ROLLOVER_PCT)
+        return _SCALAR_BY_ATTR["rollover_pct"].read(
+            self.config.get("conversation", {}), f"session {self.name}")
 
     def _configured_digest_turns(self):
         """Whether this session digests its turns: the model may override.
@@ -1781,8 +1874,7 @@ class Session:
         self.emit(ev("notice", level="info",
                      text=f"only {max(0, self._pad_headroom())} tok of thinking room "
                           f"left — rolling over before the turn"))
-        await self.roll_over("no thinking headroom", used,
-                             int(self.budget * self.rollover_pct / 100))
+        await self.roll_over("no thinking headroom", used, self.trip)
 
     def _warn_no_thinking_room(self):
         """Say once that this window has no room left to think in.
@@ -2208,7 +2300,7 @@ class Session:
                      tokens=count_text(digest), digest_text=digest))
 
     async def _after_turn(self, measured_used):
-        trip = int(self.budget * self.rollover_pct / 100) if self.budget and self.rollover_pct else 0
+        trip = self.trip
         rolled = False
         if trip:
             used = measured_used if measured_used is not None else self.estimate()
@@ -2457,9 +2549,7 @@ class Session:
                                   if self.cached_input else None),
                 "cached_total": self.total_cached,
                 "rollover": {"mode": self.rollover_mode, "percent": self.rollover_pct,
-                             "trip": int(self.budget * self.rollover_pct / 100)
-                                     if self.rollover_pct else 0,
-                             "count": self.rollover_count},
+                             "trip": self.trip, "count": self.rollover_count},
                 # What the server actually does, not what the config assumes.
                 # Probed once per engine and cached, so this is free after the
                 # first /info; see LLMEngine.capabilities.
@@ -2523,8 +2613,7 @@ class Session:
                 await self.persist()
                 return {"ok": True}
             if name == "rollover":
-                trip = (int(self.budget * self.rollover_pct / 100)
-                        if self.rollover_pct else 0)
+                trip = self.trip
                 # Asked for by a person, so the guard an earlier disk failure
                 # set is cleared first: they have usually just freed the space
                 # and this is how they say so. If it fails again it is set again.
@@ -3100,36 +3189,19 @@ class SessionManager:
         # is None, which a bare default never replaces.
         old_conv = old_cfg.get("conversation") or {}
         new_conv = fresh.get("conversation") or {}
-        # (attribute, what the old config said, what the new one says). apply_config
-        # reassigns only where the session still holds the old value.
-        scalars = [
-            # int_or, not int: reload() has already committed the new config by
-            # the time this list is built, so a ValueError raised here would
-            # leave the core running the new settings with half the sessions
-            # never told about them — the one failure mode the all-or-nothing
-            # validation above exists to prevent.
-            ("max_history", configlib.int_or(old_conv.get("max_history_messages", 100), 100),
-                            configlib.int_or(new_conv.get("max_history_messages", 100), 100)),
-            ("rollover_pct",
-             configlib.int_or(old_conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0,
-                              DEFAULT_ROLLOVER_PCT),
-             configlib.int_or(new_conv.get("rollover_at_percent", DEFAULT_ROLLOVER_PCT) or 0,
-                              DEFAULT_ROLLOVER_PCT)),
-            ("rollover_mode", str(old_conv.get("rollover_mode", DEFAULT_ROLLOVER_MODE)).lower(),
-                              str(new_conv.get("rollover_mode", DEFAULT_ROLLOVER_MODE)).lower()),
-            ("prompt_timeout", configlib.int_or(old_conv.get("prompt_timeout", 60), 60),
-                               configlib.int_or(new_conv.get("prompt_timeout", 60), 60)),
-            ("rollover_before_think", bool(old_conv.get("rollover_before_think", True)),
-                                      bool(new_conv.get("rollover_before_think", True))),
-            # digest_turns is deliberately absent: it is resolved per session
-            # against that session's model entry, so there is no single pair of
-            # old/new values this shared list could carry. apply_config asks
-            # _configured_digest_turns() instead.
-            # Turning this off leaves the open segment where it is: it closes at
-            # the next rollover, holding what was recorded before the reload.
-            ("journal_on", bool(old_conv.get("journal", True)),
-                           bool(new_conv.get("journal", True))),
-        ]
+        # One (attr, old, new) triple per conversation scalar, read through
+        # the same CONV_SCALARS table __init__ uses. apply_config applies a
+        # value only where the session still agrees with the old one, so the
+        # old side is there to be compared against and nothing else — which is
+        # why it reads silently: one typo should warn once, not twice.
+        #
+        # The coercions cannot raise. reload() has already committed the new
+        # config by the time this list is built, so a ValueError here would
+        # leave the core running the new settings with half the sessions never
+        # told about them — the one failure mode the all-or-nothing validation
+        # above exists to prevent. That is int_or's job inside the table.
+        scalars = [(sc.attr, sc.read(old_conv, None), sc.read(new_conv, "reload"))
+                   for sc in CONV_SCALARS]
 
         updated = deferred = 0
         # A list, not the live view: a client attaching mid-iteration would
