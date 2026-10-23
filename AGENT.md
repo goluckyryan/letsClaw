@@ -66,12 +66,24 @@ engines are constructed without I/O, so a wrong `base_url` only bites on the fir
 turn, not at boot. A green `/health` means the core is up, not that a model works.
 To confirm a model, open a client and send a message.
 
-The suites live in `tests/`, all of them, and `tests/run_all.py` runs them:
+The suites live in `tests/`, all of them, and `tests/run_all.py` runs them — but
+**`tests/` is gitignored and stays that way**, so the suite exists on the machine
+it was written on and nowhere else. If you are reading this in a clone and
+`tests/` is missing, that is why, and it is deliberate. The two gates below are a
+local discipline, not something a fresh checkout or a CI job can enforce.
 
 ```bash
 .venv/bin/python tests/run_all.py          # fast tier — gate a refactor on this
 .venv/bin/python tests/run_all.py --full   # everything — gate a commit on this
 ```
+
+Two consequences worth knowing before you change anything. A test you write is
+invisible to `git diff`, `git status` and review, so a source fix lands tracked
+while the test guarding it does not — write both, but do not expect the pair to
+travel together. And `run_all.py` with no flags skips the entire browser tier, so
+a green fast run says nothing at all about `web/app.js`; anything touching the
+WebUI has to be re-run with `--full` and `CORE=`, or by calling the suite
+directly with `LIVE_TESTS=1`.
 
 The fast tier is hermetic: no network, no ssh, no browser, no spawned core.
 `--full` adds the ones that need something from outside the process, and three
@@ -143,7 +155,7 @@ source/discord_probe.py  "start the bot?" — serve.sh and install.sh both ask i
 source/chunker.py        fence-aware answer chunking (shared by the clients)
 source/version.py        `__version__` — the one place the release number lives
 web/                     the WebUI (vanilla JS, no build)
-tests/                   every suite and helper, whatever it tests
+tests/                   every suite and helper, whatever it tests (gitignored)
 models/base.md           the base behavior file (committed)
 models/sessions/*.md     per-session behavior + archived transcripts (gitignored)
 config.example.yaml      the documented config template (committed)

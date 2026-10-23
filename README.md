@@ -209,6 +209,8 @@ letsClaw/
   models/                  behavior Markdown: base.md + per-model
   web/                     browser client: index.html, app.js, style.css
   tests/                   every suite and helper; run_all.py runs them
+                           (gitignored — local to the machine it was written on,
+                            so a clone has none)
   source/                  all Python
     paths.py                 where the repo root is — one definition
     server.py  core.py       the core service and the session logic
@@ -1503,8 +1505,9 @@ A formula KaTeX rejects is shown in the theme's error colour with its source int
 rather than taking the message down, and if KaTeX fails to load the page falls back to
 showing the TeX source in a code span.
 
-**Tests.** Every suite and helper lives in `tests/`, whatever it tests, and
-`.venv/bin/python tests/run_all.py` runs them all: the fast tier on its own is
+**Tests.** Every suite and helper lives in `tests/`, whatever it tests — and
+`tests/` is gitignored, so everything in this section describes the tree it was
+written in, not a clone. `.venv/bin/python tests/run_all.py` runs them all: the fast tier on its own is
 hermetic — no network, no ssh, no browser, no spawned core — and `--full` adds the
 ones that need something from outside the process. `test_browser.py`,
 `test_image.py` and `test_math_render.py` stay skipped even under `--full` until
