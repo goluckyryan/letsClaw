@@ -81,11 +81,6 @@ CHANGED: bullet list of anything written, edited or created — paths — or "no
 RULED OUT: bullet list of approaches tried and rejected, each with why — so they are not tried again"""
 
 
-def _resolve(path, default):
-    """Config paths are repo-relative unless absolute."""
-    return paths.resolve(path, default)
-
-
 # How much of each tool call's arguments reaches the summariser. Enough to
 # identify what was run — the path, the pattern, the command — without one long
 # argument blob crowding out the conversation around it.
@@ -105,8 +100,8 @@ def _safe(name):
 
 
 def live_dir(config=None):
-    return _resolve((config or {}).get("conversation", {}).get("live_dir"),
-                    DEFAULT_LIVE_DIR)
+    return paths.resolve((config or {}).get("conversation", {}).get("live_dir"),
+                         DEFAULT_LIVE_DIR)
 
 
 def live_path(name, config=None):
@@ -174,7 +169,11 @@ async def delete_live(name, config=None):
 
     def _unlink():
         path.unlink(missing_ok=True)
-        path.with_suffix(".tmp").unlink(missing_ok=True)
+        # atomic_write names its temp file with mkstemp, so the orphan a kill -9
+        # mid-write can strand is `.<name>.json.<rand>.tmp` — glob it rather than
+        # guessing one name. If that pattern changes in paths.py, change it here.
+        for orphan in path.parent.glob(f".{path.name}.*.tmp"):
+            orphan.unlink(missing_ok=True)
 
     await asyncio.to_thread(_unlink)
 
@@ -183,8 +182,8 @@ def log_dir(config=None):
     """Where log files live — the directory holding logging.file."""
     config = config or {}
     configured = (config.get("logging") or {}).get("file")
-    return _resolve(str(Path(configured).parent) if configured else None,
-                    DEFAULT_LOG_DIR)
+    return paths.resolve(str(Path(configured).parent) if configured else None,
+                         DEFAULT_LOG_DIR)
 
 
 def id_log_path(config=None):
@@ -276,8 +275,8 @@ async def unregister_id(session_id, config=None):
 def sessions_dir(config=None):
     """Where archived transcripts and the index live."""
     config = config or {}
-    return _resolve(config.get("conversation", {}).get("sessions_dir"),
-                    DEFAULT_SESSIONS_DIR)
+    return paths.resolve(config.get("conversation", {}).get("sessions_dir"),
+                         DEFAULT_SESSIONS_DIR)
 
 
 async def purge_archives(session_id, config=None):
@@ -385,8 +384,12 @@ async def save_transcript(history, model_name, config=None, session_name="sessio
     path = directory / f"{sid}_{_safe(session_name)}_{_stamp()}.json"
 
     def _write():
-        directory.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+        # Atomic for the same reason every other durable write here is, even
+        # though the name is unique and nothing is being replaced: a torn write
+        # leaves a truncated archive under a name that looks complete, and
+        # roll_over has already thrown the live history away by the time anyone
+        # reads it back. This is the one artifact that cannot be regenerated.
+        paths.atomic_write(path, json.dumps(payload, indent=2, ensure_ascii=False))
         return path
 
     final = await asyncio.to_thread(_write)
@@ -565,7 +568,7 @@ async def append_handoff(text, model_name, transcript_path, config=None,
     lock keeps two concurrent handoffs from interleaving mid-write.
     """
     config = config or {}
-    path = _resolve(config.get("memory", {}).get("long_term_file"), DEFAULT_LONG_TERM)
+    path = paths.resolve(config.get("memory", {}).get("long_term_file"), DEFAULT_LONG_TERM)
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     entry = [f"\n## {stamp}  [{session_name}]  ({model_name})\n"]
     if journal_path:

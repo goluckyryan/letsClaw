@@ -420,7 +420,11 @@ Tab-separated, not whitespace-split, because session names contain spaces.
 
 `save_transcript` → `<sid>_<safe-name>_<stamp>.json`. Encoding **and** writing
 both go through `to_thread`, because a 262144-token history can be megabytes
-and would otherwise stall every other session's stream.
+and would otherwise stall every other session's stream. The write is
+`paths.atomic_write`, like every other durable write here — not for the rename
+(the name is fresh, there is nothing to replace) but for the fsync. `roll_over`
+drops the live history once this returns, so a torn archive is not a damaged
+copy of the conversation, it is the conversation.
 
 `state/sessions/index.jsonl` holds four record types — `archive`, `journal`,
 `rename`, `delete`. **The index exists because a filename is not an identity**:
