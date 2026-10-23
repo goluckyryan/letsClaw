@@ -212,6 +212,67 @@ async def _followup(interaction, text, *, file=None, filename="answer.md"):
     return sent
 
 
+async def _send_in_chunks(text, max_lines, send, attach, what="answer"):
+    """Post `text` in as many messages as it takes; attach the lot if one is refused.
+
+    The one loop both post paths run — the channel's (`say`, falling back to
+    `_attach_answer`) and the interaction's (`_followup`, falling back to a
+    `_followup` carrying the file). It was written out twice, and the two
+    copies drifted: each held its own slice of the old `max_messages` cap and
+    the slices were off by one, so the slash path posted one message more than
+    the channel path did. Removing the cap deleted that disagreement but not
+    the thing that produced it, which is why this exists.
+
+    `send` and `attach` are the two things that genuinely differ between the
+    callers, so they are the arguments: everything a caller does to put one
+    message up, and everything it does when Discord will not take one. Both
+    sinks already report a refusal by returning False rather than raising, and
+    this relies on that — past a refusal the remaining chunks would go missing
+    in silence, so the whole text goes up unchunked (Markdown intact) behind a
+    line saying which message it stopped at.
+    """
+    chunks = chunk_discord_text(text, max_chars=DISCORD_LIMIT,
+                                max_lines=max_lines)
+    for i, chunk in enumerate(chunks):
+        if not await send(chunk):
+            await attach(f"_…Discord refused message {i + 1} of "
+                         f"{len(chunks)}; the full {what} is attached._")
+            return
+
+
+def _load_json(path, what, consequence):
+    """One of this bot's two small JSON state files, or {} if it cannot be read.
+
+    Absent is the ordinary first-run case and says nothing; unparseable is
+    damage and says so. The distinction matters because the next save
+    overwrites the file either way, so this log line is the only evidence that
+    anything was lost — which is why `consequence` is a caller's argument
+    rather than one generic sentence: what losing the name map costs is not
+    what losing the session map costs, and the person reading the log is the
+    one who has to decide whether to care.
+    """
+    try:
+        return json.loads(path.read_text())
+    except OSError:
+        return {}
+    except ValueError as e:
+        logger.warning("the %s at %s is unreadable (%s); %s",
+                       what, path, e, consequence)
+        return {}
+
+
+def _save_json(path, data, what):
+    """Atomically, because a torn state file reads as damage on next start.
+
+    A failure here is logged and swallowed: both callers are saving a
+    convenience, and neither has anything useful to do about it.
+    """
+    try:
+        paths.atomic_write(path, json.dumps(data, indent=1))
+    except OSError as e:
+        logger.warning("could not save the %s: %s", what, e)
+
+
 def _mention_summary(settings):
     mode = settings.mention_only
     if mode is True:
@@ -1028,18 +1089,10 @@ class ChannelBridge:
         a download at exactly the length that most needed reading. A long burst
         is throttled rather than dropped (discord.py waits out a 429 and
         retries), and a send Discord genuinely refuses still lands in the
-        attachment path below, so nothing is lost by letting the answer run.
+        attachment path, so nothing is lost by letting the answer run.
         """
-        chunks = chunk_discord_text(text, max_chars=DISCORD_LIMIT,
-                                    max_lines=self.settings.max_lines)
-        for i, chunk in enumerate(chunks):
-            if not await self.say(chunk):
-                # The rest would be lost in silence otherwise. Say how much,
-                # and put the whole answer up so nothing is actually gone.
-                await self._attach_answer(
-                    text, f"_…Discord refused message {i + 1} of "
-                          f"{len(chunks)}; the full answer is attached._")
-                return
+        await _send_in_chunks(text, self.settings.max_lines, self.say,
+                              lambda note: self._attach_answer(text, note))
 
     async def _attach_answer(self, text, note):
         """Put the whole answer up as answer.md, unchunked so the Markdown is
@@ -1708,44 +1761,26 @@ class LetsClawBot(discord.Client):
         brand new channel, and its conversation would be left behind under the
         old name.
         """
-        try:
-            self._names = json.loads(NAMES_FILE.read_text())
-        except OSError:
-            self._names = {}
-        except ValueError as e:
-            # Unparseable, not absent: say so. Falling back to {} silently
-            # looks identical to a first run, and the next save overwrites the
-            # file — so the only evidence of the damage is this line.
-            logger.warning("the channel-name map at %s is unreadable (%s); "
-                           "starting from empty", NAMES_FILE, e)
-            self._names = {}
+        self._names = _load_json(NAMES_FILE, "channel-name map",
+                                 "starting from empty")
 
     def _save_names(self):
-        try:
-            paths.atomic_write(NAMES_FILE, json.dumps(self._names, indent=1))
-        except OSError as e:
-            # Losing this costs a rename being missed, never a conversation.
-            logger.warning("could not save the channel-name map: %s", e)
+        # Losing this costs a rename being missed, never a conversation.
+        _save_json(NAMES_FILE, self._names, "channel-name map")
 
     def _load_maps(self):
-        """The explicit channel → session map, as /session last left it."""
-        try:
-            self._maps = json.loads(MAPS_FILE.read_text())
-        except OSError:
-            self._maps = {}
-        except ValueError as e:
-            # Worse to lose than the name map: every channel pointed at a
-            # session by /session silently falls back to its default one.
-            logger.warning("the session map at %s is unreadable (%s); "
-                           "every channel falls back to its default session",
-                           MAPS_FILE, e)
-            self._maps = {}
+        """The explicit channel → session map, as /session last left it.
+
+        Worse to lose than the name map, which is what the consequence line
+        says: every channel pointed somewhere by /session silently falls back
+        to its default session.
+        """
+        self._maps = _load_json(
+            MAPS_FILE, "session map",
+            "every channel falls back to its default session")
 
     def _save_maps(self):
-        try:
-            paths.atomic_write(MAPS_FILE, json.dumps(self._maps, indent=1))
-        except OSError as e:
-            logger.warning("could not save the session map: %s", e)
+        _save_json(MAPS_FILE, self._maps, "session map")
 
     async def _rename_core_session(self, old, new):
         """Move a session to a new name. True if it is now called `new`."""
@@ -2295,20 +2330,15 @@ class LetsClawBot(discord.Client):
         # channel already has the real news, so this only has to close the
         # interaction off.
         text = bridge.render_response(event) or "_done_"
-        chunks = chunk_discord_text(text, max_chars=DISCORD_LIMIT,
-                                    max_lines=self.settings.max_lines)
-        # Every chunk, like _post_text on the channel side: the cap the two
-        # paths used to share — and disagreed about by one message — is gone.
-        for i, chunk in enumerate(chunks):
-            if not await _followup(interaction, chunk):
-                # The rest would go missing in silence otherwise, exactly
-                # as _post_text guards against on the channel side.
-                await _followup(
-                    interaction,
-                    f"_…Discord refused message {i + 1} of {len(chunks)}; "
-                    f"the full reply is attached._",
-                    file=io.BytesIO(text.encode("utf-8")))
-                return
+        # The same loop the channel side runs, now actually the same loop: this
+        # path and _post_text differ in where a message goes and how the
+        # fallback attaches it, and in nothing else.
+        await _send_in_chunks(
+            text, self.settings.max_lines,
+            lambda chunk: _followup(interaction, chunk),
+            lambda note: _followup(interaction, note,
+                                   file=io.BytesIO(text.encode("utf-8"))),
+            what="reply")
 
     # -- text commands --
 
