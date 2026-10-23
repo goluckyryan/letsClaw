@@ -1499,7 +1499,7 @@ function handle(e) {
 
   case 'notice':
     if (S.busy) clearWaiting();
-    notice(e.text, e.level === 'warn' ? 'warn' : '');
+    notice(e.text, {warn: 'warn', error: 'err'}[e.level] || '');
     if (S.busy) setWaiting('thinking');
     return;
 

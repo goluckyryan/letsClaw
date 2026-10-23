@@ -1179,8 +1179,10 @@ class ChannelBridge:
         elif t == "error":
             await self.say(f"⚠️ {_one_line(event.get('msg')) or 'something failed'}")
         elif t == "notice":
-            if event.get("level") == "warn":
-                await self.say(f"_⚠️ {_one_line(event.get('text'))}_")
+            # Only the levels that earn an interruption get posted; info stays quiet.
+            mark = {"warn": "⚠️", "error": "❌"}.get(event.get("level"))
+            if mark:
+                await self.say(f"_{mark} {_one_line(event.get('text'))}_")
         elif t == "digest_done":
             # Held, not posted. The core emits this inside the turn, so it
             # arrives before turn_end — and this client posts nothing until

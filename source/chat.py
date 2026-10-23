@@ -277,7 +277,7 @@ class Renderer:
         elif t == "busy":
             self.line(f"⏳ {e['reason']}")
         elif t == "notice":
-            mark = {"warn": "⚠️ ", "info": ""}.get(e.get("level"), "")
+            mark = {"warn": "⚠️ ", "error": "❌ ", "info": ""}.get(e.get("level"), "")
             self.line(f"   {mark}{e['text']}")
         elif t == "error":
             self.line(f"\n❌ {e['msg']}")
