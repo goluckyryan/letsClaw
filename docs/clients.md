@@ -121,8 +121,9 @@ tool's name when the model did not give one. `show_tools: false` drops the
 line and keeps the trimming: the blank was a bug, not a setting.
 
 **Answers are chunked** by `source/chunker.py` (fence-aware, so a code block is
-never split mid-fence). Past `max_messages` chunks the opening chunks go out
-and the whole answer follows as an `answer.md` attachment
+never split mid-fence). Every chunk is posted, however many: the answer is
+already bounded by the model's `max_output_tokens`. Only a chunk Discord
+actually refuses falls back to the whole answer as an `answer.md` attachment
 (`_attach_answer()`).
 
 **Authorisation is a hard-required allowlist.** `discord.users` empty — the

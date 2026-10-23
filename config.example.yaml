@@ -220,13 +220,13 @@ core:
 #   # lost — the core keeps the session, and the next message re-attaches to it.
 #   idle_detach_min: 60   # close an idle channel's socket after this long; 0 = never
 #                        # (always connected, so a turn run from the WebUI still posts to Discord)
-#   # How many messages one answer may become before the whole thing goes up as
-#   # an answer.md attachment instead of flooding the channel.
-#   #   0 = unlimited — always post in full, never file it. Safe: an answer is
-#   #       capped by the model's max_output_tokens (~65 messages at 32k, ~16 at
-#   #       8k), and discord.py throttles itself on 429. A busy shared channel is
-#   #       the reason to keep a limit; a private one is the reason not to.
-#   max_messages: 8
+#   # There is no cap on how many messages one answer may become. There was one
+#   # — max_messages, which posted the opening and filed the rest as answer.md —
+#   # and it was removed: an answer is already bounded by the model's
+#   # max_output_tokens (~65 messages at 32k, ~16 at 8k), and filing the tail
+#   # turned a readable thread into a download at exactly the length that most
+#   # needed reading. discord.py waits out a 429, so a long burst is slow rather
+#   # than lost.
 #   max_lines: 17         # soft cap per message; Discord collapses tall ones
 #   # A turn is posted once, at the end, so a tool round shows up as nothing at
 #   # all — and the newlines that sat around the call survive as a blank gap in

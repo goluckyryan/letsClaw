@@ -192,7 +192,7 @@ state/                   live conversations, archives, memory (gitignored)
   along with `discord.token`, `discord.core` and `discord.core_token`, which a
   live bot deliberately will not re-point at another core on the strength of a
   reload event, and the bot's posting limits `discord.idle_detach_min`,
-  `discord.max_messages`, `discord.max_lines`, `discord.show_tools` and
+  `discord.max_lines`, `discord.show_tools` and
   `discord.auto_names`, which `Settings.__init__` parses once. A restart there means restarting the *bot*,
   which is a separate process from the core.
 - **The Discord allowlist does reload.** `discord.users`, `mention_only` and

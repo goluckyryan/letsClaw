@@ -82,8 +82,6 @@ logger = logging.getLogger("letclaw.discord")
 
 DISCORD_LIMIT = 2000            # per message, in UTF-16 code units
 DEFAULT_IDLE_DETACH_MIN = 60
-DEFAULT_MAX_MESSAGES = 8        # before the answer goes up as a file instead
-MAX_MESSAGES_UNLIMITED = 0      # max_messages: 0 — never file it, always post in full
 DEFAULT_MAX_LINES = 17
 # A tool line is a margin note, so it has to fit on one. Past this the model
 # wrote a sentence where it was asked for a phrase, and the rest is cut.
@@ -312,22 +310,6 @@ class Settings:
         raw_idle = blob.get("idle_detach_min")
         self.idle_detach_min = (DEFAULT_IDLE_DETACH_MIN if raw_idle in (None, "")
                                 else int(raw_idle))
-        # 0 means unlimited: post every chunk, never fall back to answer.md.
-        # Read with an explicit None check rather than `or`, which would see a
-        # literal 0 as absent and hand back the default -- the exact bug that
-        # makes "off" impossible to say. A negative is a typo, not a second way
-        # to say unlimited, so it clamps to 1.
-        raw_max = blob.get("max_messages")
-        if raw_max is None or raw_max == "":
-            self.max_messages = DEFAULT_MAX_MESSAGES
-        else:
-            try:
-                n = int(raw_max)
-            except (TypeError, ValueError):
-                logger.warning("discord.max_messages %r is not a number; using %d",
-                               raw_max, DEFAULT_MAX_MESSAGES)
-                n = DEFAULT_MAX_MESSAGES
-            self.max_messages = MAX_MESSAGES_UNLIMITED if n == 0 else max(1, n)
         self.max_lines = max(1, int(blob.get("max_lines") or DEFAULT_MAX_LINES))
         # Absent means on. Off still collapses the blank the round leaves
         # behind — that is a bug, not a feature anyone turns off — and only
@@ -955,7 +937,7 @@ class ChannelBridge:
 
         The line goes into self.answer rather than out as its own message:
         a turn that ran twenty commands would otherwise be twenty extra posts
-        past whatever max_messages says, and the ordering this client promises
+        interleaved with the answer, and the ordering this client promises
         — text and tools in the order the core sent them — comes free from
         appending to the one list.
 
@@ -1033,40 +1015,31 @@ class ChannelBridge:
     async def _post_text(self, text):
         """Post text to the channel under the channel's own limits.
 
-        Both the model's answer and a command's reply come through here, so
-        max_messages, the refused-send check and the attach-the-whole-thing
-        fallback apply to each in the same way. They did not: this path used to
-        chunk and send with no cap and no look at say()'s result, so a long
-        command reply — a /files listing, a /help on a big tool set — flooded
-        the channel past the limit the user set for exactly that, and a
-        refusal at chunk 12 of 40 dropped the remaining 28 in silence.
+        Both the model's answer and a command's reply come through here, so the
+        refused-send check and the attach-the-whole-thing fallback apply to each
+        in the same way. They did not: this path used to chunk and send with no
+        look at say()'s result, so a refusal at chunk 12 of 40 dropped the
+        remaining 28 in silence.
+
+        Every chunk goes out, however many. There was a cap — `discord.max_messages`,
+        which posted the opening and filed the rest as answer.md — and it was
+        removed: the real bound is the context window, which already limits how
+        much there is to post, and filing the tail turned a readable thread into
+        a download at exactly the length that most needed reading. A long burst
+        is throttled rather than dropped (discord.py waits out a 429 and
+        retries), and a send Discord genuinely refuses still lands in the
+        attachment path below, so nothing is lost by letting the answer run.
         """
         chunks = chunk_discord_text(text, max_chars=DISCORD_LIMIT,
                                     max_lines=self.settings.max_lines)
-        unlimited = self.settings.max_messages == MAX_MESSAGES_UNLIMITED
-        if unlimited or len(chunks) <= self.settings.max_messages:
-            # Every chunk, however many. The model cannot run away with this:
-            # max_output_tokens caps an answer long before the count gets
-            # interesting, and discord.py throttles itself on 429.
-            for i, chunk in enumerate(chunks):
-                if not await self.say(chunk):
-                    # The rest would be lost in silence otherwise. Say how much,
-                    # and put the whole answer up so nothing is actually gone.
-                    await self._attach_answer(
-                        text, f"_…Discord refused message {i + 1} of "
-                              f"{len(chunks)}; the full answer is attached._")
-                    return
-            return
-
-        # Long enough that posting it all would flood the channel. Send the
-        # opening of the answer so the thread still reads, and attach the whole
-        # thing — unchunked, so the Markdown is intact — rather than truncate.
-        for chunk in chunks[:self.settings.max_messages - 1]:
+        for i, chunk in enumerate(chunks):
             if not await self.say(chunk):
-                break
-        await self._attach_answer(
-            text, f"_…{len(chunks) - self.settings.max_messages + 1} more messages "
-                  f"worth — the full answer is attached._")
+                # The rest would be lost in silence otherwise. Say how much,
+                # and put the whole answer up so nothing is actually gone.
+                await self._attach_answer(
+                    text, f"_…Discord refused message {i + 1} of "
+                          f"{len(chunks)}; the full answer is attached._")
+                return
 
     async def _attach_answer(self, text, note):
         """Put the whole answer up as answer.md, unchunked so the Markdown is
@@ -1681,13 +1654,9 @@ class LetsClawBot(discord.Client):
         names, when = self._models
         if names and time.monotonic() - when < 60:
             return names
-        url = (self.settings.core.replace("wss://", "https://")
-                                 .replace("ws://", "http://")) + "/models"
-        headers = ({"Authorization": f"Bearer {self.settings.core_token}"}
-                   if self.settings.core_token else {})
         try:
             async with self._core_http.get(
-                    url, headers=headers,
+                    self._core_url() + "/models", headers=self._auth(),
                     timeout=aiohttp.ClientTimeout(total=5)) as r:
                 body = await r.json()
             names = list(body.get("configured") or [])
@@ -2328,33 +2297,18 @@ class LetsClawBot(discord.Client):
         text = bridge.render_response(event) or "_done_"
         chunks = chunk_discord_text(text, max_chars=DISCORD_LIMIT,
                                     max_lines=self.settings.max_lines)
-        unlimited = self.settings.max_messages == MAX_MESSAGES_UNLIMITED
-        if unlimited or len(chunks) <= self.settings.max_messages:
-            for i, chunk in enumerate(chunks):
-                if not await _followup(interaction, chunk):
-                    # The rest would go missing in silence otherwise, exactly
-                    # as _post_text guards against on the channel side.
-                    await _followup(
-                        interaction,
-                        f"_…Discord refused message {i + 1} of {len(chunks)}; "
-                        f"the full reply is attached._",
-                        file=io.BytesIO(text.encode("utf-8")))
-                    return
-            return
-        # Capped: send as much as fits, and attach the rest rather than drop it.
-        for chunk in chunks[:self.settings.max_messages]:
+        # Every chunk, like _post_text on the channel side: the cap the two
+        # paths used to share — and disagreed about by one message — is gone.
+        for i, chunk in enumerate(chunks):
             if not await _followup(interaction, chunk):
-                break
-        # The whole thing, unchunked, so the Markdown is intact.
-        if not await _followup(
-                interaction,
-                f"_…{len(chunks) - self.settings.max_messages} more messages "
-                f"worth — the full answer is attached._",
-                file=io.BytesIO(text.encode("utf-8"))):
-            logger.warning("session %s: could not attach the command answer",
-                           bridge.link.session)
-            await _followup(interaction,
-                            "_…the rest of the answer would not upload._")
+                # The rest would go missing in silence otherwise, exactly
+                # as _post_text guards against on the channel side.
+                await _followup(
+                    interaction,
+                    f"_…Discord refused message {i + 1} of {len(chunks)}; "
+                    f"the full reply is attached._",
+                    file=io.BytesIO(text.encode("utf-8")))
+                return
 
     # -- text commands --
 
@@ -2404,7 +2358,7 @@ class LetsClawBot(discord.Client):
             event = await bridge.run_command("info")
             cur = (event or {}).get("info", {}).get("session") or bridge.link.session
             mapped = str(message.channel.id) in self._maps
-            how = "set by /session" if mapped else "the default for this channel"
+            how = "set by !session" if mapped else "the default for this channel"
             await bridge.say(f"🆔 this channel talks to **`{cur}`** — {how}.\n"
                              f"_`!session <name>` points it somewhere else; "
                              f"`!session auto` brings it back._")
