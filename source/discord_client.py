@@ -95,6 +95,15 @@ RECONNECT_RESET_S = 30
 SWEEP_INTERVAL_S = 60
 DENY_QUIET_S = 600              # one refusal per stranger per 10 minutes
 READY_TIMEOUT_S = 10
+# How long a call to the core's HTTP side waits. The short one is for calls
+# somebody is sitting in front of — an autocomplete, the digest after a
+# /session switch — where a late answer is worth little more than no answer;
+# Discord's own autocomplete deadline is 3s, so 5 is already generous. The
+# long one is for bookkeeping nothing is blocked on, which can afford to be
+# patient. These were five bare literals before, which is why the two reads of
+# the same endpoint could differ without anyone deciding that they should.
+CORE_INTERACTIVE_S = 5
+CORE_BOOKKEEPING_S = 10
 # How long the link waits, once the socket is done, for the queued tail of an
 # answer to finish posting. Long enough for a handful of Discord sends at a
 # second each; short enough that a wedged handler cannot hold up a reconnect.
@@ -1707,16 +1716,12 @@ class LetsClawBot(discord.Client):
         names, when = self._models
         if names and time.monotonic() - when < 60:
             return names
-        try:
-            async with self._core_http.get(
-                    self._core_url() + "/models", headers=self._auth(),
-                    timeout=aiohttp.ClientTimeout(total=5)) as r:
-                body = await r.json()
+        # Autocomplete is a convenience; failing it must not fail the command,
+        # so a None here leaves the previous answer standing and says nothing.
+        body = await self._core_json("/models", what="fetch model names")
+        if body is not None:
             names = list(body.get("configured") or [])
             self._models = (names, time.monotonic())
-        except Exception as e:
-            # Autocomplete is a convenience; failing it must not fail the command.
-            logger.debug("could not fetch model names: %s", e)
         return names
 
     # -- idle detach --
@@ -1754,6 +1759,43 @@ class LetsClawBot(discord.Client):
         return ({"Authorization": f"Bearer {self.settings.core_token}"}
                 if self.settings.core_token else {})
 
+    async def _core_json(self, path, *, what, timeout=CORE_INTERACTIVE_S,
+                         log=None):
+        """GET `path` from the core; the JSON object it answered with, or None.
+
+        Four read paths used to spell this request out in full, and what they
+        differed in was not the request — it was the timeout and the log level,
+        two bare values sitting in four hand-copies with nothing stating which
+        was deliberate. Here they are arguments, so a caller says *this one is
+        patient* or *this one is only a warning* out loud.
+
+        None means it did not work: unreachable, timed out, not JSON, or a body
+        that is not an object. Every caller has something sensible to do with
+        that and none of them should have to tell those cases apart.
+
+        `what` completes "could not …", so each line reads exactly as it did
+        before this helper existed. `log` defaults to debug because three of
+        the four callers are conveniences whose failure the user never needs to
+        hear about; the one that is not passes `logger.warning`.
+        """
+        log = log or logger.debug
+        try:
+            async with self._core_http.get(
+                    self._core_url() + path, headers=self._auth(),
+                    timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                body = await r.json()
+        except Exception as e:
+            log("could not %s: %s", what, e)
+            return None
+        if not isinstance(body, dict):
+            # Logged rather than passed on: every caller is about to call .get
+            # on this, and a list would have raised there before this helper
+            # existed. Same outcome, one place, and it says what happened.
+            log("could not %s: the core answered with %s, not an object",
+                what, type(body).__name__)
+            return None
+        return body
+
     def _load_names(self):
         """What each channel's session was called last time this bot ran.
 
@@ -1783,12 +1825,19 @@ class LetsClawBot(discord.Client):
         _save_json(MAPS_FILE, self._maps, "session map")
 
     async def _rename_core_session(self, old, new):
-        """Move a session to a new name. True if it is now called `new`."""
+        """Move a session to a new name. True if it is now called `new`.
+
+        The one core call that stays spelled out, and not by oversight: it is a
+        POST, and it answers three different ways that matter — 200 is done,
+        404 means there was nothing there so the new name is free, and anything
+        else is a real failure to report. `_core_json` exists to hide a status
+        code behind "a dict or None", which is the wrong shape for this.
+        """
         try:
             async with self._core_http.post(
                     f"{self._core_url()}/sessions/{quote(old, safe='')}/rename",
                     headers=self._auth(), json={"to": new},
-                    timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    timeout=aiohttp.ClientTimeout(total=CORE_BOOKKEEPING_S)) as r:
                 if r.status == 200:
                     logger.info("renamed session %r -> %r to follow Discord",
                                 old, new)
@@ -1814,14 +1863,16 @@ class LetsClawBot(discord.Client):
         """
         if not self.settings.auto_names:
             return
-        try:
-            async with self._core_http.get(
-                    f"{self._core_url()}/sessions", headers=self._auth(),
-                    timeout=aiohttp.ClientTimeout(total=10)) as r:
-                existing = {s["name"] for s in (await r.json())["sessions"]}
-        except Exception as e:
-            logger.warning("could not list sessions to rename them: %s", e)
+        # Deliberately not session_names()' cached list, though the URL is the
+        # same: this renames sessions off the answer, so a 60-second-old view
+        # is a wrong rename, where for an autocomplete it is only a stale menu.
+        # A warning rather than debug for the same reason — nothing else tells
+        # anyone the startup migration did not run.
+        body = await self._core_json("/sessions", what="list sessions to rename them",
+                                     timeout=CORE_BOOKKEEPING_S, log=logger.warning)
+        if body is None:
             return
+        existing = {s.get("name") for s in body.get("sessions") or []}
 
         moved = 0
         for guild in self.guilds:
@@ -1996,14 +2047,10 @@ class LetsClawBot(discord.Client):
     async def _post_history(self, bridge):
         """The tail of the session just joined, so the channel can see where
         it landed. One message, capped — a switch should not replay a novel."""
-        try:
-            async with self._core_http.get(
-                    f"{self._core_url()}/sessions/{quote(bridge.link.session, safe='')}/history",
-                    headers=self._auth(),
-                    timeout=aiohttp.ClientTimeout(total=5)) as r:
-                body = await r.json()
-        except Exception as e:
-            logger.debug("could not fetch the switch digest: %s", e)
+        body = await self._core_json(
+            f"/sessions/{quote(bridge.link.session, safe='')}/history",
+            what="fetch the switch digest")
+        if body is None:
             return
         lines = []
         for m in body.get("messages", [])[-3:]:
@@ -2018,15 +2065,10 @@ class LetsClawBot(discord.Client):
         names, when = self._sessions
         if names and time.monotonic() - when < 60:
             return names
-        try:
-            async with self._core_http.get(
-                    f"{self._core_url()}/sessions", headers=self._auth(),
-                    timeout=aiohttp.ClientTimeout(total=5)) as r:
-                body = await r.json()
+        body = await self._core_json("/sessions", what="fetch session names")
+        if body is not None:
             names = [s["name"] for s in body.get("sessions", []) if s.get("name")]
             self._sessions = (names, time.monotonic())
-        except Exception as e:
-            logger.debug("could not fetch session names: %s", e)
         return names
 
     async def handle_session(self, interaction, args=""):
