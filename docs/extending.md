@@ -121,9 +121,14 @@ reviewer will check first:
 
 | | |
 |---|---|
-| read-only | `if not _authorised(request): raise web.HTTPUnauthorized()` |
+| read-only | `_read_guard(request)` — auth only |
 | anything that writes | `_guard(request)` — auth **and** same-origin |
 | open on purpose | neither, and say in the docstring why it holds no secrets |
+
+One call either way, so which gate a route takes is a grep and not a pattern
+match. Call the named guard rather than inlining `if not _authorised(request)`:
+six routes did that before, and an inlined check is one a later edit can
+change in one place and not the other five.
 
 `_authorised` is the project's single answer to "who is asking". Do not write a
 header-only or query-only variant for one route: a second definition is how two

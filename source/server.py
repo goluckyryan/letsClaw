@@ -18,6 +18,7 @@ readable for `stop` and for the rollover answer while a turn is in flight.
 import argparse
 import asyncio
 import copy
+import json
 import logging
 import os
 import secrets
@@ -253,6 +254,18 @@ def _same_origin(request):
     return bool(netloc) and netloc == request.headers.get("Host", "")
 
 
+def _read_guard(request):
+    """The one gate a read-only route needs: who is asking.
+
+    Named rather than inlined because the asymmetry with `_guard` is the whole
+    design, and six routes spelled this out two lines at a time — which made
+    "which gate does this route take?" a pattern match instead of a grep, and
+    left the read half with no single place to change.
+    """
+    if not _authorised(request):
+        raise web.HTTPUnauthorized()
+
+
 def _guard(request):
     """Both gates a state-changing route needs: who is asking, and from where.
 
@@ -261,12 +274,29 @@ def _guard(request):
     lands whether or not the reply is readable, and a WebSocket is exempt from
     the same-origin policy altogether, which is why those two take both checks.
     """
-    if not _authorised(request):
-        raise web.HTTPUnauthorized()
+    _read_guard(request)
     if not _same_origin(request):
         logger.warning("refused a cross-origin %s %s from Origin %r",
                        request.method, request.path, request.headers.get("Origin"))
         raise web.HTTPForbidden(reason="cross-origin request refused")
+
+
+async def _json_body(request):
+    """The request's parsed JSON body, or a 400 saying it was not JSON.
+
+    Raises rather than returns the failure, the way `_guard` does, so a route
+    that wants a body costs one line instead of a four-line try/except —
+    which is what `config_save` and `rename_session` each held, character for
+    character. Raised and returned responses are the same thing to aiohttp;
+    the status, body and Content-Type here are byte-identical to the
+    `web.json_response` the two call sites used to return.
+    """
+    try:
+        return await request.json()
+    except ValueError:
+        raise web.HTTPBadRequest(
+            text=json.dumps({"ok": False, "error": "malformed JSON"}),
+            content_type="application/json")
 
 
 async def health(request):
@@ -281,8 +311,7 @@ async def health(request):
 
 
 async def models(request):
-    if not _authorised(request):
-        raise web.HTTPUnauthorized()
+    _read_guard(request)
     cfg = request.app["config"]
     return web.json_response({
         "default": cfg.get("models", {}).get("default_model"),
@@ -292,8 +321,7 @@ async def models(request):
 
 
 async def sessions(request):
-    if not _authorised(request):
-        raise web.HTTPUnauthorized()
+    _read_guard(request)
     return web.json_response({"sessions": request.app["mgr"].describe()})
 
 
@@ -303,8 +331,7 @@ async def session_history(request):
     Read-only and capped: a switch digest needs the last few lines, not the
     whole conversation, and an unbounded copy of a long session would be a
     slow JSON for no one."""
-    if not _authorised(request):
-        raise web.HTTPUnauthorized()
+    _read_guard(request)
     name = request.match_info["name"]
     try:
         limit = int(request.query.get("limit", 10))
@@ -368,8 +395,7 @@ def _redacted(config):
 async def config_get(request):
     """The live config dict, for the Settings panel. Authenticated like the
     other state reads, and with the two tokens redacted on the way out."""
-    if not _authorised(request):
-        raise web.HTTPUnauthorized()
+    _read_guard(request)
     return web.json_response({
         "path": str(request.app["config_path"]),
         "config": _redacted(request.app["config"]),
@@ -381,10 +407,7 @@ async def config_save(request):
     it is the one section whose change is safe to apply without a restart
     and that a browser should not be editing byte-for-byte."""
     _guard(request)
-    try:
-        body = await request.json()
-    except ValueError:
-        return web.json_response({"ok": False, "error": "malformed JSON"}, status=400)
+    body = await _json_body(request)
     webui = body.get("webui") if isinstance(body, dict) else None
     if not isinstance(webui, dict):
         return web.json_response(
@@ -402,10 +425,7 @@ async def reload_config(request):
 
 async def rename_session(request):
     _guard(request)
-    try:
-        body = await request.json()
-    except ValueError:
-        return web.json_response({"ok": False, "error": "malformed JSON"}, status=400)
+    body = await _json_body(request)
     result = await request.app["mgr"].rename(request.match_info["name"],
                                              body.get("to"))
     if not result["ok"]:
@@ -531,7 +551,7 @@ def _scan_files(root):
 async def files_list(request):
     """What is in webui.files_dir, for the WebUI's Media panel.
 
-    Read-only, so _authorised alone — the same gate /sessions and /config take,
+    Read-only, so _read_guard alone — the same gate /sessions and /config take,
     and for the same reason: no CORS headers go out, so a hostile page can fire
     this GET and cannot read what comes back (see _guard).
 
@@ -544,8 +564,7 @@ async def files_list(request):
     Off the event loop: a cold directory of a few hundred entries is a stat per
     file, and the core is shared.
     """
-    if not _authorised(request):
-        raise web.HTTPUnauthorized()
+    _read_guard(request)
     root = files_root(request.app["config"])
     found = await asyncio.to_thread(_scan_files, root)
     return web.json_response({
@@ -561,7 +580,7 @@ async def files_list(request):
 async def files_delete(request):
     """Remove one image from webui.files_dir.
 
-    _guard, not _authorised: this is a write, so it takes both checks the way
+    _guard, not _read_guard: this is a write, so it takes both checks the way
     delete_session and config_save do. The token may still arrive by query —
     _authorised accepts either — but the gate that matters for a browser is
     _same_origin, and a fetch() can send the header, which is why the WebUI
@@ -599,8 +618,7 @@ async def files(request):
     own answer cannot make either of those pass for /etc/shadow. Both live in
     _files_target now, so the listing and the delete cannot drift from this.
     """
-    if not _authorised(request):
-        raise web.HTTPUnauthorized()
+    _read_guard(request)
     target, ctype = _files_target(request, request.match_info["name"])
     return web.FileResponse(target, headers={
         "Content-Type": ctype,
