@@ -717,7 +717,7 @@ main::after {
 .stats  { color: var(--dim); }
 .notice { color: var(--dim); }
 .notice.warn { color: var(--warn); }
-.notice.err, .err-line { color: var(--err); }
+.notice.err { color: var(--err); }
 
 .roll .slab-box {
   background: var(--bg2);

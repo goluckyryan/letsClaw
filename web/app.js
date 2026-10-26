@@ -140,6 +140,19 @@ function num(v) {
  */
 const IMG_OK = /^[\w.-]+\.(?:png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
 
+/* Where a file served by the core lives, token and all.
+
+   The token rides in the query because the two things that ask for these URLs
+   — an <img> and the media panel's <video>/<audio> — set their own src and
+   cannot carry an Authorization header. Both built this by hand; the media
+   panel's copy even said so in a comment (*"Same URL imgTag() builds, for the
+   same reason"*), which is a duplicate admitting to being one rather than
+   being called.
+
+   Not authQuery(): that joins with `&`, for a URL that already has a query. */
+const fileURL = (name) => `/files/${encodeURIComponent(name)}`
+                        + (S.token ? `?token=${encodeURIComponent(S.token)}` : '');
+
 function imgTag(alt, src) {
   // inlineMd runs on text esc() has already been over, so '&' here is already
   // '&amp;'. Escaping again would show '&amp;amp;' in the alt -- the entities
@@ -150,9 +163,7 @@ function imgTag(alt, src) {
     .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
     .replace(/^\/files\//, '');
   if (!IMG_OK.test(raw)) return null;
-  // The token rides in the query because an <img> cannot carry a header.
-  const url = `/files/${encodeURIComponent(raw)}` +
-              (S.token ? `?token=${encodeURIComponent(S.token)}` : '');
+  const url = fileURL(raw);
   // loading=lazy: a long transcript of plots should not fetch them all on
   // attach. The alt doubles as the caption when the file is missing.
   return `<img class="md-img" src="${url.replace(/"/g, '&quot;')}" alt="${alt}" ` +
@@ -353,6 +364,21 @@ function newThink() {
     blockT0: 0,      // when the current run of thinking began
     last: 0,         // when thinking last moved — the stamp's end point
     samples: [],     // [ms, tokens] for the rate, trimmed to RATE_WINDOW
+  };
+}
+
+/* The other per-turn record: where this turn's output is being written.
+
+   S.turn's sibling. newThink() has been a factory since it was written and
+   this one was three copies of the same object literal — turn_start, and the
+   two mid-turn paths that have to invent a record because the page attached
+   after the turn began. Adding a field meant finding all three, and the one
+   you missed would read `undefined` only on a mid-turn reload. */
+function newTurn() {
+  return {
+    textEl: null,    // the .body the answer streams into
+    reasonEl: null,  // the open thinking block, if one is showing
+    tools: new Map() // tool id -> its slab, so a result can find its call
   };
 }
 
@@ -942,6 +968,21 @@ function flushStream(el) {
   if (!(el._raw || '').trim()) el.closest('.msg').remove();
 }
 
+/* The turn's open answer and thinking blocks are finished with; whatever comes
+   next starts its own.
+
+   What a tool call and a steering interjection both do before they draw
+   anything, and the two spellings were character-for-character identical.
+   Naming it says what they are doing, which "three statements guarded by an
+   if" did not: the next words from the model are a new block, not more of the
+   one on screen. */
+function closeBlocks() {
+  if (!S.turn) return;
+  flushStream(S.turn.textEl);
+  S.turn.textEl = null;
+  S.turn.reasonEl = null;
+}
+
 function setWaiting(label) {
   clearWaiting();
   waitEl = node('slab waiting');
@@ -965,6 +1006,26 @@ function setWaiting(label) {
 function clearWaiting() {
   if (waitTimer) { clearInterval(waitTimer); waitTimer = null; }
   if (waitEl) { waitEl.remove(); waitEl = null; }
+}
+
+/* Empty the log and put the view back to how a fresh session starts.
+
+   The three statements always belonged together and were written out four
+   times anyway — switching session, `cleared`, `wiped`, `deleted` — and the
+   fifth site, hello()'s replay after a session renumbers its events, had only
+   the middle one. That is what a copied group costs: the one site that forgets
+   a line looks exactly like the four that did not. Scrolled up when the replay
+   arrived, you got the whole transcript with following still off and whatever
+   spinner was on screen left orphaned above it, because nothing had cleared
+   the wait.
+
+   Anything clearing the log wants all three. A spinner outlives the messages
+   it belonged to; `follow` is about where the next line goes, and after a wipe
+   the only sensible answer is the bottom. */
+function resetView() {
+  clearWaiting();
+  log.innerHTML = '';
+  follow = true;
 }
 
 /* Copy to the clipboard, saying whether it worked.
@@ -1266,9 +1327,7 @@ function switchSession(name) {
   S.turn = null;
   S.sent = loadSent(name);         // the recall list follows the session, not the tab
   S.histIdx = -1;
-  clearWaiting();
-  log.innerHTML = '';
-  follow = true;               // a fresh session starts at the bottom, following
+  resetView();                 // a fresh session starts at the bottom, following
   history.replaceState(null, '', `?session=${encodeURIComponent(name)}`);
   refreshSessions();          // move the highlight now, don't wait for the poll
   connect();
@@ -1320,7 +1379,7 @@ function handle(e) {
   case 'hello': return hello(e);
 
   case 'turn_start':
-    S.turn = { textEl: null, reasonEl: null, tools: new Map() };
+    S.turn = newTurn();
     think = newThink();
     setBusy(true);
     // Asking is the intent to follow, whatever the view was doing: re-assert
@@ -1346,7 +1405,7 @@ function handle(e) {
     think.chars += e.delta.length;
     thinkGrew();
     if (!reasonShown()) return;
-    if (!S.turn) S.turn = { textEl: null, reasonEl: null, tools: new Map() };
+    if (!S.turn) S.turn = newTurn();
     if (!S.turn.reasonEl) S.turn.reasonEl = reasonBlock(e);
     appendText(S.turn.reasonEl, e.delta);
     scrollSoon();
@@ -1366,7 +1425,7 @@ function handle(e) {
     // spinner holding the live figure goes away.
     stampThinking();
     clearWaiting();
-    if (!S.turn) S.turn = { textEl: null, reasonEl: null, tools: new Map() };
+    if (!S.turn) S.turn = newTurn();
     else S.turn.reasonEl = null;   // any further thinking opens its own block
     if (!S.turn.textEl) S.turn.textEl = msg('llm', '🐱', null, e).querySelector('.body');
     stream(S.turn.textEl, e.delta);
@@ -1375,7 +1434,7 @@ function handle(e) {
   case 'tool_call': {
     stampThinking();
     clearWaiting();
-    if (S.turn) { flushStream(S.turn.textEl); S.turn.textEl = null; S.turn.reasonEl = null; }
+    closeBlocks();
     const el = toolSlab(e.name, e.arguments, e);
     if (S.turn) S.turn.tools.set(e.id, el);
     setWaiting(e.name);
@@ -1405,7 +1464,7 @@ function handle(e) {
     // the interjection as a user message — it is one, so pinUser pins it.
     stampThinking();
     clearWaiting();
-    if (S.turn) { flushStream(S.turn.textEl); S.turn.textEl = null; S.turn.reasonEl = null; }
+    closeBlocks();
     const st = msg('user', '📌', esc(e.text), e);
     st.classList.add('steering');
     addPin(st);
@@ -1475,16 +1534,12 @@ function handle(e) {
 
   case 'session_state':
     if (e.what === 'cleared') {
-      clearWaiting();
-      log.innerHTML = '';
-      follow = true;
+      resetView();
       notice('🧹 History cleared (/rollover archives it instead).');
       if (e.record) notice(`📓 what was said is still in ${e.record}`);
       freshGauge(e);
     } else if (e.what === 'wiped') {
-      clearWaiting();
-      log.innerHTML = '';
-      follow = true;
+      resetView();
       notice(`🔥 Everything wiped — conversation and ${e.files || 0} archive file(s).`);
       freshGauge(e);
     } else if (e.what === 'model') {
@@ -1523,9 +1578,7 @@ function handle(e) {
       // Deleted from another window, or from this one while we were attached.
       // The socket stays up: the core re-homes it onto a fresh session of the
       // same name as soon as we say anything, so the name stays usable.
-      clearWaiting();
-      log.innerHTML = '';
-      follow = true;
+      resetView();
       setGauge(0, S.budget, false);
       // Name the archives too. They are the half that used to survive a
       // delete, so saying nothing about them now reads as if they still do.
@@ -1572,7 +1625,7 @@ function handle(e) {
   case 'error':
     clearWaiting();
     setBusy(false);
-    slab('notice err', `❌ ${esc(e.msg)}`);
+    notice(`❌ ${e.msg}`, 'err');
     return;
 
   case 'response': return response(e);
@@ -1592,9 +1645,18 @@ function hello(e) {
   // empty and `gap` false, and everything the new session said was dropped
   // with nothing on screen to say why. Clearing the log makes the replay below
   // fire, which is how the page catches up.
+  //
+  // `fresh` is read far below, and is captured here because this branch is
+  // about to write to the log. It cleared the log so the replay would fire,
+  // then appended its own warning line — so by the time the replay asked
+  // "is the log empty?" the answer was no, and the catch-up it had just gone
+  // to the trouble of arranging never happened. Measured on the real page:
+  // the notice was the only thing on screen afterwards.
+  let fresh = log.childElementCount === 0;
   if (typeof e.seq === 'number' && e.seq < S.lastSeq) {
     S.lastSeq = e.seq;
-    log.innerHTML = '';
+    resetView();
+    fresh = true;
     notice('this session restarted its event numbering — replaying it from the top', 'warn');
   }
   S.model = e.model;
@@ -1618,7 +1680,6 @@ function hello(e) {
   if ($('#model').options.length) selectModel(); else loadModels().then(selectModel);
   setHint();
 
-  const fresh = log.childElementCount === 0;
   if (fresh) {
     replayHistory(e.messages || []);
     if ((e.messages || []).length) separator(`rejoined — ${e.messages.length} messages already in this session`);
@@ -1713,7 +1774,7 @@ function response(e) {
     waiter.resolve(e);
     if (waiter.silent) return;
   }
-  if (e.ok === false) { slab('notice err', `❌ ${esc(e.error)}`); return; }
+  if (e.ok === false) { notice(`❌ ${e.error}`, 'err'); return; }
   if (e.changed) return showReload(e);
   if (e.info) return showInfo(e.info);
   if ('behavior' in e) {
@@ -2008,7 +2069,7 @@ $('#btn-restart').onclick = () => {
   // (socket gone) is something else entirely and is reported as itself.
   rpc('restart', '', true).then((reply) => {
     if (reply.ok) return;
-    if (!reply.busy) { slab('notice err', `❌ ${esc(reply.error)}`); return; }
+    if (!reply.busy) { notice(`❌ ${reply.error}`, 'err'); return; }
     if (confirm(`A turn is running in ${reply.busy.join(', ')}.\n\nRestart anyway? Those turns are lost.`)) {
       rpc('restart', 'force').catch((err) => notice(`/restart: ${err.message}`, 'warn'));
     }
@@ -2518,9 +2579,6 @@ function sessionImageNames() {
 const medSize = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB`
                       : n >= 1024 ? `${Math.round(n / 1024)} KB` : `${n} B`);
 
-// Same URL imgTag() builds, for the same reason: an <img> cannot send a header.
-const medSrc = (name) => `/files/${encodeURIComponent(name)}`
-                       + (S.token ? `?token=${encodeURIComponent(S.token)}` : '');
 
 function renderMedia(data) {
   mediaData = data;
@@ -2559,7 +2617,7 @@ function renderMedia(data) {
     // backstop when they are not.
     const img = cfgEl('img');
     img.className = 'med-thumb';
-    img.src = medSrc(f.name);
+    img.src = fileURL(f.name);
     img.alt = f.name;
     img.loading = 'lazy';
     img.decoding = 'async';
