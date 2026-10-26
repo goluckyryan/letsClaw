@@ -686,6 +686,29 @@ def format_carryover(handoff, transcript_path, journal_path=None):
     return "\n\n".join(parts)
 
 
+async def _summarise(engine, messages, max_tokens):
+    """One summariser request, with the no-thinking hint and its fallback.
+
+    A thinking model will spend the entire budget reasoning and hand back an
+    empty string, so ask the chat template to turn thinking off. Servers that
+    don't understand the hint get a plain retry — `extra_body`, not a bare
+    kwarg, because the OpenAI SDK rejects unknown arguments.
+
+    Both summarisers below ran byte-identical copies of this. Nothing had
+    drifted, which is the point of extracting it now: the hint is a guess
+    about one server's chat template, so the day it needs a second key or a
+    different fallback is the day two copies become one right and one wrong.
+    """
+    try:
+        text = await engine.chat(
+            messages, max_tokens=max_tokens, temperature=0.2,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+    except Exception as e:
+        logger.warning(f"no-thinking hint rejected ({e}); retrying without it")
+        text = await engine.chat(messages, max_tokens=max_tokens, temperature=0.2)
+    return (text or "").strip()
+
+
 async def build_handoff(engine, history, max_tokens=1500, prior=""):
     """Ask the model to compress the conversation. Returns "" if it produced nothing.
 
@@ -710,18 +733,7 @@ async def build_handoff(engine, history, max_tokens=1500, prior=""):
             f"Conversation so far:\n\n{body}\n\n"
             f"Write a handoff using exactly these four sections:\n\n{_HANDOFF_FORMAT}")},
     ]
-    # A thinking model will spend the entire budget reasoning and hand back an
-    # empty string, so ask the chat template to turn thinking off. Servers that
-    # don't understand the hint get a plain retry.
-    try:
-        text = await engine.chat(
-            messages, max_tokens=max_tokens, temperature=0.2,
-            # extra_body, not a bare kwarg — the OpenAI SDK rejects unknown arguments.
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}})
-    except Exception as e:
-        logger.warning(f"no-thinking hint rejected ({e}); retrying without it")
-        text = await engine.chat(messages, max_tokens=max_tokens, temperature=0.2)
-    return (text or "").strip()
+    return await _summarise(engine, messages, max_tokens)
 
 
 def digest_messages(turn_slice, pad=""):
@@ -777,16 +789,7 @@ async def build_turn_digest(engine, turn_slice, pad="", max_tokens=600,
     messages = digest_messages(turn_slice, pad)
     if not messages:
         return ""
-    # Same hint and same fallback as build_handoff: a thinking model spends the
-    # whole budget reasoning and returns an empty string otherwise.
-    try:
-        text = await engine.chat(
-            messages, max_tokens=max_tokens, temperature=0.2,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}})
-    except Exception as e:
-        logger.warning(f"no-thinking hint rejected ({e}); retrying without it")
-        text = await engine.chat(messages, max_tokens=max_tokens, temperature=0.2)
-    text = (text or "").strip()
+    text = await _summarise(engine, messages, max_tokens)
     if not text:
         return ""
     return f"{text}\n\n{record}".strip() if record else text
