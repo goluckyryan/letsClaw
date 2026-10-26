@@ -24,7 +24,6 @@ import re
 import secrets
 import time
 from collections import deque
-from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -234,8 +233,12 @@ def now_stamp():
     Display metadata for the clients' timestamps — a history message and the
     events that draw it carry the same stamp, so a live turn and its replay
     read identically. Never sent to the model: api_messages() drops it.
+
+    Re-exported rather than defined, so a message's stamp and the stamps on
+    everything `session` writes to disk cannot come to disagree about the
+    format. It lives there because `session` cannot import `core` back.
     """
-    return datetime.now().isoformat(timespec="seconds")
+    return store.now_stamp()
 
 
 def api_messages(history):
@@ -959,7 +962,7 @@ class Session:
             # for a file that predates this field instead.
             "session_id": self.session_id,
             "model": self.model_name,
-            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "saved_at": now_stamp(),
             # Restored so a client reconnecting with an old last_seq is told it
             # missed something, instead of being silently handed a numbering
             # that restarted at 1 underneath it.
@@ -3454,8 +3457,8 @@ class SessionManager:
         # worked must not be reported as failed because a log line did not land.
         try:
             await store.append_index(
-                {"t": "rename", "id": s.session_id, "from": old, "to": new,
-                 "at": datetime.now().isoformat(timespec="seconds")}, self.config)
+                {"t": "rename", "id": s.session_id, "from": old, "to": new},
+                self.config)
         except OSError as e:
             logger.warning("could not record the rename in the session index: %s", e)
         # The id log names the conversation too; an entry still showing the old
@@ -3556,7 +3559,6 @@ class SessionManager:
         try:
             await store.append_index(
                 {"t": "delete", "id": s.session_id, "name": name,
-                 "at": datetime.now().isoformat(timespec="seconds"),
                  "messages": messages, "files": files, "bytes": freed},
                 self.config)
         except OSError as e:

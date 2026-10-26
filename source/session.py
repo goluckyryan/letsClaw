@@ -87,7 +87,26 @@ RULED OUT: bullet list of approaches tried and rejected, each with why — so th
 _CALL_ARGS_CHARS = 200
 
 
+def now_stamp():
+    """Local wall-clock time, seconds — the one spelling of a record's time.
+
+    Here and not in `core`, which is where it reads most naturally, because
+    `core` imports this module and the reverse would be a cycle. `core`
+    re-exports it under the same name, so the fifteen call sites there and
+    everything written to disk here resolve to this single line.
+
+    One line matters because the index is sorted on it. `archive`, `journal`,
+    `rename` and `delete` records interleave in one file, and a record type
+    added later with `utcnow()` or `timespec="milliseconds"` would sort into
+    the wrong place with nothing to show for it — the strings still compare,
+    they just compare wrongly. `append_index` stamps every record from here
+    so a caller cannot supply a format at all.
+    """
+    return datetime.now().isoformat(timespec="seconds")
+
+
 def _stamp():
+    """The same instant as a filename: no colons, which Windows refuses."""
     return datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 
 
@@ -240,8 +259,7 @@ async def register_id(session_id, name, config=None):
         records = _read_id_log(path)
         created = next((r[2] for r in records if r[0] == session_id), None)
         kept = [r for r in records if r[0] != session_id]
-        kept.append((session_id, field,
-                     created or datetime.now().isoformat(timespec="seconds")))
+        kept.append((session_id, field, created or now_stamp()))
         _write_id_log(path, kept)
 
     async with _id_log_lock:
@@ -319,8 +337,18 @@ async def purge_archives(session_id, config=None):
     return await asyncio.to_thread(_purge)
 
 
-async def append_index(record, config=None):
-    """Append one record to the session index. Returns its path.
+async def append_index(record, config=None, at=None):
+    """Append one record to the session index, stamped. Returns its path.
+
+    The `at` is stamped here rather than by the caller. All four callers used
+    to hand-stamp it, each writing the format out again, and the index is the
+    one file where a disagreement is silent: the records sort by that string,
+    so a caller that reached for `utcnow()` would interleave its entries into
+    the wrong place and nothing would complain.
+
+    `at=` overrides, for the single caller that needs it: `save_transcript`
+    puts the same instant in the archive payload and in the index line, and
+    those two are meant to be the same string, not one second apart.
 
     JSON Lines rather than a JSON document, for three reasons: appending never
     rewrites what is already there, so two sessions archiving at the same moment
@@ -334,7 +362,8 @@ async def append_index(record, config=None):
     leaves the archives of one conversation scattered under two names with
     nothing joining them. `id` is what joins them.
     """
-    line = json.dumps(record, ensure_ascii=False) + "\n"
+    line = json.dumps({**record, "at": at or now_stamp()},
+                      ensure_ascii=False) + "\n"
     directory = sessions_dir(config)
     path = directory / INDEX_NAME
 
@@ -369,7 +398,7 @@ async def save_transcript(history, model_name, config=None, session_name="sessio
     stalls every other session's token stream.
     """
     directory = sessions_dir(config)
-    saved_at = datetime.now().isoformat(timespec="seconds")
+    saved_at = now_stamp()
     payload = {
         "saved_at": saved_at,
         "session": session_name,
@@ -397,8 +426,8 @@ async def save_transcript(history, model_name, config=None, session_name="sessio
     # the index must never cost the archive, so this failure only warns.
     try:
         await append_index({"t": "archive", "id": session_id, "name": session_name,
-                            "file": final.name, "at": saved_at, "model": model_name,
-                            "messages": len(history)}, config)
+                            "file": final.name, "model": model_name,
+                            "messages": len(history)}, config, at=saved_at)
     except OSError as e:
         logger.warning("could not update the session index: %s", e)
     return final
@@ -485,7 +514,7 @@ class Journal:
         path.write_text(
             f"# {self.session_name} — {self.model_name}\n\n"
             f"session_id: `{self.session_id}`  \n"
-            f"opened: {datetime.now().isoformat(timespec='seconds')}\n\n"
+            f"opened: {now_stamp()}\n\n"
             "Every model round, every tool call and every tool result, in full.\n"
             "Search with `grep -n '^## turn'` for the contents.\n",
             encoding="utf-8")
@@ -551,7 +580,6 @@ class Journal:
         try:
             await append_index({"t": "journal", "id": self.session_id,
                                 "name": self.session_name, "file": path.name,
-                                "at": datetime.now().isoformat(timespec="seconds"),
                                 "model": self.model_name, "blocks": blocks},
                                self.config)
         except OSError as e:
