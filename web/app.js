@@ -1562,7 +1562,7 @@ function handle(e) {
       rpc('info', '', true)
         .then((r) => r.info && setGauge(r.info.used, r.info.budget, false))
         .catch(() => {});
-      if (settingsOpen) settingsRefresh();   // the panel shows the live config — redraw it
+      if (isOpen('#settings')) settingsRefresh();   // the panel shows the live config — redraw it
       setHint();
     } else if (e.what === 'renamed') {
       // e.session is already the new name — emit() stamped it after the rename.
@@ -1615,7 +1615,7 @@ function handle(e) {
     // closed.
     if (S.busy) clearWaiting();
     slab('digest',
-      `<details><summary>🗜️ turn ${e.turn_id} collapsed to a ` +
+      `<details><summary>🗜️ turn ${num(e.turn_id)} collapsed to a ` +
       `${num(e.tokens)} tok digest</summary>` +
       `<pre>${esc(e.digest_text || '')}</pre></details>`, e);
     if (S.busy) setWaiting('thinking');
@@ -1798,14 +1798,14 @@ function showReload(e) {
   slab('notice',
     `<b>♻️ Config reloaded</b><br>` +
     e.changed.map((c) => esc(c)).join('<br>') +
-    `<br><br>${e.updated} session(s) updated` +
-    (e.deferred ? `, ${e.deferred} waiting for a turn to finish` : ''));
+    `<br><br>${num(e.updated)} session(s) updated` +
+    (e.deferred ? `, ${num(e.deferred)} waiting for a turn to finish` : ''));
 }
 
 function rolloverCount(ro) {
   if (!ro) return '';
   const n = ro.count || 0;
-  return ` · ${n} rollover${n !== 1 ? 's' : ''}`;
+  return ` · ${num(n)} rollover${n !== 1 ? 's' : ''}`;
 }
 // What the server was probed to actually do, against what the config assumes.
 // Shown even when the two agree: a line that only appears when something is
@@ -1813,7 +1813,9 @@ function rolloverCount(ro) {
 function serverLine(s) {
   if (!s) return '';
   const bits = [`thinking=${esc(s.reasoning_channel)}`];
-  if (s.server_ctx) bits.push(`window ${s.server_ctx}`);
+  // Not letsClaw's number: n_ctx as the model server reported it, which is the
+  // strongest case in the file for coercing at the boundary.
+  if (s.server_ctx) bits.push(`window ${num(s.server_ctx)}`);
   if (s.usage_reported != null)
     bits.push(s.usage_reported ? 'usage reported' : 'usage withheld');
   return `🛰️ ${bits.join(' · ')}<br>` +
@@ -1824,41 +1826,41 @@ function showInfo(i) {
   const pct = i.budget ? Math.round((i.used * 100) / i.budget) : 0;
   const rows = i.recent.map((m) => {
     const emoji = { system: '🤖', user: '👤', tool: '🔧' }[m.role] || '🐱';
-    return `${emoji} ${esc(m.role)}: ${esc(m.content)} (${m.tokens} tok)`;
-  }).join('<br>');
+    return `${emoji} ${esc(m.role)}: ${esc(m.content)} (${num(m.tokens)} tok)`;
+  });
   slab('notice',
     // Omitted rather than blank on a core too old to send it.
     (i.version ? `<b>🧠 letsClaw ${esc(i.version)}</b><br>` : '') +
     `<b>🤖 ${esc(i.model)}</b> @ ${esc(i.base_url)}<br>` +
     // The id as well as the name: archives are filed under it, and it is the
     // half that survives a rename.
-    `💬 ${i.messages} messages in session '${esc(i.session)}'` +
+    `💬 ${num(i.messages)} messages in session '${esc(i.session)}'` +
     (i.session_id ? ` (id <b>${esc(i.session_id)}</b> — archives are ${esc(i.session_id)}_*)` : '') +
     '<br>' +
     // The ~ marks the estimator's padded guess, and drops away once the server
     // has reported a real prompt_tokens for this window — same convention as
     // the per-turn stats line.
-    `⚡ context ${i.estimated === false ? '' : '~'}${i.used}/${i.budget} tok ` +
-    `(${pct}%) · ${i.tools_tokens} tok of tool schemas<br>` +
+    `⚡ context ${i.estimated === false ? '' : '~'}${num(i.used)}/${num(i.budget)} tok ` +
+    `(${num(pct)}%) · ${num(i.tools_tokens)} tok of tool schemas<br>` +
     (i.output_total != null
-      ? `📤 ${i.output_total} output tok generated in this session (an odometer — /clear does not rewind it)<br>`
+      ? `📤 ${num(i.output_total)} output tok generated in this session (an odometer — /clear does not rewind it)<br>`
       : '') +
     // "≥" rather than the "~" above: the tilde marks a guess that could land
     // either side, this is a sum with the unreported rounds left out and can
     // only be low. The cache line is omitted entirely when no round ever
     // reported a figure — 0% would be a claim about a server that was silent.
     (i.input_total != null
-      ? `📥 ${i.input_exact === false ? '≥' : ''}${i.input_total} input tok sent in this session ` +
+      ? `📥 ${i.input_exact === false ? '≥' : ''}${num(i.input_total)} input tok sent in this session ` +
         `(every round of every turn — the window is re-sent each time)<br>`
       : '') +
     (i.cache_hit_pct != null
-      ? `💾 ${i.cache_hit_pct}% of that served from the server's KV cache (${i.cached_total || 0} tok)<br>`
+      ? `💾 ${num(i.cache_hit_pct)}% of that served from the server's KV cache (${num(i.cached_total || 0)} tok)<br>`
       : '') +
     (i.rollover.percent
-      ? `🔄 rollover ${esc(i.rollover.mode)} at ${i.rollover.percent}% (${i.rollover.trip} tok)${rolloverCount(i.rollover)}<br>`
+      ? `🔄 rollover ${esc(i.rollover.mode)} at ${num(i.rollover.percent)}% (${num(i.rollover.trip)} tok)${rolloverCount(i.rollover)}<br>`
       : `🔄 rollover disabled (/rollover still works)${rolloverCount(i.rollover)}<br>`) +
     serverLine(i.server) +
-    `<br>📜 recent:<br>${rows}`);
+    `<br>📜 recent:<br>${rows.join('<br>')}`);
   setGauge(i.used, i.budget, false);
 }
 
@@ -1960,7 +1962,7 @@ function submit() {
 
     if (word === '/help') {
       return slab('notice', Object.entries(COMMANDS)
-        .map(([c, d]) => `<b>${c}</b> — ${esc(d)}`).join('<br>'));
+        .map(([c, d]) => `<b>${esc(c)}</b> — ${esc(d)}`).join('<br>'));
     }
     if (word === '/reasoning') {
       const want = args.trim().toLowerCase();
@@ -2284,6 +2286,42 @@ $('#side-name').addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { $('#side-add').hidden = true; input.focus(); }
 });
 
+/* --------------------------------------------------------------- overlays
+
+   Settings and media are one object with two bodies. index.html says so where
+   it builds them — *"Same .set-* box as Settings on purpose"* — and the
+   wiring should say it too. A panel is a backdrop holding a box: the sidebar
+   button opens it, and the ✕, a click on the backdrop and Escape close it.
+   What differs is the body, which is what gets passed in.
+
+   There is no `settingsOpen`/`mediaOpen` pair any more. Each was always
+   exactly `!$('#settings').hidden`, written in the same statement as the
+   attribute and read in two places that can as easily read the attribute: a
+   second copy of a fact the DOM already holds, kept in step by hand at six
+   sites. `isOpen()` asks the DOM instead, so there is nothing to keep in step.
+
+   One Escape listener for both, not one each. The backdrop covers the page,
+   so at most one panel can be open; the listener closes whichever it is. The
+   lightbox keeps its own and should — it is built on demand and takes its
+   listener away with it when it goes. */
+
+const isOpen = (sel) => !$(sel).hidden;
+
+const overlays = [];
+
+function overlay({ panel, button, closer, onOpen, onClose }) {
+  const close = () => { $(panel).hidden = true; if (onClose) onClose(); };
+  $(button).onclick = async () => { $(panel).hidden = false; await onOpen(); };
+  $(closer).onclick = close;
+  $(panel).addEventListener('click', (e) => { if (e.target === e.currentTarget) close(); });
+  overlays.push({ panel, close });
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  for (const o of overlays) if (isOpen(o.panel)) o.close();
+});
+
 /* --------------------------------------------------------------- settings */
 
 /* Everything in config.yaml, read from GET /config so the panel always shows
@@ -2364,7 +2402,6 @@ function cfgCard(title, map, path) {
   return card;
 }
 
-let settingsOpen = false;   // the panel is up — a reloaded event redraws it live
 let settingsCfg = null;
 let setNotice = null;       // {text, ok} — survives a re-render so "saved" is not wiped by it
 
@@ -2489,7 +2526,7 @@ function webuiEditor(val) {
         : 'no change — the file already said this', ok: true };
       notice.className = 'set-notice ok';
       notice.textContent = setNotice.text;
-      if (settingsOpen) await settingsRefresh();   // redraw against the live config
+      if (isOpen('#settings')) await settingsRefresh();   // redraw against the live config
     } catch (e) {
       setNotice = { text: String(e), ok: false };
       notice.className = 'set-notice err';
@@ -2519,19 +2556,14 @@ async function settingsRefresh() {
   }
 }
 
-if ($('#side-settings')) {
-  $('#side-settings').onclick = async () => {
-    settingsOpen = true;
+overlay({
+  panel: '#settings', button: '#side-settings', closer: '#set-close',
+  onOpen: async () => {
     setNotice = null;
-    $('#settings').hidden = false;
     $('#set-body').innerHTML = '<div class="set-notice">loading…</div>';
     await settingsRefresh();
-  };
-  const closeSettings = () => { settingsOpen = false; $('#settings').hidden = true; };
-  $('#set-close').onclick = closeSettings;
-  $('#settings').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeSettings(); });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && settingsOpen) closeSettings(); });
-}
+  },
+});
 
 /* ------------------------------------------------------------------- media
 
@@ -2542,7 +2574,6 @@ if ($('#side-settings')) {
    Built on the settings overlay's parts deliberately — same box, same head,
    same close. The only new idea is the grid. */
 
-let mediaOpen = false;
 let mediaData = null;     // the last listing, whole, so the filter can re-render
                           // without a round trip and without losing `truncated`
 
@@ -2695,32 +2726,25 @@ async function deleteMedia(f) {
   await mediaRefresh();
 }
 
-if ($('#side-media')) {
-  $('#side-media').onclick = async () => {
-    mediaOpen = true;
-    $('#media').hidden = false;
+overlay({
+  panel: '#media', button: '#side-media', closer: '#med-close',
+  onOpen: async () => {
     $('#med-body').innerHTML = '<div class="med-note">loading…</div>';
     await mediaRefresh();
-  };
+  },
   // Emptying #med-body is not housekeeping: every src in it carries the token,
   // for the reason showLightbox gives about itself. It also drops a grid of
   // decoded bitmaps the page has no further use for.
-  const closeMedia = () => {
-    mediaOpen = false;
-    $('#media').hidden = true;
-    $('#med-body').innerHTML = '';
-  };
-  $('#med-close').onclick = closeMedia;
-  $('#media').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeMedia(); });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && mediaOpen) closeMedia(); });
-  // Per browser, not per session: it is a way of looking at the panel.
-  const box = $('#med-session');
-  box.checked = localStorage.getItem('letsclaw.mediaSession') === '1';
-  box.onchange = () => {
-    localStorage.setItem('letsclaw.mediaSession', box.checked ? '1' : '0');
-    if (mediaData) renderMedia(mediaData);
-  };
-}
+  onClose: () => { $('#med-body').innerHTML = ''; },
+});
+
+// Per browser, not per session: it is a way of looking at the panel.
+const medSessionBox = $('#med-session');
+medSessionBox.checked = localStorage.getItem('letsclaw.mediaSession') === '1';
+medSessionBox.onchange = () => {
+  localStorage.setItem('letsclaw.mediaSession', medSessionBox.checked ? '1' : '0');
+  if (mediaData) renderMedia(mediaData);
+};
 
 /* Poll, because the list shows *other* sessions and our socket only ever hears
    about this one. Cheap (a small JSON read against a local core), and paused
