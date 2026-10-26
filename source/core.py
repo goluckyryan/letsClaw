@@ -719,6 +719,22 @@ class Session:
             content += CARRYOVER_MARKER + carryover
         return [{"role": "system", "content": content}]
 
+    def _rebuild_system_message(self):
+        """Replace history[0] from the behavior layers, keeping everything else.
+
+        carryover() is read before the old system message goes and handed
+        back in: switching models after a rollover used to drop the handoff
+        on the floor.
+
+        An empty history is not a special case. `body` is then `[]` and
+        `fresh_history(carried) + []` is `fresh_history(carried)` — which is
+        what use_model's `if self.history:` branch computed the long way
+        round, both arms arriving at the same list.
+        """
+        carried = self.carryover()
+        body = [m for m in self.history if m["role"] != "system"]
+        self.history = self.fresh_history(carried) + body
+
     async def reload_session_behavior(self):
         """Re-read models/sessions/<name>.md and rebuild the system message.
 
@@ -727,9 +743,7 @@ class Session:
         entry = (self.config.get("models", {}) or {}).get(self.model_name) or {}
         _, _, self.session_behavior = await self.manager.behavior_for(
             entry, self.name)
-        carried = self.carryover()
-        body = [m for m in self.history if m["role"] != "system"]
-        self.history = self.fresh_history(carried) + body
+        self._rebuild_system_message()
 
     async def refresh_behavior(self):
         """Re-read the three layers from disk, for a window about to be rebuilt.
@@ -1753,7 +1767,7 @@ class Session:
             # evaluated, so digesting afterwards would roll the un-collapsed
             # window away and leave this doing nothing at all.
             await self._digest_turn(user_msg, "".join(reasoning_parts), blocks_before)
-            await self._after_turn(getattr(self, "_last_used", None))
+            await self._after_turn()
 
     def _answer_reserve(self):
         """Context tokens held back so the closing round can still be written.
@@ -2299,11 +2313,16 @@ class Session:
         self.emit(ev("digest_done", turn_id=self.turn_id,
                      tokens=count_text(digest), digest_text=digest))
 
-    async def _after_turn(self, measured_used):
+    async def _after_turn(self):
         trip = self.trip
         rolled = False
         if trip:
-            used = measured_used if measured_used is not None else self.estimate()
+            # used_now(), not a measurement passed in: the one caller handed us
+            # `self._last_used` and this line then re-derived used_now() from
+            # it, character for character. Nothing can change it in between —
+            # the argument was evaluated in the statement that awaits this, and
+            # there is no suspension point before here.
+            used = self.used_now()
             if used >= trip:
                 rolled = await self._maybe_roll(used, trip)
         if rolled:
@@ -2714,14 +2733,7 @@ class Session:
         # and the session file is named for this session.
         (self.base_behavior, self.behavior,
          self.session_behavior) = await self.manager.behavior_for(entry, self.name)
-        # carryover() must be read before history[0] is replaced, and passed back
-        # in: switching models after a rollover used to drop the handoff on the floor.
-        carried = self.carryover()
-        if self.history:
-            body = [m for m in self.history if m["role"] != "system"]
-            self.history = self.fresh_history(carried) + body
-        else:
-            self.history = self.fresh_history(carried)
+        self._rebuild_system_message()
         # Two things just moved under the measurement, not one. history[0] was
         # rebuilt from a different model's behavior layers, so _last_used sizes
         # a system prompt that is gone — and self.engine changed, so budget is
@@ -2826,15 +2838,26 @@ class SessionManager:
         if engine is not None:
             self._retired_engines.append(engine)
 
+    def _all_engines(self):
+        """Every engine something could still read from, in first-seen order.
+
+        Three sources: the manager's per-model cache, the engine each session
+        is using, and the engine a deferred config blob has already built but
+        not installed — the session swaps to that one the moment its turn
+        ends, so it is spoken for.
+
+        Retired engines are deliberately not here. Nothing reads from them,
+        which is why they were retired; only close() wants them, and it
+        chains them on itself.
+        """
+        yield from (e for e, _, _ in self._engines.values())
+        yield from (s.engine for s in self.sessions.values())
+        yield from (b["engine"] for s in self.sessions.values()
+                    if (b := s._pending_config))
+
     def _live_engine_ids(self):
         """id() of every engine something could still read from."""
-        live = {id(e) for e, _, _ in self._engines.values()}
-        live |= {id(s.engine) for s in self.sessions.values()}
-        # A deferred blob's engine is not installed yet but is already spoken
-        # for: the session will swap to it the moment its turn ends.
-        live |= {id(b["engine"]) for s in self.sessions.values()
-                 if (b := s._pending_config) and b["engine"] is not None}
-        return live
+        return {id(e) for e in self._all_engines() if e is not None}
 
     async def _close_unreferenced(self, engines):
         live = self._live_engine_ids()
@@ -3573,17 +3596,10 @@ class SessionManager:
         # After a reload a session can hold an older engine the cache has
         # already forgotten, and a retired one is waiting here precisely
         # because no earlier pass was allowed to close it — each owns a pool.
-        closing, seen = [], set()
-        for engine in (*(e for e, _, _ in self._engines.values()),
-                       *(s.engine for s in self.sessions.values()),
-                       *(b["engine"] for s in self.sessions.values()
-                         if (b := s._pending_config)),
-                       *self._retired_engines):
-            if engine is not None and id(engine) not in seen:
-                seen.add(id(engine))
-                closing.append(engine)
+        closing = {id(e): e for e in (*self._all_engines(), *self._retired_engines)
+                   if e is not None}
         self._retired_engines = []
-        for engine in closing:
+        for engine in closing.values():
             try:
                 await engine.close()
             except Exception:

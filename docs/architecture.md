@@ -170,7 +170,8 @@ _digest_turn(user_msg, reasoning, blocks_before)   ← collapses this turn's
                                                working set, BEFORE rollover
                                                emit(digest_done) — note this
                                                precedes turn_end
-_after_turn(used)                            ← rollover evaluated ONLY here
+_after_turn()                                ← rollover evaluated ONLY here,
+                                               reading used_now()
 ```
 
 **That order is load-bearing too.** Digesting after `_after_turn` would let
