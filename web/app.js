@@ -460,8 +460,20 @@ function stampThinking() {
    touches it, so a single update that grows the log more than the old 80px
    atBottom() allowance (a tall question, a round ending mid-batch) can no
    longer read "not at bottom" and freeze the follow for the rest of the
-   session. The listener is the only writer besides turn_start and the
-   clear/switch sites. */
+   session.
+
+   Four sites write it, and only the first is reading the view:
+
+     the scroll listener below  the user scrolled; measure where they are
+     submit()                   this tab asked, so this tab follows the answer
+     turn_start                 the same intent, arriving as a broadcast, so
+                                it is gated on S.weAsked
+     resetView()                there is nothing on screen to be scrolled up
+                                in, and the next thing to arrive is the top
+
+   Keep this list honest. It was wrong for as long as `submit()` was missing
+   from it, which is the state someone reads while debugging a scroll bug, and
+   `test_webui_shape.py` now fails if the sites and the list disagree. */
 let follow = true;
 const FOLLOWS = 80;
 log.addEventListener('scroll', () => {
