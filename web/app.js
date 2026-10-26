@@ -1854,6 +1854,14 @@ function showInfo(i) {
     // the per-turn stats line.
     `⚡ context ${i.estimated === false ? '' : '~'}${num(i.used)}/${num(i.budget)} tok ` +
     `(${num(pct)}%) · ${num(i.tools_tokens)} tok of tool schemas<br>` +
+    // Only when it is bad news — see the same branch in chat.py. A different
+    // axis from the ~ above: that one says the server withheld usage, this
+    // says what the local count was made with.
+    (i.tokenizer && i.tokenizer.calibrated === false
+      ? `⚠️ counting with ${esc(i.tokenizer.encoding)}, not cl100k_base — every ` +
+        `token figure here is far cruder${i.tokenizer.reason
+          ? ` (${esc(i.tokenizer.reason)})` : ''}<br>`
+      : '') +
     (i.output_total != null
       ? `📤 ${num(i.output_total)} output tok generated in this session (an odometer — /clear does not rewind it)<br>`
       : '') +

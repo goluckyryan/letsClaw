@@ -28,11 +28,6 @@ import paths
 
 logger = logging.getLogger("letclaw.tokens")
 
-# Per-message overhead (role markers, separators) — OpenAI cookbook estimate
-_MESSAGE_OVERHEAD = 4
-# End-of-conversation tokens
-_CONVERSATION_TAIL = 3
-
 # tiktoken caches the 1.6 MB cl100k vocab under TIKTOKEN_CACHE_DIR and defaults
 # to a directory in /tmp, which the OS clears on reboot. With the cache gone
 # and no network — a lab machine behind a proxy, which is the normal case here
@@ -135,22 +130,12 @@ def count_content(msg: dict) -> int:
     return total
 
 
-def count_message(msg: dict) -> int:
-    """Estimate tokens for one chat message (content + tool calls + framing)."""
-    return count_content(msg) + _MESSAGE_OVERHEAD
-
-
-def count_messages(messages: list) -> int:
-    """Estimate total tokens for a full message list (the whole context)."""
-    return sum(count_message(m) for m in messages) + _CONVERSATION_TAIL
-
-
 def count_tools(specs: list) -> int:
     """Estimate tokens for tool schemas.
 
     Schemas are re-sent with every request, so on a tool-enabled session they are
-    a large fixed part of each prompt — invisible to count_messages(), which only
-    ever sees the conversation.
+    a large fixed part of each prompt — invisible to a conversation count, which
+    only ever sees the messages.
 
     This is the raw JSON cost. What the server charges is more — see
     `schema_cost()`.
@@ -170,7 +155,8 @@ def count_tools(specs: list) -> int:
 #   per token    the encodings disagree, proportionally: cl100k runs ~5% low
 #                on the same prose. A ratio, so it scales with the text.
 #   per message  the template wraps every message in role markers and
-#                separators. _MESSAGE_OVERHEAD guesses 4; Qwen charges about
+#                separators. The OpenAI cookbook's estimate, which this module
+#                used to carry as a constant, guesses 4; Qwen charges about
 #                11. Grows with the number of messages, not their size.
 #   per prompt   count_tools() sees `json.dumps(specs)`; the server sees those
 #                schemas rendered into the template's own scaffolding. A fixed
@@ -209,9 +195,10 @@ def corrected_text(text: str) -> int:
 def corrected_messages(messages: list) -> int:
     """A message-list count corrected toward what the server will charge.
 
-    Built from the content up rather than by scaling count_messages(), which
-    would multiply its own 4-token framing guess by the prose ratio and
-    arrive at 4.2 where the template charges 11. That is the error that makes
+    Built from the content up rather than by scaling a plain message count,
+    which would multiply the cookbook's 4-token framing guess by the prose
+    ratio and arrive at 4.2 where the template charges 11. That is the error
+    that makes
     a corrected estimate drift low as a conversation lengthens, since the
     framing is paid per message and conversations grow by messages.
     """

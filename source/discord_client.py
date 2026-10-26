@@ -1483,6 +1483,13 @@ def _format_info(info, where=None):
         lines.append(f"📍 {where}")
     lines.append(f"⚡ context {approx}{used}/{budget} tok ({pct}%) · "
                  f"{info.get('tools_tokens')} tok of tool schemas")
+    # Only when it is bad news — see the same branch in chat.py. The reason
+    # is dropped here: it names a local cache path, which means nothing to
+    # whoever is reading this in a channel.
+    tok = info.get("tokenizer") or {}
+    if tok.get("calibrated") is False:
+        lines.append(f"⚠️ counting with {tok.get('encoding')}, not cl100k_base — "
+                     f"every token figure here is far cruder")
     if info.get("output_total") is not None:
         lines.append(f"📤 {info['output_total']} tok generated in this session")
     if info.get("input_total") is not None:

@@ -36,8 +36,8 @@ import paths
 import session as store
 from llm_engine import ChatResult, RoundInterrupted
 from ssh_forward import SSHForwardManager
-from token_counter import (count_messages, count_text, count_tools,
-                           corrected_messages, corrected_text, schema_cost)
+from token_counter import (count_text, count_tools, corrected_messages,
+                           corrected_text, schema_cost, tokenizer_status)
 from version import __version__
 
 logger = logging.getLogger("letclaw.core")
@@ -2550,6 +2550,15 @@ class Session:
                            for m in self.history[-5:]],
                 "used": used, "budget": self.budget,
                 "estimated": self._last_used is None,
+                # A different axis from `estimated`, and the reason both are
+                # here. `estimated` says the server withheld usage, so this
+                # figure is ours; `tokenizer` says what "ours" was counted
+                # with. A chars/4 count is wrong by far more than the 5% the
+                # corrections are fitted for, and until this field existed a
+                # user on that path read output identical to a user on
+                # cl100k — the module promised to say which was live and
+                # nothing asked it.
+                "tokenizer": tokenizer_status(),
                 "tools_tokens": self.tools_tok,
                 # Since the session was created, surviving /clear and restarts.
                 "output_total": self.total_output,

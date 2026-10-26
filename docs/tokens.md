@@ -451,7 +451,7 @@ three have three different shapes**:
 | per **prompt** | the schemas are *rendered into* the template, not dumped as JSON | a fixed block $T$ | nothing at all |
 
 Saying that needs two symbols $m(n)$ cannot provide, because $m(n)$ already has
-a guess baked into it — `count_messages` charges 4 tokens of framing per message
+a guess baked into it — the naive count charges 4 tokens of framing per message
 and 3 at the end:
 
 | | |
@@ -817,9 +817,15 @@ cannot produce a drift, so the residual was fitted for shape:
 $$\text{prose\_true} = a\cdot\mu + b\cdot\nu \qquad\Longrightarrow\qquad a = 1.0510,\; b = 10.79$$
 
 worst residual **0.60%**. The per-token scale is 1.05 and the drift is $b$:
-`count_messages` charges 4 tokens of framing per message where the real
+the naive count charges 4 tokens of framing per message where the real
 template charges about 11, so a shortfall of ~7 tokens is paid once per
 message — and conversations grow by messages. Hence three constants, not two.
+
+That naive count is the baseline this corrects, not code you will find:
+`count_message`/`count_messages` were deleted once nothing called them, and
+`corrected_messages` builds from `count_content` up for the reason its
+docstring gives — scaling the 4-token guess by the prose ratio arrives at 4.2
+where the template charges 11.
 
 #### What the schema term reads
 

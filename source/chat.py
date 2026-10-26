@@ -57,9 +57,6 @@ COMMANDS = {
     "/restart": "restart the core process (/restart force cancels running turns)",
 }
 
-# Handled here, not by the core: they change this terminal, not the conversation.
-LOCAL_COMMANDS = {"/quit", "/exit", "/reasoning"}
-
 # What counts as an answer to the rollover question, and nothing else does —
 # see the pending branch in the input loop.
 YES = ("y", "yes")
@@ -360,6 +357,17 @@ class Renderer:
         how = "~ conservative estimate" if approx else "counted by the server"
         self.line(f"  ⚡ Context: {approx}{i['used']}/{i['budget']} tok ({pct}%)   "
                   f"({how}; {i['tools_tokens']} tok of tool schemas)")
+        # Only when it is bad news. On cl100k this line would say "the numbers
+        # are fine" under every /info forever, which is how a warning stops
+        # being read; on chars/4 it is the one thing about these figures worth
+        # knowing, and nothing else on screen distinguishes the two.
+        tok = i.get("tokenizer") or {}
+        if tok.get("calibrated") is False:
+            self.line(f"  ⚠️  Counting with {tok.get('encoding')}, not cl100k_base — "
+                      f"every token figure above is far cruder than the ~5% "
+                      f"the corrections assume.")
+            if tok.get("reason"):
+                self.line(f"      {tok['reason']}")
         if i.get("output_total") is not None:
             self.line(f"  📤 Output: {i['output_total']} tok generated in this session"
                       f"  (an odometer — /clear does not rewind it)")

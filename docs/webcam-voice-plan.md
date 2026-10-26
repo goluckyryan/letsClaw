@@ -186,7 +186,7 @@ capability: **a submit may carry multimodal content**.
   existing client is untouched.
 - `core.py`: `start_turn/run_turn/_turn` take `content=None` (default `text`);
   history gets `content`, `jot()` and `turn_start` keep `text`.
-- `token_counter.py`: `count_message` must handle list content — sum
+- `token_counter.py`: `count_content` must handle list content — sum
   `count_text` over the text parts, and charge a flat ~350 tokens per image
   part (Qwen-VL-class image token counts run 64–1200 depending on size; the
   estimate only feeds the ⚡ line and rollover headroom).
