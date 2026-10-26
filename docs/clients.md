@@ -155,14 +155,17 @@ to configure it.
 **Shared:** the protocol constant (in the two Python clients), and
 `source/chunker.py`.
 
-**Duplicated:** everything else. Each of `/info`, `/behavior`, `/models`,
+**Duplicated:** everything else. Each of `/info`, `/behavior`, `/model`,
 `/reload`, `rollover_ask`, `session_state` and `stats` has **two or three
-independent renderers**, and the three command tables have drifted apart.
+independent renderers**.
 
 This is the codebase's real maintenance tax, and it is worth naming plainly:
 **adding a field to a command's reply means editing up to three renderers, and
-nothing will tell you if you miss one.** There is no test that the three
-clients agree.
+nothing will tell you if you miss one.** The *fields* are untested; the
+*command lists* are not. `tests/test_command_surface.py` checks every client's
+table against the core's own dispatch, after the three had drifted far enough
+that `/models` was reachable in the terminal and on Discord while the WebUI
+rejected it outright.
 
 Whether to fix it is a genuine trade. A shared renderer would have to abstract
 over ANSI, HTML and Discord markdown, which are not very alike; the duplication

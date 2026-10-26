@@ -133,7 +133,7 @@ NO = {"n", "no"}
 # Used to tell a real command from a message that merely opens with the
 # alternative prefix — see ALT_PREFIX.
 COMMAND_WORDS = {
-    "info", "model", "models", "new", "rollover", "clear", "behavior", "stop",
+    "info", "model", "new", "rollover", "clear", "behavior", "stop",
     "reload", "restart", "session", "help", "commands", "quit", "exit",
     "reasoning",
 }
@@ -148,8 +148,7 @@ ALT_PREFIX = "!"
 HELP = (
     "**letsClaw** — I hold one conversation per channel; the core keeps it "
     "when I restart.\n"
-    "`!info` context and recent history · `!model [name]` list or switch · "
-    "`!models` the list\n"
+    "`!info` context and recent history · `!model [name]` list or switch\n"
     "`!clear` forget the conversation · `!rollover` archive it and carry a "
     "handoff forward\n"
     "`!new` **wipe everything**, archives included · `!behavior` the loaded "
@@ -2205,7 +2204,6 @@ class LetsClawBot(discord.Client):
             tree.command(name=name, description=description)(_run)
 
         simple("info", "context, recent history and token usage")
-        simple("models", "the configured model list")
         simple("rollover", "archive this conversation and carry a handoff forward")
         simple("clear", "forget this conversation, keep the archives")
         simple("new", "WIPE everything — this conversation and its archives")

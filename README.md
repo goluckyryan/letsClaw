@@ -156,7 +156,7 @@ graph TD
     end
 
     subgraph Modules
-        Cmds[Commands\n/clear /new /info /model /models\n/behavior /reasoning /stop /steering\n/reload /restart /session]
+        Cmds[Commands\n/clear /rollover /new /info /model\n/behavior /reasoning /stop /steering\n/reload /restart /session]
         TokenCounter[Token Counter\ntoken_counter.py\nper-message stats]
         ThinkingUI[Thinking indicator\nui.py\nlive spinner + TTFT]
         Tools[Tool executor\ntools.py\nexec / read / write / list]
@@ -1329,7 +1329,7 @@ There is no attach message: the session name is a query parameter on the socket,
 is a connection, not a handshake, and reconnecting is the same operation as connecting.
 
 `tool_call` is emitted *before* the tool runs, so a slow `exec` is visible instead of
-silent. Read-only commands (`/info`, `/behavior`, bare `/model` and `/models`) come back as a
+silent. Read-only commands (`/info`, `/behavior`, bare `/model`) come back as a
 `response` to the asking client only, not broadcast to everyone attached.
 
 > **Security.** Tools are unconfined by design: `exec` runs shell commands and
@@ -1357,8 +1357,7 @@ picks the token up from the local `config.yaml` on its own).
 | `/clear` | forget the conversation — the archives on disk are kept |
 | `/rollover` | archive it, write a handoff, carry that into a fresh window |
 | `/new` | **wipe everything** — the conversation *and* every transcript and journal this session has written. No undo |
-| `/model` , `/model <name>` | list the configured models, or switch this session to one |
-| `/models` | the model list on its own |
+| `/model` , `/model <name>` | list the configured models, or switch this session to one. The bare form answers while a turn is running; the switch waits for it |
 | `/info` | the core's version, session name and id, recent history, context usage, output total |
 | `/behavior` | print the loaded behavior file |
 | `/reasoning` | toggle live display of the model's thinking |
@@ -1378,9 +1377,7 @@ session id so no other session's files can be caught. There is no undo, which
 is why it is `/new` and not `/clear` — the reflexive keystroke is the safe one.
 
 **Tab completes** commands, and model names after `/model `. The completion list prints
-each command with its description rather than a bare column of names. One gap to be aware
-of: the completer's list (`COMMANDS` in `chat.py`) does not include `/models`, so `/models`
-works when typed but is never suggested. `/quit`, `/exit`
+each command with its description rather than a bare column of names. `/quit`, `/exit`
 and `/reasoning` are handled in the terminal — they change this window, not the
 conversation — so they never reach the core; everything else is a `command` message and
 comes back as a `response` to this client alone.
@@ -1626,7 +1623,7 @@ answers freely in: #solaris, #caen, #esps, #ptolemy-translation, #analysis_11c
 ```
 
 An unreadable value warns and falls back to `true`, so a typo never opens the bot up. The slash commands work as
-plain messages: `/info`, `/model [name]`, `/models`, `/rollover`, `/new`,
+plain messages: `/info`, `/model [name]`, `/rollover`, `/new`,
 `/clear`, `/behavior`, `/stop`, `/reload`, `/restart`, `/session [name]`, plus a
 local `/help`. Two are not shared with the other clients, in either direction:
 `/session` is Discord-only, because it maps a *channel* to a session and the

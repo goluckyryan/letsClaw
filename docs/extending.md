@@ -94,7 +94,7 @@ there deadlocks because `reload` defers busy sessions and would defer the one
 that asked. See [protocol.md](protocol.md) for the three groups.
 
 **The trap:** a command is not one listing but **eight**, and they have already
-drifted. Nothing tells you if you miss one:
+drifted:
 
 | | |
 |---|---|
@@ -105,8 +105,26 @@ drifted. Nothing tells you if you miss one:
 | `source/discord_client.py` | `COMMAND_WORDS` — **miss this one and `!cmd` is sent to the model as chat** — `HELP`, and `_register_commands` for the native slash picker |
 | `README.md` | the terminal command table, the Mermaid `Cmds` node, the Discord prose list |
 
-`tests/test_discord.py` pins the slash tree, so Discord's three are the only
-ones a test will catch for you. See
+`tests/test_command_surface.py` now tells you if you miss one. It parses the
+`name == "…"` branches out of `Session.command` and checks every listing above
+against *that*, not against a list of its own, so a command the core gains
+fails by name in each place it is missing. It reads the core's dispatch for the
+same reason the table calls that row the only one that does anything: it is the
+listing that cannot be wrong.
+
+Two caveats. The button in `index.html` is not checked — a toolbar button is
+optional per command, so its absence is not a defect. And a word a client lists
+that the core does not implement has to go on `NOT_CORE_COMMANDS` in that test,
+with the reason: `/stop` and `/steering` are protocol message types rather than
+commands, `/quit`, `/exit`, `/reasoning`, `/help` and `/commands` are answered
+by the client that drew them, and `/session` and `/ask` are Discord-only.
+
+Note which failure that gate catches. `app.js`'s `COMMANDS` is a **hard gate**,
+not a help table — `submit()` rejects any `/word` missing from it before the
+core ever sees it, while `chat.py` forwards anything. So a command absent from
+the web table is not under-documented there, it is unreachable, and it is
+reachable in the terminal at the same time. That is how `/models` lived for as
+long as it did. See
 [clients.md](clients.md#what-is-shared-and-what-is-not).
 
 If the command mutates session state that other attached clients should see,

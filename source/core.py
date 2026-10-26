@@ -2622,7 +2622,21 @@ class Session:
                     "base": self.base_behavior or "",
                     "behavior": self.behavior or "",
                     "session_behavior": self.session_behavior or ""}
-        if name == "models":
+        if name == "model" and not args.strip():
+            # The listing half of /model, up here with /info and /behavior
+            # because it reads two fields and changes nothing — and because
+            # the moment you most want to know what you could switch to is
+            # while a turn is running. The switching half stays below the
+            # busy guard, where it belongs: it swaps the engine under a
+            # live conversation.
+            #
+            # There was a second command, /models, returning this exact dict
+            # from this exact spot. Two spellings of one answer: the help in
+            # both chat.py and app.js already described /model as "list
+            # models, or /model <name> to switch", neither listed /models,
+            # and the WebUI refused it outright. All it really bought over
+            # bare /model was being readable mid-turn, which is now just
+            # where this branch sits.
             return {"ok": True, "current": self.model_name,
                     "configured": configlib.known_models(self.config)}
         if name == "reload":
@@ -2730,10 +2744,9 @@ class Session:
                             self.name, files, freed)
                 return {"ok": True, "files": files, "bytes": freed}
             if name == "model":
+                # A bare /model was answered above the busy guard, so there is
+                # a name here and this is a switch.
                 target = args.strip()
-                if not target:
-                    return {"ok": True, "current": self.model_name,
-                            "configured": configlib.known_models(self.config)}
                 try:
                     await self.use_model(target)
                 except ValueError as e:

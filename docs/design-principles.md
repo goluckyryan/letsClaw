@@ -296,8 +296,11 @@ transcript in the same order — including yours.
 `tool_call` is emitted *before* the tool runs, so a slow `exec` is visible
 rather than silent.
 
-Read-only commands (`/info`, `/behavior`, bare `/model`, `/models`) come back as
+Read-only commands (`/info`, `/behavior`, bare `/model`) come back as
 a `response` to the asking client only, not broadcast to everyone attached.
+Bare `/model` is read-only in the strong sense: it is answered *above* the busy
+guard, so you can see what you could switch to while a turn is running. Passing
+a name is a switch, and a switch waits.
 
 ## 17. Attaching is a connection, not a handshake
 
