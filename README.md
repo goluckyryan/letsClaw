@@ -1319,7 +1319,7 @@ rather than silently queued behind a context its sender never saw.
 
 **Events** (core → client): `hello` `turn_start` `text` `reasoning`
 `reasoning_stat` `tool_call` `tool_result` `stats` `turn_end` `steering`
-`rollover_start` `rollover_ask` `rollover_done` `rollover_failed`
+`rollover_start` `rollover_ask` `rollover_done`
 `session_state` `notice` `busy` `error` `response` `pong`.
 **Messages** (client → core): `submit` `command` `rollover_reply` `stop`
 `steering` `ping`.

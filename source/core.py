@@ -1900,6 +1900,15 @@ class Session:
         `off` still means off. This only ends the silence, which was the part
         that made a full window indistinguishable from a model that had stopped
         reasoning.
+
+        Two different conditions arrive here and they need different words. A
+        session with rollover switched off is doing as it was told, and
+        `rollover_mode: auto` is the answer. A session whose rollover *failed*
+        is not: it tried, the archive could not be written, and this is the
+        only message that person gets afterwards — `_maybe_roll` returns False
+        in silence from then on. Sending them to turn on a setting that is
+        already on, while the reason sits unread in `rollover_blocked`, was
+        telling someone the wrong thing at the one moment they were listening.
         """
         if self._no_room_warned:
             return
@@ -1907,10 +1916,17 @@ class Session:
         if room >= MIN_THINK_HEADROOM:
             return
         self._no_room_warned = True
+        head = f"only {max(0, room)} tok of thinking room left"
+        if self.rollover_blocked:
+            self.emit(ev("notice", level="warn",
+                         text=f"{head} and this window could not be archived "
+                              f"({self.rollover_blocked}) — the conversation is "
+                              "kept and will not roll over until that is fixed. "
+                              "Then /rollover."))
+            return
         self.emit(ev("notice", level="warn",
-                     text=f"only {max(0, room)} tok of thinking room left and this "
-                          "session will not roll over by itself — /rollover, or set "
-                          "rollover_mode: auto"))
+                     text=f"{head} and this session will not roll over by itself "
+                          "— /rollover, or set rollover_mode: auto"))
 
     async def _think_pad(self, call_round, turn_t0, seed, allow_tools=True):
         """Resume a cut-off round instead of re-asking the question.
@@ -2428,17 +2444,31 @@ class Session:
             transcript = await store.save_transcript(
                 self.history, self.model_name, self.config, self.name,
                 session_id=self.session_id)
-        except OSError as e:
+        except Exception as e:
             # error, not warn: nothing was rolled, the window is still full, and
-            # the next turn will be refused the same way until the disk is fixed.
+            # the next turn will be refused the same way until this is fixed.
+            #
+            # Exception, not OSError. A disk that will not take the write is the
+            # failure this path was written for, but json.dumps runs inside the
+            # same call, so a history holding something unserialisable raised
+            # TypeError straight out of roll_over and the person was told
+            # nothing whatsoever. Whatever arrives here has already cost them
+            # the rollover; silence must not be on top of that.
             self.rollover_count -= 1
-            self.rollover_blocked = str(e)
+            self.rollover_blocked = str(e) or e.__class__.__name__
+            if not isinstance(e, OSError):
+                # A full disk is the environment and the text says it all. This
+                # is a bug in our own payload, and nobody will find it from one
+                # line of notice.
+                logger.exception("rollover failed on a non-OSError")
+            # The error itself, not a guess at its remedy. "Free some disk" was
+            # right for ENOSPC and wrong for the other three measured causes —
+            # a read-only sessions dir, a bad sessions_dir, a dropped mount —
+            # where it sends someone to do a thing that cannot help.
             self.emit(ev("notice", level="error",
                          text=f"could not save the transcript ({e}) — rollover "
-                              "abandoned and the conversation kept. Free some "
-                              "disk, then /rollover."))
-            self.emit(ev("rollover_failed", reason=reason, error=str(e),
-                         used=used, budget=self.budget))
+                              "abandoned, the conversation is kept. Fix that, "
+                              "then /rollover."))
             return False
         # Cleared only on a save that worked, so the guard cannot outlive the
         # condition that set it.
@@ -2650,10 +2680,14 @@ class Session:
                 # and this is how they say so. If it fails again it is set again.
                 self.rollover_blocked = None
                 if not await self.roll_over("on request", trip=trip):
+                    # The reason, not "see the error above": this reply is what
+                    # a /rollover typed on Discord or in the terminal prints,
+                    # and the notice it refers to may not have been rendered
+                    # anywhere the person is looking.
                     return {"ok": False,
-                            "error": "could not archive this window — the "
-                                     "conversation is untouched. See the error "
-                                     "above; free some disk and try again."}
+                            "error": f"could not archive this window "
+                                     f"({self.rollover_blocked}) — the "
+                                     "conversation is untouched."}
                 self.declined_at, self.warned_over = None, False
                 self._no_room_warned = False
                 await self.persist()
