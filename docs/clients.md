@@ -84,14 +84,18 @@ Beside **Send**, `↑`/`↓` jump to the previous and next **question** in the
 transcript — the log, not the composer, so the answer stays below it. That is
 separate from `↑` in an empty box, which recalls what you last *typed*. A
 `/steering` correction is a user message but not a question, so it is stepped
-over. The jump accounts for the pinned band: the question you are on sticks to
-the top of the log for the whole turn, and reaching an earlier one releases it,
-which is why the target lands where it can be read.
+over. The jump makes **no** allowance for the pinned band, and an early version
+that did was measured landing in exactly the same place: the question you are
+on is the pinned one, so every earlier question `↑` can reach sits above it,
+and scrolling to one carries the pin's own flow position below the top of the
+pane, where sticky lets go of it. The target lands where it can be read because
+the pin gets out of the way by itself, not because `scrollToPrompt()` works
+around it.
 
 The token is entered in the page and kept in `localStorage`; it goes out as
 `?token=` because a browser cannot set a WebSocket header.
 
-> ⚠️ **`PROTOCOL_VERSION` is hard-coded as `1` in `app.js:37`** while the two
+> ⚠️ **`PROTOCOL_VERSION` is hard-coded as `1` in `app.js`** while the two
 > Python clients import it from `core.py`. Bumping the protocol means
 > editing this line by hand.
 
