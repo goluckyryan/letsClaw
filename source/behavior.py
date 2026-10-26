@@ -204,16 +204,20 @@ class BehaviorStore:
         from the query and mgr.get() creates whatever it is handed — so a
         session called `../../etc/passwd` can exist. This is the one place a
         session name becomes a path that is *read*, so it is guarded twice: the
-        name is slugged to the same character set session._safe() allows, and
-        the result is then required to sit directly in session_dir. Either
-        alone would do; both is cheap, and the failure mode is an arbitrary
-        file landing in a system prompt.
+        name is slugged by paths.safe_name(), the same flattening the session
+        store names its files with, and the result is then required to sit
+        directly in session_dir. Either alone would do; both is cheap, and the
+        failure mode is an arbitrary file landing in a system prompt.
+
+        The character class used to be written out here as well, identical to
+        the store's, with a comment promising the two would stay in step. They
+        now are the same line; the longer limit and the empty fallback are the
+        differences this layer actually wants, so they are arguments.
         """
         configured = (self.config.get("behavior", {}) or {}).get("session_dir")
         if not configured:
             return None
-        slug = "".join(c if c.isalnum() or c in "-_." else "_"
-                       for c in str(session_name))[:64]
+        slug = paths.safe_name(session_name, limit=64, fallback="")
         if not slug or set(slug) <= {".", "_"}:
             return None
         root = paths.resolve(configured)

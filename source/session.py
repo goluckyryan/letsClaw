@@ -111,8 +111,14 @@ def _stamp():
 
 
 def _safe(name):
-    """Make a session name usable in a filename."""
-    return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(name))[:40] or "session"
+    """Make a session name usable in a filename — this module's defaults.
+
+    The flattening itself is `paths.safe_name`, shared with `behavior`, which
+    needs the same character set for a path it reads. Kept as a local name
+    because seven call sites here want these two defaults and none wants to
+    restate them.
+    """
+    return paths.safe_name(name)
 
 
 # ---- the live store: conversations as they stand right now -----------------

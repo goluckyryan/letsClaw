@@ -70,6 +70,39 @@ def resolve(path, default=None):
     return _abs(Path(path or default).expanduser())
 
 
+def safe_name(name, limit=40, fallback="session"):
+    """A session name flattened to something safe to put in a filename.
+
+    Alphanumerics, dash, underscore and dot survive; everything else becomes
+    an underscore. Lossy by design — 'my session', 'my/session' and
+    'my+session' all come out 'my_session' — so it names a file, it never
+    keys one.
+
+    Here rather than in `session`, for the reason IMAGE_TYPES is here rather
+    than in `server`: two modules need the same answer and neither should
+    import the other for it. `session` uses it for the live file, the
+    transcript and the journal stem; `behavior` uses it to turn a session
+    name into `models/sessions/<name>.md`, which is the one place a session
+    name becomes a path that is *read*. Those two had the character class
+    written out separately, agreeing exactly, with a comment in `behavior`
+    promising they would stay that way. The day the set widens — a space kept
+    as a space, say, or a colon allowed because Linux takes one — it has to
+    widen in both or a name reaches one module as itself and the other as a
+    different string. The difference they are allowed to have is the two
+    arguments.
+
+    `limit` and `fallback` are where they legitimately differ. `session`
+    truncates at 40 and substitutes 'session' for a name that flattened to
+    nothing, because something has to go in the filename. `behavior` allows
+    64 and asks for '' instead, because a name with nothing left in it means
+    that session simply has no behavior file — and it rejects an all-dots or
+    all-underscore slug on top of this, since '..' survives the character
+    class intact.
+    """
+    return "".join(c if c.isalnum() or c in "-_." else "_"
+                   for c in str(name))[:limit] or fallback
+
+
 # Where the agent puts pictures it wants shown. Not under web/: that directory is
 # the app's own source, served unauthenticated to anyone who loads the page, and
 # generated output does not belong in it. state/ is already gitignored.
