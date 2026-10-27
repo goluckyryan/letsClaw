@@ -55,7 +55,11 @@ only test that fails because of a *rename* rather than a behaviour change.
 Write an `async def` handler, wrap it in `Tool(name, description, parameters,
 handler, max_output)` inside `build_tools`, add it to the dict at the bottom,
 and add its name to the default `allow` list if it should be on by default.
-The final line is `return [tools[k] for k in tools if k in allow]`.
+The final line is `return [tools[k] for k in tools if k in allow]`. If the tool
+is read-only — it changes nothing a later call in the same round could observe
+— also add its name to `PARALLEL_SAFE`, so a run of such calls shares a moment
+instead of running one at a time. Anything with an effect stays out of the set
+and runs in issue order.
 
 `Tool.run_full` returns `(full, clipped)` — the core journals the full text and
 gives the model the clipped one. Your handler just returns a string; argument

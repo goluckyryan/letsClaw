@@ -332,6 +332,41 @@ def truncated_tool_calls(result):
     return bad
 
 
+def stored_tool_args(tc):
+    """One tool call's arguments as history has to carry them: a JSON object.
+
+    The server re-validates every assistant message on every later request.
+    SGLang answers one whose `arguments` is not JSON with a 400 — "Assistant
+    tool call function.arguments must be valid JSON" — and one holding a valid
+    JSON *scalar* with another, "must be a JSON object". Both were checked
+    against the live server; `{}` is accepted.
+
+    A rejected message is not a lost turn, it is every turn after it: the
+    message rides in every prompt until the window rolls over, so the next 400
+    arrives on the user's very next question and `settled()` then unwinds the
+    whole unfinished turn around it. That is what happened at round 73 of
+    session b9aec0f9 — 180 messages, one turn, gone.
+
+    Two shapes reach here invalid. A round cut off mid-JSON is the one
+    `truncated_tool_calls` exists for. The other is a call that streamed no
+    argument deltas at all, leaving `arguments` as `""`: that call is
+    deliberately *not* flagged, because a tool that takes no arguments is
+    legitimately called with none and must still run. Both are still unfit to
+    store, so history gets `{}` and the turn carries on.
+
+    Valid JSON passes through byte for byte rather than being re-serialised:
+    the journal, the token counts and the server's prefix cache all describe
+    the string the model actually generated.
+    """
+    args = tc.get("arguments") or ""
+    try:
+        if isinstance(json.loads(args), dict):
+            return args
+    except (ValueError, TypeError):
+        pass
+    return "{}"
+
+
 def strip_tool_markup(text):
     """Drop tool-call markup a resumed round may have written as prose.
 
@@ -1455,11 +1490,23 @@ class Session:
 
             Shared by the tool loop and by a thinking pad's conclusion, which may
             decide the right ending is an action rather than a sentence.
+
+            In the order the model issued them, with one exception: a run of
+            consecutive read-only calls (`tools.PARALLEL_SAFE`) runs together,
+            so three two-second reads take the two of the slowest. A write and
+            an exec always run alone, in their issued position — a read after
+            the write of the same path, or the second of two writes of it,
+            keeps the order the model meant, and a read never reaches across
+            the command that may have made the file it reads. The result slots
+            were reserved in issue order before anything ran, so the history
+            stays in issue order whatever the completion order is; the
+            tool_result events, by contrast, land in completion order.
             """
-            nonlocal tools_used
-            # A call cut off mid-JSON is never executed and never stored as it
-            # came: the arguments go in as {} so the history stays valid for the
-            # server, and the model is told why nothing ran.
+            # A call cut off mid-JSON is never executed: `rm -rf /tmp/scratch`
+            # truncated to `rm -rf /` is the shape of accident that stops. What
+            # goes into history is a separate question and `stored_tool_args`
+            # answers it for every call, not just the cut-off ones — an empty
+            # `arguments` runs, and must still not be stored as it came.
             cut = {id(tc) for tc in truncated_tool_calls(result)}
             self.history.append({
                 "role": "assistant",
@@ -1469,7 +1516,7 @@ class Session:
                 "tool_calls": [
                     {"id": tc["id"], "type": "function",
                      "function": {"name": tc["name"],
-                                  "arguments": "{}" if id(tc) in cut else tc["arguments"]}}
+                                  "arguments": stored_tool_args(tc)}}
                     for tc in result.tool_calls
                 ],
             })
@@ -1485,11 +1532,21 @@ class Session:
                 slots[tc["id"]] = msg
                 self.history.append(msg)
 
-            for tc in result.tool_calls:
+            tag = f"turn {self.turn_id} round {rounds}"
+            from tools import PARALLEL_SAFE   # local, as build_tools is
+
+            async def execute(tc):
+                """One call end to end: announce it, run it, land its result.
+
+                May run inside a gather, so nothing here may assume it began
+                or ended before any other call: it fills the one slot reserved
+                for it up above, and the reservation is what keeps the history
+                in issue order.
+                """
+                nonlocal tools_used
                 # Emitted BEFORE the call: a 120-second exec used to be silent.
                 self.emit(ev("tool_call", id=tc["id"], name=tc["name"],
                              arguments=tc["arguments"], at=now_stamp()))
-                tag = f"turn {self.turn_id} round {rounds}"
                 # Recorded before the call runs, so a command that hangs until
                 # the turn wall still leaves behind what was attempted.
                 await self.jot(f"{tag} tool_call {tc['name']} {tc['id']}",
@@ -1517,6 +1574,28 @@ class Session:
                     f"{tag} tool_result {tc['name']} {tc['id']} {len(full)} chars", full)
                 self.emit(ev("tool_result", id=tc["id"], name=tc["name"],
                              size=len(out), at=slots[tc["id"]]["at"]))
+
+            calls = result.tool_calls
+            i = 0
+            while i < len(calls):
+                if calls[i]["name"] not in PARALLEL_SAFE:
+                    await execute(calls[i])
+                    i += 1
+                    continue
+                j = i + 1
+                while j < len(calls) and calls[j]["name"] in PARALLEL_SAFE:
+                    j += 1
+                group = calls[i:j]
+                if len(group) > 1:
+                    # A /stop or the turn wall here cancels the gather, which
+                    # cancels every call still running, and the reserved slots
+                    # keep the history well-formed whatever did land.
+                    await asyncio.gather(*(execute(tc) for tc in group))
+                else:
+                    # One read alone is a run of one: the direct await is the
+                    # same behaviour without the gather frame.
+                    await execute(group[0])
+                i = j
 
         def was_cut_off(result):
             """Reasoning ate the whole budget: thought hard, said nothing."""

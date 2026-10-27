@@ -37,7 +37,7 @@ conversation state — see
 | `source/behavior.py` | ~300 | **the behavior layers.** `BehaviorStore`, the read-through cache behind a lock, and the two directives extracted out of `base.md` |
 | `source/config_edit.py` | ~290 | rewriting the `webui:` block of `config.yaml` **as text**, so the file's comments survive a save |
 | `source/ssh_forward.py` | ~570 | **model servers over ssh.** One supervised `ssh -N -L` child per model entry that names an `ssh_forward`, on a port the core picks itself |
-| `source/tools.py` | ~300 | `exec`, `read_file`, `write_file`, `list_dir`, `show_image`, … and their JSON schemas |
+| `source/tools.py` | ~800 | `exec`, `read_file`, `write_file`, `list_dir`, `show_image`, the search and edit tools, … and their JSON schemas |
 | `source/logging_setup.py` | ~110 | one rotating log file **per writer** (`letclaw-core.log`, `letclaw-discord.log`), because two processes sharing one file cannot rotate it safely |
 | `source/token_counter.py` | ~230 | counts with tiktoken's `cl100k_base`, cached under `state/tiktoken/` so it is fetched once ever rather than once per reboot; degrades loudly to 4-chars-per-token if the vocab cannot be loaded at all |
 | `source/paths.py` | ~70 | `REPO_ROOT` and `resolve()` — [principle 15](design-principles.md#15-one-definition-of-where-the-repo-is) |
@@ -109,6 +109,12 @@ Three free functions worth knowing before you touch the turn loop:
   are non-empty but fail `json.loads`. **These are never run**; `rm -rf
   /tmp/scratch` truncated to `rm -rf /` is the accident this prevents. Empty
   arguments are legitimate.
+- **`stored_tool_args(tc)`** — what one call's `arguments` looks like in
+  history: always a JSON object. The server re-validates every assistant
+  message on every later request, so a stored `""` or `123` is a 400 on the
+  *next* turn and on every turn after it, until the window rolls over —
+  `truncated_tool_calls` decides what may run, which is a different question
+  from what may be stored.
 - **`strip_tool_markup(text)`** — removes `<tool_call>…` from
   prose. Only ever relevant on the raw transport.
 
@@ -201,7 +207,14 @@ Rollover is evaluated only after the tool loop has fully drained, so no
   **reserves every result slot up front** with `"error: cancelled"` so a turn
   torn off mid-loop still leaves a well-formed history, then per call: emit
   `tool_call` *before* running, jot, run, **full output to the journal and
-  clipped output to the model**, emit `tool_result`.
+  clipped output to the model**, emit `tool_result`. A run of consecutive
+  read-only calls (`PARALLEL_SAFE` in tools.py — `read_file`, `list_dir` and
+  the three search tools) runs together through `asyncio.gather`, so three
+  two-second reads take the two of the slowest; a write and an exec run alone,
+  in their issued position, so a read after the write of the same path keeps
+  the order the model meant.
+  Results and `tool_result` events land in completion order; the slots, and
+  the history, stay in issue order.
 - **`push_reasoning_stat(...)`** — counts only the new slice,
   **cutting at the last space**, because a token carries its leading space
   (`" alpha"` is one token; `"alpha"` + `" "` is two) and cutting anywhere else

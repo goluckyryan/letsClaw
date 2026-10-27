@@ -40,9 +40,23 @@ someone watching who cannot see the command. A phrase, not a sentence, and
 never a restatement of the command itself.
 
 `read_file` has no offset and no line range: it returns the whole file, and past
-the output limit the middle comes back replaced by a truncation marker. So for a
-large file use `exec` — `grep -n` to find the lines that matter, then
-`sed -n 'A,Bp'` to read that range.
+the output limit the middle comes back replaced by a truncation marker. For a
+large file use `inspect_file` instead — its structure map shows where the
+functions and classes sit, and `lines` reads the range that matters.
+
+Independent reads may go in one message: several read-only calls — `read_file`,
+`list_dir`, `search_and_inspect`, `inspect_file`, `inspect_symbol` — that
+nothing between them could change run together, and the round costs the
+slowest of them rather than the sum. What has an order keeps it — a read after
+the write that made the file, the second of two writes of one path, anything
+after an `exec`.
+
+`edit_file` changes a file by replacing the exact block you name, and refuses
+if that block does not match exactly once — so a small change cannot clobber a
+file you have not read. `search_and_inspect` finds matching lines or files
+under a directory without reading them; `inspect_symbol` finds a definition
+and its references. `run_and_capture` is `exec` with stdout and stderr bounded
+separately, for output too large for one clipped result.
 
 # The record on disk
 Two places hold the work in full, and neither replaces grepping it:

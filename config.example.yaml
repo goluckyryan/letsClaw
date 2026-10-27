@@ -249,7 +249,12 @@ core:
 # Agent tools
 tools:
   enabled: true
-  allow: [exec, read_file, write_file, list_dir, show_image]  # anything not listed is denied
+  allow: [exec, read_file, write_file, list_dir, show_image, search_and_inspect,
+          inspect_file, inspect_symbol, edit_file, run_and_capture]
+                              # anything not listed is denied. The search tools are
+                              # read-only and run in parallel (tools.py:PARALLEL_SAFE);
+                              # edit_file and run_and_capture have effects and run one
+                              # at a time, in the order issued.
                               # show_image copies a picture from anywhere on disk
                               # into webui.files_dir so an answer can display it.
                               # It is the only tool that moves a file onto the

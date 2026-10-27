@@ -380,7 +380,7 @@ and two directives in it are lifted out by the core and used as machinery.
 | section | what it does |
 |---|---|
 | **How you work** | check with a tool rather than answer from memory; **decide rather than ask**; finish the whole task before answering |
-| **Tools** | how to read a large file — `grep -n` then `sed -n`, because `read_file` has no offset and truncates |
+| **Tools** | `read_file` has no offset, so large files go through `inspect_file` (structure map + line ranges); independent read-only calls may be batched in one message, because the core runs them together |
 | **The record on disk** | search the previous window's [journal](#the-journal), and the `grep` line a turn digest ends with, before re-investigating anything |
 | **Directives → `## Checkpoint`** | the text sent when a full notepad is about to be compacted — extracted by `extract_checkpoint_directive` |
 | **Directives → `## Forced conclusion`** | the text sent when a server cannot resume a cut-off thought — extracted by `extract_conclude_directive` |
@@ -450,12 +450,13 @@ graph TD
 ```
 
 Built-in tools: `exec` (shell), `read_file`, `write_file`, `list_dir`,
-`show_image`.
+`show_image`, `search_and_inspect`, `inspect_file`, `inspect_symbol`,
+`edit_file`, `run_and_capture`.
 Add a tool: define a `Tool(name, description, json_schema, async_handler)`
 entry in `tools.py` and list its name in `tools.allow`.
 
 All tool I/O is truncated (`max_output_chars`) so a single call can't blow
-up the context, and the three file tools do their reading and writing off the event
+up the context, and the file tools do their reading and writing off the event
 loop — in the shared core one slow read would otherwise stall every session's stream.
 
 The loop is not capped in **rounds** — a round is one model call plus every tool call it
