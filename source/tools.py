@@ -462,8 +462,15 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
             if len(matches) >= max_matches:
                 break
         if not matches:
+            # Say so when the walk hit its ceiling: "no matches" over a tree
+            # that was only partly read is a wrong answer, and it is the kind
+            # an agent will act on. The cap is reported on the match path
+            # above; it has to be reported here too, where it matters most.
             return (f"no matches in {len(candidates)} files "
-                    f"(scanned {len(files)} files)")
+                    f"(scanned {len(files)} files)"
+                    + (f" — [stopped after {MAX_SEARCH_FILES} files, the rest "
+                       f"was never read; search a narrower root]" if files_stopped
+                       else ""))
         matches.sort(key=lambda m: (_rel(m[0], root_p), m[1]))
         out = [f"{len(matches)} match(es) in {len({m[0] for m in matches})} file(s) "
                f"(scanned {len(files)} files)"]

@@ -8,6 +8,7 @@ that answer in one place means there is exactly one line to get wrong.
 """
 
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -33,16 +34,33 @@ def atomic_write(path, text, encoding="utf-8"):
         and expose a target full of zeros after a power cut;
       * fsync on the directory, so the rename itself survives one. That last is
         best-effort: it is meaningful on Linux and may not be permitted
-        elsewhere, and failing it is no reason to fail a write that landed.
+        elsewhere, and failing it is no reason to fail a write that landed;
+      * the target's mode, copied onto the temp file before the rename, because
+        rename replaces the mode along with the contents and mkstemp's 0600 is
+        not the mode the file had.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # The mode an existing target already carries. mkstemp hands back 0600 and
+    # rename carries that to the target, so without this an edit to a 0755
+    # script leaves it not executable, and a 0664 file a single user can read.
+    # `write_text`, which this replaced, never did that: it opens the target in
+    # place and so cannot see the mode at all. Set on the fd *before* the
+    # rename, so there is no moment when the target is more locked down than it
+    # was; a target that does not exist yet keeps mkstemp's 0600, which is the
+    # right default for a new file holding state.
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        mode = None
     fd, tmp = tempfile.mkstemp(dir=str(path.parent),
                                prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding=encoding) as f:
             f.write(text)
             f.flush()
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
             os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:

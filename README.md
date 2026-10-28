@@ -84,6 +84,7 @@ principles — is in [`docs/`](docs/README.md).
   correction without throwing away the work already done.
 - **Operable without a shell on the core's host** — `/reload` re-reads `config.yaml`
   into the running core, and `/restart` covers the few keys reload cannot reach.
+- The model may continue reasoning as long as there is a meaningful next action, but it should not need another inference call merely to orchestrate work that the harness can execute deterministically.
 
 ## Quick Start
 
