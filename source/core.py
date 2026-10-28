@@ -259,7 +259,7 @@ def api_messages(history):
     no use for. Anything added here must be added to this filter too — the
     default is to send it.
     """
-    drop = ("at", "digest", "turn", "round")
+    drop = ("at", "digest", "turn", "round", "tokens")
     return [{k: v for k, v in m.items() if k not in drop} for m in history]
 
 
@@ -783,6 +783,12 @@ class Session:
     def snapshot(self, last_seq=0):
         """What a (re)attaching client needs: state, plus any missed turn events."""
         missed = [e for e in self.turn_events if e["seq"] > last_seq] if last_seq else []
+        # Digest messages written before tokens were stored on the message get
+        # it back from the content, so every replayed marker carries the full
+        # wording without a data migration.
+        messages = [{**m, "tokens": m.get("tokens") or count_text(m.get("content") or "")}
+                    if m.get("digest") else m
+                    for m in self.history if m.get("role") != "system"]
         # Built directly rather than via emit(), so it must stamp these itself.
         return ev("hello",
                   session=self.name,
@@ -794,7 +800,7 @@ class Session:
                   busy=self.busy,
                   theme=configlib.config_theme(self.config),
                   pin=configlib.config_pin(self.config),
-                  messages=[m for m in self.history if m.get("role") != "system"],
+                  messages=messages,
                   rollover={"mode": self.rollover_mode, "percent": self.rollover_pct,
                             "count": self.rollover_count},
                   missed=missed,
@@ -2635,7 +2641,10 @@ class Session:
             + spoken
             + ([answer] if answer else [])
             + [{"role": "assistant", "content": digest,
-                "at": now_stamp(), **self.mark(), "digest": True}])
+                "at": now_stamp(), **self.mark(), "digest": True,
+                # The same figure digest_done shows: replayed markers carry
+                # the wording without recomputing.
+                "tokens": count_text(digest)}])
         # The window just got much smaller, so the measured prompt size
         # describes a history that no longer exists — same reason as the
         # max_history trim below and roll_over's own reset. Leaving it set

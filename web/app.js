@@ -1764,6 +1764,16 @@ function replayInto(messages) {
       for (const tc of m.tool_calls) {
         pending.set(tc.id, toolSlab(tc.function.name, tc.function.arguments, m));
       }
+    } else if (m.role === 'assistant' && m.digest) {
+      // A collapsed turn, replayed: the same slab digest_done drew live — the
+      // marker line, closed by default, the digest text under it. Without this
+      // branch the digest text fell into the plain-assistant fallthrough and
+      // replayed as an ordinary answer, so after a restart the collapse looked
+      // undone: the one-line marker was full text on screen.
+      slab('digest',
+        `<details><summary>🗜️ turn ${num(m.turn)} collapsed to a ` +
+        `${m.tokens != null ? `${num(m.tokens)} tok ` : ''}digest</summary>` +
+        `<pre>${esc(m.content || '')}</pre></details>`, m);
     } else if (m.role === 'assistant') {
       if (!(m.content || '').trim()) continue;
       msg('llm', '🐱', renderMd(m.content), m);
