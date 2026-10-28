@@ -624,7 +624,17 @@ main::after {
    the bubble's colour instead of its own, that a wide equation scroll rather
    than stretch the page (the same rule <pre> and <table> already follow), and
    that a formula KaTeX refused be legible instead of invisible. */
-.body .katex { color: inherit; font-size: 1.05em; }
+/* The position: relative is not cosmetic — it is the containing block for
+   KaTeX's own .katex-mathml copy. That span is position: absolute, clipped to
+   1px and invisible, but KaTeX does not position .katex, and nothing else in
+   this page is positioned either, so the span's containing block fell through
+   to <body> and its 1px box sat at the formula's full in-flow depth in body
+   coordinates. In a long session that is tens of thousands of px, and an
+   absolutely positioned box contributes to its containing block's scrollable
+   overflow: the document grew a second scrollbar that drags the whole UI.
+   Parking the box in .katex puts it in the log's own scroll context, where
+   it is invisible and harmless. */
+.body .katex { color: inherit; font-size: 1.05em; position: relative; }
 
 /* Display math: its own band, scrollable on a narrow pane. */
 .body .katex-display {
