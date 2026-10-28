@@ -245,14 +245,13 @@ class Renderer:
                     self.line(f"     {ln}")
             self.line(f"   ✨ New session  {e['used']}/{e['budget']} tok")
         elif t == "digest_done":
-            # Laid out like the handoff above it, because it is the same kind
-            # of thing one scale down: a model-written summary that has already
-            # replaced what it summarises. The grep line pointing at the
-            # journal is the digest's own last line, so it needs no row here.
+            # One line — the headline the WebUI folds the full digest behind.
+            # Printing the whole summary here landed a block of it at the end
+            # of every collapsed turn; the working-out is one /digest expand
+            # away, and the journal the digest's pointer names keeps the
+            # untruncated copy either way.
             self.line(f"\n   🗜️  Turn {e['turn_id']} collapsed to a "
-                      f"{e['tokens']} tok digest:")
-            for ln in (e.get("digest_text") or "").splitlines():
-                self.line(f"     {ln}")
+                      f"{e['tokens']} tok digest")
         elif t == "session_state":
             if e["what"] == "cleared":
                 self.line("\n🧹 History cleared (/rollover archives it instead).")

@@ -932,10 +932,11 @@ class ChannelBridge:
         # that sat around the <tool_call> block, and they are not an
         # intentional paragraph break. See _text.
         self._after_tool = False
-        # The turn digest, held from the digest_done that carries it until the
-        # turn_end that posts it. Deliberately not cleared by _reset_answer:
-        # _post_answer calls that on its way through, and clearing it there
-        # would drop the digest a line before it is posted. See _post_digest.
+        # The one-line digest marker, held from the digest_done that carries
+        # it until the turn_end that posts it. Deliberately not cleared by
+        # _reset_answer: _post_answer calls that on its way through, and
+        # clearing it there would drop the marker a line before it is
+        # posted. See _post_digest.
         self._digest = None
         # request_id → future, for a slash command awaiting its own reply.
         self.waiters = {}
@@ -1072,16 +1073,17 @@ class ChannelBridge:
         await self._post_text(text)
 
     async def _post_digest(self):
-        """What the window kept of the turn that just ended, after the answer.
+        """The collapsed turn's one-line marker, after the answer.
 
-        say() rather than _post_text(): a digest is capped at 600 tokens, so
-        it is one or two messages and needs none of the flood handling, and
-        _post_text's overflow path puts the text up as `answer.md` under a
-        note calling it the answer, which this is not.
+        The headline the WebUI folds the full digest behind, and nothing
+        more: Discord has no folding, and the full text at the end of every
+        collapsed turn pushed the conversation off the screen. The
+        working-out is one /digest expand away, and the journal the digest's
+        pointer names keeps the untruncated copy either way.
         """
-        text, self._digest = self._digest, None
-        if text:
-            await self.say(f"🗜️ *turn digest — what the window keeps:*\n{text}")
+        line, self._digest = self._digest, None
+        if line:
+            await self.say(line)
 
     async def _post_text(self, text):
         """Post text to the channel under the channel's own limits.
@@ -1219,12 +1221,14 @@ class ChannelBridge:
             if mark:
                 await self.say(f"_{mark} {_one_line(event.get('text'))}_")
         elif t == "digest_done":
-            # Held, not posted. The core emits this inside the turn, so it
-            # arrives before turn_end — and this client posts nothing until
-            # turn_end, holding the whole answer in self.answer. Posting it
-            # where it lands would put the summary of a turn above the answer
-            # that turn produced.
-            self._digest = event.get("digest_text")
+            # Held, not posted: the core emits this inside the turn, so it
+            # arrives before turn_end, and this client posts nothing until
+            # turn_end, holding the whole answer in self.answer. Posted where
+            # it lands, the marker would sit above the answer the turn
+            # produced. The digest_text the event carries is dropped — the
+            # WebUI is the client that unfolds it.
+            self._digest = (f"_🗜️ turn {event.get('turn_id')} collapsed "
+                            f"to a {event.get('tokens')} tok digest_")
         elif t == "rollover_start":
             await self.say(f"_🔄 rolling over — {_one_line(event.get('reason'))}_")
         elif t == "rollover_done":
