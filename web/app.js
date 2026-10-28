@@ -2245,7 +2245,8 @@ async function refreshSessions() {
   } catch { return; }        // core down; the status pill already says so
 
   if (!list.some((s) => s.name === S.session)) {
-    list.push({ name: S.session, messages: 0, clients: 1, busy: false, pending: true });
+    list.push({ name: S.session, messages: 0, turns: 0, rounds: 0,
+                clients: 1, busy: false, pending: true });
   }
   list.sort((a, b) => a.name.localeCompare(b.name));
 
@@ -2254,7 +2255,11 @@ async function refreshSessions() {
   for (const s of list) {
     const row = node(`srow${s.name === S.session ? ' on' : ''}`);
     row.dataset.name = s.name;
-    row.title = `${s.name} — ${s.messages} messages · ${s.model || 'no model yet'}`
+    row.title = `${s.name} — `
+              + (s.turns !== undefined
+                 ? `${s.turns} turns · ${s.rounds} rounds · `
+                 : '')
+              + `${s.messages} messages · ${s.model || 'no model yet'}`
               + (s.clients ? ` · ${s.clients} attached` : '');
 
     const dot = node('dot');
@@ -2267,7 +2272,15 @@ async function refreshSessions() {
     // tooltip, which is to say nowhere. Shown from two up; one is the normal case
     // and a badge on every row would just be noise.
     const ct = node('ct');
-    ct.textContent = s.messages || '';
+    // turns.rounds: the questions and the model rounds, the two components the
+    // old total lumped together (tool results are neither). Both are scoped to
+    // the window, as the total was — a turn rolled into the archives is not
+    // counted here. The keys exist only on a core new enough to count them,
+    // so until the restart lands the badge falls back to the old total rather
+    // than going blank.
+    ct.textContent = (s.turns !== undefined)
+      ? ((s.turns || s.rounds) ? `${s.turns}.${s.rounds}` : '')
+      : (s.messages || '');
     const eyes = node('eyes');
     eyes.hidden = !(s.clients > 1);
     eyes.textContent = `⧉${s.clients}`;

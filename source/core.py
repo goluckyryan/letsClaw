@@ -3923,6 +3923,13 @@ class SessionManager:
     def describe(self):
         return [{"name": s.name, "model": s.model_name,
                  "messages": len([m for m in s.history if m["role"] != "system"]),
+                 # The window's turns and rounds, separately: user messages and
+                 # assistant messages. The sidebar shows them as turns.rounds
+                 # (tool results are neither), and both stay scoped to the
+                 # current window, as messages does — turns rolled into the
+                 # archives are not counted twice.
+                 "turns": sum(1 for m in s.history if m["role"] == "user"),
+                 "rounds": sum(1 for m in s.history if m["role"] == "assistant"),
                  "clients": len(s.subscribers), "busy": s.busy}
                 for s in self.sessions.values()]
 
