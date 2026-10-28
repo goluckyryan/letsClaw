@@ -369,7 +369,6 @@ main::after {
 }
 
 .msg {
-  max-width: 900px;
   margin: 0 auto 14px;
   padding: 0 18px;
   display: flex;
@@ -672,7 +671,6 @@ main::after {
 /* ---------- tool calls, stats, notices ---------- */
 
 .slab {
-  max-width: 900px;
   margin: 0 auto 10px;
   padding: 0 18px;
   display: flex;
@@ -778,7 +776,6 @@ main::after {
 }
 
 .sep {
-  max-width: 900px;
   margin: 18px auto;
   padding: 0 18px;
   display: flex;
@@ -819,7 +816,6 @@ footer {
 }
 
 .composer {
-  max-width: 900px;
   margin: 0 auto;
   display: flex;
   gap: 8px;
@@ -878,7 +874,6 @@ footer {
 .navbtns button:disabled { opacity: .3; }
 
 .hint {
-  max-width: 900px;
   margin: 5px auto 0;
   font: 11px var(--mono);
   color: var(--dim);
@@ -886,7 +881,6 @@ footer {
 
 /* slash-command popup */
 .ac {
-  max-width: 900px;
   margin: 0 auto 6px;
   background: var(--bg3);
   border: 1px solid var(--line);
