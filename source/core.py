@@ -165,6 +165,12 @@ DIGEST_WINDOW_SHARE = 50
 # and it is already on disk in full, so the tail is taken: the reasoning that
 # led to the answer, rather than the exploring that preceded it.
 DIGEST_PAD_TAIL_CHARS = 20_000
+# The line every digest ends with. Appended by build_turn_digest, not written
+# by the model — the model cannot be trusted to copy a path accurately, and
+# does not need to — which is also why /digest expand can parse it back out
+# with a regex instead of asking a model to point the way.
+DIGEST_POINTER_RX = re.compile(
+    r"\[full record: grep -n '\^## turn (\d+) ' (\S+)\]")
 SESSION_MARKER = "\n=== SESSION ===\n"
 CARRYOVER_MARKER = "\n\n=== CONTINUED SESSION ===\n"
 
@@ -367,6 +373,197 @@ def stored_tool_args(tc):
     return "{}"
 
 
+def _read_turn_blocks(path, turn_id):
+    """One turn's journal blocks, in file order — or None when the segment is gone.
+
+    Each block is (head, body): head is the header minus the `turn N` prefix
+    (`user`, `round 3 tool_call exec call_1`, ...) and body the text under the
+    header. Only a line in the strict header form ends a block, because tool
+    output and reasoning are raw text that may itself contain `## ` lines, and
+    those are body, not structure. The turn number matches exactly, so a
+    search for turn 1 never touches turn 12's blocks.
+    """
+    try:
+        raw = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    own = re.compile(rf"^## turn {turn_id} (.+?)  \[\d{{2}}:\d{{2}}:\d{{2}}\]$")
+    other = re.compile(r"^## turn \d+ .+  \[\d{2}:\d{2}:\d{2}\]$")
+    blocks = []
+    head, body = None, []
+    for line in raw.split("\n"):
+        m = own.match(line)
+        if m:
+            if head is not None:
+                blocks.append((head, "\n".join(body).strip("\n")))
+            head, body = m.group(1), []
+        elif other.match(line):
+            if head is not None:
+                blocks.append((head, "\n".join(body).strip("\n")))
+            head, body = None, []
+        elif head is not None:
+            body.append(line)
+    if head is not None:
+        blocks.append((head, "\n".join(body).strip("\n")))
+    return blocks or None
+
+
+def _reconstruct_turn(region, turn_id, blocks):
+    """A digested turn, rebuilt as the history messages the collapse removed.
+
+    Returns (messages, reason): messages is None when the blocks do not line
+    up with what a digested turn leaves behind, and reason is the words a
+    /digest reply can carry. `region` is the turn as it stands after the
+    collapse, digest removed: [user, ...steering, answer?].
+
+    The user messages and, when there is one, the answer stay verbatim from
+    the region — the journal only fixes their positions, and the region's
+    copies are the ones with the original stamps. What is rebuilt is the
+    working-out: one assistant message per round that called tools, carrying
+    the round's text (if any) and its calls, followed by that round's
+    results in issue order, not the completion order the journal recorded
+    them in — the same invariant the pre-reserved result slots exist for.
+
+    Text needs a rule, because a text-only round can be either an answer the
+    region already keeps or an intermediate answer the collapse ate (a
+    /steering that arrived as the answer finished reopens the turn, and the
+    real answer comes later): a text-only round whose blocks are not the
+    turn's last is appended, the last one is not. `fallback text` is the
+    answer too — the region keeps it — so it is never appended. Reasoning
+    blocks are skipped everywhere: reasoning never enters history, and the
+    journal remains its record.
+    """
+    if not region or region[0].get("role") != "user":
+        return None, "the region does not open on the turn's question"
+    users = [m for m in region if m.get("role") == "user"]
+    journal_users = [b for b in blocks if b[0] in ("user", "steering")]
+    if len(journal_users) != len(users):
+        return None, ("the journal's user blocks do not line up with "
+                      "the history's — the segment may have stopped recording")
+
+    messages = []
+    ui = 0
+    cur = None          # the round being collected
+    cur_round = None
+    last_round = 0
+    answer = (region[-1] if region[-1].get("role") == "assistant"
+              and not region[-1].get("tool_calls")
+              and (region[-1].get("content") or "").strip() else None)
+
+    def flush(append_text):
+        """One collected round into messages. False when a call's result is missing.
+
+        append_text: a round that made no calls is not rebuilt at all when it
+        is the turn's answer — the region keeps that — but a text-only round
+        that is *not* the turn's last is an intermediate answer the collapse
+        removed, and only the journal has it, so it is rebuilt.
+        """
+        nonlocal cur, cur_round
+        if cur is None:
+            return True
+        ok = True
+        if cur["calls"]:
+            messages.append({
+                "role": "assistant",
+                "content": "\n".join(cur["text"]) or "",
+                "turn": turn_id, "round": cur_round, "at": now_stamp(),
+                "tool_calls": [
+                    {"id": cid, "type": "function",
+                     "function": {"name": nm,
+                                  "arguments":
+                                      stored_tool_args({"arguments": args})}}
+                    for cid, nm, args in cur["calls"]
+                ],
+            })
+            for cid, nm, _args in cur["calls"]:
+                if cid not in cur["results"]:
+                    ok = False
+                    break
+                messages.append({"role": "tool", "tool_call_id": cid,
+                                 "content": cur["results"][cid],
+                                 "turn": turn_id, "round": cur_round,
+                                 "at": now_stamp()})
+        elif append_text and (cur["text"] or []):
+            messages.append({"role": "assistant",
+                             "content": "\n".join(cur["text"]),
+                             "turn": turn_id, "round": cur_round,
+                             "at": now_stamp()})
+        cur, cur_round = None, None
+        return ok
+
+    for head, body in blocks:
+        if head in ("user", "steering"):
+            # drain_steering runs at the top of the next loop iteration, so the
+            # journal's steering block sits after the round it followed. Flush
+            # that round first, or its assistant and tool messages would land
+            # after the steering and the history would not be the one the model
+            # saw. A round flushed here is not the turn's last, so a text-only
+            # one is an intermediate answer and is kept.
+            if not flush(True):
+                return None, "a tool call has no recorded result in this segment"
+            messages.append(users[ui])
+            ui += 1
+            continue
+        # The phase is round, resume or closing — the journal tags them the
+        # way the model saw them, and the round number runs on across all
+        # three, which is the ordering below.
+        # tool_call and tool_result carry a tail (name, id, …); reasoning and
+        # text do not, so it is optional — a regex that made it mandatory
+        # dropped every text-only round, which is exactly the intermediate
+        # answer this function exists to recover.
+        m = re.match(r"^(?:round|resume|closing) (\d+) "
+                     r"(reasoning|text|tool_call|tool_result)(?: (.+))?$", head)
+        if m:
+            rnd = int(m.group(1))
+            if cur is None:
+                if rnd <= last_round:
+                    return None, "the segment's rounds are out of order"
+                cur, cur_round = {"text": [], "calls": [], "results": {}}, rnd
+                last_round = rnd
+            kind, rest = m.group(2), m.group(3)
+            if kind == "reasoning":
+                continue
+            if kind == "text":
+                cur["text"].append(body)
+            elif kind == "tool_call":
+                nm, cid = rest.split(" ", 1)
+                cur["calls"].append((cid, nm, body))
+            else:  # tool_result: "name id N chars"
+                # Off the end, where the count and its unit are fixed words;
+                # the id is the second-to-last token, the name everything
+                # before it (it cannot contain spaces — it is a registry key).
+                nm, cid = rest.rsplit(" ", 3)[:-2]
+                cur["results"][cid] = body
+            continue
+        if head == "partial (steering)":
+            # The interrupted round itself has no phase blocks — the jot sits
+            # after a model round returns, and this one never did — so its
+            # number is the last completed round plus one. It is never the
+            # turn's answer: the steering and the re-planning that followed it
+            # still have to produce one, and a turn that errored instead was
+            # never digested at all.
+            if not flush(True):
+                return None, "a tool call has no recorded result in this segment"
+            messages.append({"role": "assistant", "content": body,
+                             "turn": turn_id, "round": last_round + 1,
+                             "at": now_stamp()})
+            continue
+        if head == "fallback text":
+            # The one answer that never goes through call_round; it is the
+            # turn's answer, so the region keeps it and this block is the
+            # flush, not an append.
+            if not flush(True):
+                return None, "a tool call has no recorded result in this segment"
+            continue
+        # Anything else is a block of this turn that history never held
+        # (interrupted reasoning: the journal keeps it, and only the journal).
+    if not flush(False):
+        return None, "a tool call has no recorded result in this segment"
+    if answer is not None:
+        messages.append(answer)
+    return messages, ""
+
+
 def strip_tool_markup(text):
     """Drop tool-call markup a resumed round may have written as prose.
 
@@ -417,7 +614,13 @@ class Session:
         # conversation default. This early call always lands on the default:
         # model_name is still None here and use_model() sets it, which is why
         # use_model() asks again once it has.
-        self.digest_turns = self._configured_digest_turns()
+        #
+        # digest_override is the session's own answer to the same question,
+        # made by a person with `/digest off|collapse` rather than by a config
+        # file. None until it is made; it then outranks both config layers for
+        # the life of the session, and persist() carries it across a restart.
+        self.digest_override = None
+        self.digest_turns = self._effective_digest_turns()
         self.declined_at = None
         self.warned_over = False
         # Said once per window when the pre-turn gate declines to act on a
@@ -735,6 +938,34 @@ class Session:
             return bool(override)
         return bool((self.config.get("conversation") or {}).get("digest_turns", False))
 
+    def _effective_digest_turns(self):
+        """The session's actual mode: a `/digest` choice, else the config.
+
+        The override outranks both config layers, which is why the three
+        sites that resolve this (init, the reload path, use_model) all ask
+        here rather than _configured_digest_turns() directly: a `/clear`, a
+        `/model` switch and a reload all re-ask, and the choice has to ride
+        through all three. A reload with the override set keeps the override
+        and does not re-resolve the config under it — that would quietly
+        overrule a choice the person made in this session, and the config
+        change is still one `/digest` away from being read.
+        """
+        if self.digest_override is not None:
+            return self.digest_override
+        return self._configured_digest_turns()
+
+    def _digest_state(self):
+        """The digest answer as /info and bare /digest both return it.
+
+        One shape, because the WebUI button paints from the /info it fetches
+        on attach and from the reply to its own clicks alike — two shapes
+        would have to agree with each other forever, and would not.
+        """
+        return {"on": self.digest_turns,
+                "set_by": ("you" if self.digest_override is not None
+                           else "config"),
+                "expandable": sum(1 for m in self.history if m.get("digest"))}
+
     def fresh_history(self, carryover=""):
         """System message: the three behavior layers, then the carryover.
 
@@ -890,14 +1121,16 @@ class Session:
                 setattr(self, attr, now)
 
         # Recomputed outright rather than diffed like the scalars above, and
-        # the divergence rule does not apply: nothing changes digest_turns for
-        # a single session at runtime, so there is no per-session value to
-        # protect. It is derived from two config layers — the model entry over
-        # the conversation default — and re-resolving is the only way to pick
-        # up a change in either. Turning it on affects the next turn to
+        # the divergence rule does not apply to the config half: nothing
+        # changes the configured value for a single session at runtime, and
+        # it is derived from two config layers — the model entry over the
+        # conversation default — so re-resolving is the only way to pick up a
+        # change in either. Through _effective_digest_turns(), because a
+        # /digest choice outranks both layers and has to survive the reload
+        # that is this very path. Turning it on affects the next turn to
         # finish; turns already collapsed stay collapsed, which is what the
         # journal is for.
-        self.digest_turns = self._configured_digest_turns()
+        self.digest_turns = self._effective_digest_turns()
 
         if blob["engine"] is not None and blob["engine"] is not self.engine:
             # The engine being dropped still owns an httpx connection pool. On
@@ -1007,6 +1240,11 @@ class Session:
             # even a fresh window trips the threshold; re-reading it from config
             # would put the session straight back into that loop.
             "rollover_pct": self.rollover_pct,
+            # The /digest choice: None while the session follows the config,
+            # True/False once a person has spoken. Additive like the odometers
+            # below — a file written before the key existed reads back as
+            # None, which is exactly "never chose".
+            "digest": self.digest_override,
             "declined_at": self.declined_at,
             "warned_over": self.warned_over,
             "last_used": self._last_used,
@@ -1065,6 +1303,15 @@ class Session:
         self.total_cached = configlib.int_or(payload.get("total_cached") or 0, 0)
         self.cached_input = configlib.int_or(payload.get("cached_input") or 0, 0)
         self.rollover_count = configlib.int_or(payload.get("rollover_count") or 0, 0)
+        # The /digest choice. isinstance, not a truthy test: 1 and True are
+        # equal in Python, and a torn write or hand edit that leaves a 1 in
+        # the file is not a person who chose collapse.
+        digest = payload.get("digest")
+        self.digest_override = digest if isinstance(digest, bool) else None
+        # use_model already ran before load_state on the restore path and
+        # resolved this from the config; the override, if the file carried
+        # one, outranks that resolution.
+        self.digest_turns = self._effective_digest_turns()
         self._persisted = True
 
     # ---- the turn --------------------------------------------------------
@@ -2411,6 +2658,98 @@ class Session:
         self.emit(ev("digest_done", turn_id=self.turn_id,
                      tokens=count_text(digest), digest_text=digest))
 
+    async def _expand_digests(self, all_=False):
+        """Restore turns _digest_turn collapsed, from the journal they left.
+
+        The inverse of a collapse, with the same discipline: anything that
+        cannot be verified fails toward keeping the digest, because the
+        journal is the only other copy, and a segment that stopped recording
+        part-way through would make a partial expansion a partial loss.
+
+        A collapse leaves the turn's region as [user, ...steering, answer?,
+        digest] — the answer before the digest, so this cannot splice the
+        rebuild where the digest sat. It finds the region by turn id instead:
+        every message of the turn carries it in its mark, and the digest's
+        record pointer (code-appended, not model-written) names the turn and
+        the segment to read.
+        """
+        digests = [i for i, m in enumerate(self.history) if m.get("digest")]
+        if not digests:
+            # A report, not an error: the WebUI button's cycle
+            # (off → collapse → expand → off) routes every on-collapse click
+            # through here, where nothing is collapsed by definition, and a
+            # click that surfaces an error would make the cycle read as a bug.
+            # A typed /digest expand still hears back — the clients print the
+            # empty report, since there is no digest_expanded broadcast for it.
+            return {"ok": True, "expanded": {"turns": [], "messages": 0,
+                                             "skipped": []}}
+        targets = digests if all_ else [digests[-1]]
+        plan = []       # (start, digest_idx, turn_id, rebuilt)
+        skipped = []
+        for i in targets:
+            pointer = DIGEST_POINTER_RX.search(
+                self.history[i].get("content") or "")
+            if not pointer:
+                skipped.append("one digest carries no record pointer")
+                continue
+            turn_id = int(pointer.group(1))
+            path = pointer.group(2)
+            blocks = await asyncio.to_thread(_read_turn_blocks, path,
+                                             turn_id)
+            if not blocks:
+                # Covers both ways the read comes back empty: the file itself
+                # is gone, or it is there but holds no record of this turn —
+                # either way there is nothing to verify, so the digest stays.
+                skipped.append(f"turn {turn_id}: no record of it in the "
+                               f"segment it points at ({path})")
+                continue
+            # The region starts where the turn number begins: everything back
+            # from the digest stamped with it is this turn's, and the first
+            # message with a different number ends the walk. The system
+            # message has none, so a turn at the top of the window stops there.
+            start = i
+            while start > 0 and self.history[start - 1].get("turn") == turn_id:
+                start -= 1
+            rebuilt, reason = _reconstruct_turn(self.history[start:i],
+                                                turn_id, blocks)
+            if rebuilt is None:
+                skipped.append(f"turn {turn_id}: kept — {reason}")
+                continue
+            plan.append((start, i, turn_id, rebuilt))
+        if not plan:
+            return {"ok": False,
+                    "error": "nothing was restored — " + "; ".join(skipped)}
+        # Splice from the tail, so an earlier region's indices are not moved
+        # by a later one, and assign the whole list in one statement — a
+        # cancellation between two mutations would leave a history settled()
+        # no longer recognises, the same reason _digest_turn works that way.
+        new_history = list(self.history)
+        turns = []
+        restored = 0
+        for start, i, turn_id, rebuilt in sorted(plan, key=lambda r: -r[1]):
+            # i + 1: the digest is inside the replacement. Splicing to i
+            # would leave the summary in the window with the full working
+            # out re-inserted around it — paying for both.
+            new_history[start:i + 1] = rebuilt
+            turns.append(turn_id)
+            restored += len(rebuilt) - (i - start)
+        self.history = new_history
+        turns.sort()
+        # The window just grew, so the measured prompt size describes a
+        # history that no longer exists — the same reset _digest_turn makes
+        # when it shrinks one.
+        self._last_used = None
+        # The state rides with the event, read after the splice: a client
+        # that repainted from the pre-expansion count would still be pointing
+        # at a digest this call just removed.
+        self.emit(ev("session_state", what="digest_expanded",
+                     turns=turns, messages=restored,
+                     skipped=skipped, **self._digest_state()))
+        await self.persist()
+        return {"ok": True, "expanded": {"turns": turns,
+                                         "messages": restored,
+                                         "skipped": skipped}}
+
     async def _after_turn(self):
         trip = self.trip
         rolled = False
@@ -2672,6 +3011,11 @@ class Session:
                 # nothing asked it.
                 "tokenizer": tokenizer_status(),
                 "tools_tokens": self.tools_tok,
+                # The WebUI's digest button paints from here, on attach:
+                # whether collapsing is on, who turned it on, and how many
+                # collapsed turns the window still holds (its expand position
+                # has work to do).
+                "digest": self._digest_state(),
                 # Since the session was created, surviving /clear and restarts.
                 "output_total": self.total_output,
                 # The bill, as opposed to the gauge. input_total counts every
@@ -2718,6 +3062,12 @@ class Session:
             # where this branch sits.
             return {"ok": True, "current": self.model_name,
                     "configured": configlib.known_models(self.config)}
+        if name == "digest" and not args.strip():
+            # The reporting half of /digest, up here for the same reason the
+            # model listing is: it reads history and changes nothing, and the
+            # moment a person wants to know the state is while a turn runs.
+            # The halves that change anything stay below the busy guard.
+            return {"ok": True, "digest": self._digest_state()}
         if name == "reload":
             # Manager-level, and deliberately outside the turn lock: reload defers
             # any session that is busy, so taking the lock here would have it defer
@@ -2834,6 +3184,34 @@ class Session:
                              budget=self.budget))
                 await self.persist()
                 return {"ok": True, "model": self.model_name, "budget": self.budget}
+            if name == "digest":
+                choice = args.strip().lower()
+                if choice in ("off", "collapse"):
+                    # A person's answer to the digest question. It outranks
+                    # both config layers until this session dies, and it is
+                    # written to the live file so a restart does not answer
+                    # "config" to a question the person already decided.
+                    self.digest_override = choice == "collapse"
+                    self.digest_turns = self._effective_digest_turns()
+                    # The broadcast carries the state, the reply is just ok:
+                    # /clear and /model do it this way, and a reply that also
+                    # carried the state would have the asking client print the
+                    # same choice twice.
+                    self.emit(ev("session_state", what="digest",
+                                 **self._digest_state()))
+                    await self.persist()
+                    return {"ok": True}
+                if choice in ("expand", "expand all"):
+                    # The undo of a collapse, not a state: off/collapse decide
+                    # what happens to the next turn, expand re-reads the past
+                    # from the journal. Re-inserted turns are bigger than the
+                    # digest they replace, which is the whole of the risk —
+                    # so all_ is opt-in, and a bare expand is one turn.
+                    return await self._expand_digests(all_=choice == "expand all")
+                return {"ok": False,
+                        "error": "usage: /digest off | /digest collapse | "
+                                 "/digest expand [all] "
+                                 "(or bare /digest to report the mode)"}
         return {"ok": False, "error": f"unknown command: /{name}"}
 
     async def use_model(self, model_name=None):
@@ -2856,8 +3234,10 @@ class Session:
         # to override it — a session switched onto a model whose window makes
         # digesting pointless must stop digesting, and one switched back must
         # start again. Reading the live config means this needs no cooperation
-        # from reload, which may have rewritten either layer since.
-        self.digest_turns = self._configured_digest_turns()
+        # from reload, which may have rewritten either layer since. Through
+        # _effective_digest_turns(): a /digest choice outranks the model entry
+        # it was made on, and a switch must not silently overrule it.
+        self.digest_turns = self._effective_digest_turns()
         # A different engine is a different server with different answers, so
         # the findings this session has already reported are about somebody else.
         self._server_warned = False

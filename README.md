@@ -24,6 +24,7 @@ over a WebSocket. Behavior is plain MD files — everything visible, nothing hid
 - [Agent Tools](#agent-tools)
 - [Context Rollover](#context-rollover)
   - [Collapsing a finished turn (`digest_turns`)](#collapsing-a-finished-turn-digest_turns)
+  - [The `/digest` command](#the-digest-command)
   - [The journal](#the-journal)
 - [Reasoning: the Notepad and the Answer Sheet](#reasoning-the-notepad-and-the-answer-sheet)
   - [The picture](#the-picture)
@@ -156,7 +157,7 @@ graph TD
     end
 
     subgraph Modules
-        Cmds[Commands\n/clear /rollover /new /info /model\n/behavior /reasoning /stop /steering\n/reload /restart /session]
+        Cmds[Commands\n/clear /rollover /new /info /model\n/behavior /reasoning /stop /steering\n/reload /restart /session /digest]
         TokenCounter[Token Counter\ntoken_counter.py\nper-message stats]
         ThinkingUI[Thinking indicator\nui.py\nlive spinner + TTFT]
         Tools[Tool executor\ntools.py\nexec / read / write / list]
@@ -618,6 +619,54 @@ models:
 Omitting the key in a model entry means "follow the conversation setting";
 `false` there means off. A `/model` switch re-resolves it, so moving a live
 session onto that model stops the digesting and moving it back resumes.
+
+### The `/digest` command
+
+The config answers what every session should do; `/digest` answers what *this*
+session will do. It is in every client — terminal, WebUI, Discord — and the
+WebUI's toolbar carries it as a 📄 button.
+
+- **`/digest off`** and **`/digest collapse`** are state, and the session's
+  own. While set, the choice outranks both config layers, so a config edit,
+  a `/model` switch, a `/clear` or a restart cannot take it back — it is
+  written to the session's live file, which is what carries it across a
+  restart. A session that never chose follows the config as before.
+- **`/digest expand`** and **`/digest expand all`** are the undo of a
+  collapse, not a state: the last collapsed turn back out of the journal, or
+  every collapsed turn in the window. The re-inserted turn is bigger than the
+  digest it replaces, which is the whole of the risk, so `all` is opt-in.
+- **`/digest`** with nothing after it is the read-only report: on or off, by
+  config or by you, and how many collapsed turns an expand would reach. It
+  answers while a turn is running, for the same reason `/info` does.
+
+Expansion works the way the collapse's promise says it should. Every digest
+ends in the grep line pointing at the segment that holds the turn in full,
+and `expand` parses that line — code-appended, not model-written — and
+rebuilds the turn from it. The question and the answer stay the copies
+already in the window; the working-out comes back the way it ran, one
+assistant message per round of tool calls with the results in the order they
+were issued, and unclipped where the journal kept more than the window had
+room for.
+
+And it fails the way the collapse fails: no pointer, a segment with no record
+of the turn, a call with no recorded result — the digest stays, the reply
+names which turn was kept and why, and nothing else in the window moves. A
+partial expansion would be a partial loss, and the journal is the only other
+copy.
+
+The 📄 button is a three-position wheel in the think button's style —
+**off** → **collapse** → **expand** → **off** — where the position is the
+wheel's own: each click advances it and sends the command the new position
+names, `collapse` turns the digest on, `expand` undoes the last collapse,
+`off` turns it off. Both on positions light the button's on lamp; the
+server's state still owns that lamp and the collapsed-turn count, and a
+broadcast that contradicts the wheel pulls it back — a tab that sees the
+session go off from elsewhere snaps to off — but between those, the wheel is
+the tab's, as the think button's mode is. A reattach learns the position
+from the `/info` it fetches. The wheel's `expand` with nothing collapsed is
+a no-op the core reports as "nothing to expand" rather than refusing — a
+click is never an error — and expanding more than one turn is going around
+the wheel again, or a typed `/digest expand` (`all` stays a typed argument).
 
 Two directories under `state/`, easily confused: **`state/live/` is the conversation
 you are having** — rewritten as you go and reloaded at startup — while
@@ -1362,6 +1411,7 @@ picks the token up from the local `config.yaml` on its own).
 | `/info` | the core's version, session name and id, recent history, context usage, output total |
 | `/behavior` | print the loaded behavior file |
 | `/reasoning` | toggle live display of the model's thinking |
+| `/digest` , `/digest off` , `/digest collapse` , `/digest expand [all]` | per-session digest mode — the bare form reports it (and answers while a turn runs), `off`/`collapse` choose it for this session's life, `expand` restores the last collapsed turn from the journal, `expand all` every one |
 | `/stop` | interrupt the turn in progress |
 | `/steering <text>` | send a correction *into* the turn in progress — the model picks it up at the next round, and it enters the history as the ordinary user message it is. Refused when nothing is running, rather than held over for the next turn |
 | `/reload` | re-read `config.yaml` into the running core |

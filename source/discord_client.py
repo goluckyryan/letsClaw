@@ -135,7 +135,7 @@ NO = {"n", "no"}
 COMMAND_WORDS = {
     "info", "model", "new", "rollover", "clear", "behavior", "stop",
     "reload", "restart", "session", "help", "commands", "quit", "exit",
-    "reasoning",
+    "reasoning", "digest",
 }
 # Discord's own client captures a leading "/" into its slash-command picker, and
 # with no application commands registered the message can end up never being
@@ -157,6 +157,8 @@ HELP = (
     "`!restart` restart the core process (I am a separate process and stay "
     "up)\n"
     "`!session [name]` this channel's session — set, show, or `auto`\n"
+    "`!digest` digest mode report · `!digest off` / `!digest collapse` choose · "
+    "`!digest expand` undo the last collapse\n"
     "`!help` this\n"
     "_`/` works too, but Discord's own command picker often eats it before it "
     "is sent — `!` or `@me /command` always gets through._"
@@ -1325,6 +1327,16 @@ class ChannelBridge:
         elif what == "model":
             await self.say(f"_🤖 now on {event.get('model')} — budget "
                            f"{event.get('budget')} tok_")
+        elif what == "digest":
+            # The broadcast is the announcement: the off/collapse reply is
+            # ok-and-done, so the asker does not get a second line for it.
+            own = event.get("set_by") == "you"
+            await self.say(f"_📄 digest {'on' if event.get('on') else 'off'} — "
+                           f"{'your choice, survives restarts' if own else 'following config'}_")
+        elif what == "digest_expanded":
+            await self.say(f"_📂 expanded turn(s) "
+                           f"{', '.join(map(str, event.get('turns') or []))} — "
+                           f"{event.get('messages', 0)} message(s) back from the journal_")
         elif what == "reloaded":
             # The core has re-read config.yaml; this process has to as well,
             # or the line below announces a reload that did not reach the one
@@ -1419,6 +1431,18 @@ class ChannelBridge:
                 where = f" ({event['session']})" if event.get("session") else ""
                 out.append(f"**Session behavior**{where}\n{per_session}")
             return "\n\n".join(out)
+        if "digest" in event:
+            # Bare /digest: the read-only half. The off/collapse replies carry
+            # nothing but ok — their line is the session_state broadcast.
+            d = event["digest"]
+            own = d.get("set_by") == "you"
+            return (f"📄 digest **{'on' if d.get('on') else 'off'}** — "
+                    f"{'your choice, survives restarts' if own else 'following config'}"
+                    f" · {d.get('expandable', 0)} collapsed turn(s) to expand")
+        if "expanded" in event and not event["expanded"].get("turns"):
+            # The no-op half of /digest expand — a real expansion is announced
+            # by its session_state broadcast, so this only sees the empty one.
+            return "📄 nothing to expand — no collapsed turn in the window"
         if "configured" in event:
             listed = ", ".join(f"`{m}`" for m in event.get("configured") or [])
             return (f"🤖 current: **{event.get('current')}**\n"
@@ -2213,6 +2237,15 @@ class LetsClawBot(discord.Client):
         # The bot is a sibling process of the core, not a child of it: this
         # restarts the core and the link reconnects on its own backoff.
         simple("restart", "restart the core process (refuses while a turn runs)")
+
+        @tree.command(name="digest",
+                      description="digest mode — the report, or off / collapse "
+                                  "/ expand (with 'all')")
+        @app_commands.describe(choice="leave blank for the report")
+        async def _digest(interaction: discord.Interaction, choice: str = ""):
+            # Forwarded verbatim, the way model's name is: the core owns the
+            # subcommand grammar and answers the usage error itself.
+            await self.run_slash(interaction, "digest", choice)
 
         @tree.command(name="model",
                       description="switch this channel's model — pick from a list")

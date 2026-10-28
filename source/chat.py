@@ -50,6 +50,7 @@ COMMANDS = {
     "/model": "list models, or /model <name> to switch",
     "/info": "recent history and context usage",
     "/behavior": "print the loaded behavior files (base + model + session)",
+    "/digest":    "off | collapse | expand [all] — turn's working-out, per session",
     "/reasoning": "toggle live display of the model's thinking",
     "/stop": "interrupt the turn in progress",
     "/steering": "send a correction to the turn in progress",
@@ -266,6 +267,15 @@ class Renderer:
                 self.fresh_context(e)
             elif e["what"] == "model":
                 self.line(f"\n🤖 Switched to {e['model']} — context budget {e['budget']} tok.")
+            elif e["what"] == "digest":
+                # The broadcast is the notification; the reply to /digest off
+                # is just ok, so nothing is printed twice.
+                own = e.get("set_by") == "you"
+                self.line(f"\n📄 Digest: {'on' if e.get('on') else 'off'}"
+                          f"{' — your choice' if own else ' (following config)'}")
+            elif e["what"] == "digest_expanded":
+                self.line(f"\n📂 Expanded turn(s) {', '.join(map(str, e.get('turns') or []))} — "
+                          f"{e.get('messages', 0)} message(s) back from the journal.")
             elif e["what"] == "reloaded":
                 # Broadcast to every attached session, including ones whose client
                 # did not ask — so say which session moved, not just that it did.
@@ -513,6 +523,21 @@ async def run_client(url, session_name, render, token=""):
                     elif "configured" in e:
                         render.line(f"\n🤖 Current: {e.get('current')}")
                         render.line(f"📋 Configured models: {', '.join(e['configured']) or '(none)'}")
+                    elif "digest" in e:
+                        # Bare /digest: the read-only half. The state-changing
+                        # halves reply bare {ok}, their line comes from the
+                        # session_state broadcast instead.
+                        d = e["digest"]
+                        render.line(f"\n📄 Digest: {'on' if d.get('on') else 'off'} — "
+                                    f"{'your choice' if d.get('set_by') == 'you' else 'following config'}"
+                                    f", {d.get('expandable', 0)} collapsed turn(s) to expand")
+                    elif "expanded" in e and not e["expanded"].get("turns"):
+                        # The no-op half of /digest expand. A real expansion
+                        # announces itself with its digest_expanded broadcast,
+                        # so this only sees the empty one — without it a typed
+                        # command with nothing collapsed would print nothing.
+                        render.line("\n📄 Nothing to expand — no collapsed turn "
+                                    "in the window")
                     elif "changed" in e:
                         render.show_reload(e)
                     elif not e.get("ok"):

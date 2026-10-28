@@ -24,6 +24,7 @@ const COMMANDS = {
   '/model':     'list models, or /model <name> to switch',
   '/info':      'recent history and context usage',
   '/behavior':  'print the loaded behavior files (base + model + session)',
+  '/digest':    'off | collapse | expand [all] — collapse finished turns, per session',
   '/reasoning': "cycle the model's thinking: off → folded → open (or name one)",
   '/stop':      'interrupt the turn in progress',
   '/steering':       'send a correction to the turn in progress',
@@ -88,6 +89,14 @@ const S = {
   tripPct: 0,
   rollovers: 0,
   reason: loadReasonMode(),
+  // The session's digest mode, server-owned: /info on attach, each /digest
+  // reply, and the session_state broadcasts all land here. null on `on`
+  // means /info has not landed yet, and the button stays unlit.
+  digest: { on: null, set_by: 'config', expandable: 0 },
+  // The 📄 button's wheel position (off/collapse/expand), tab-owned like
+  // S.reason: the click advances it, the server only pulls it back when its
+  // on/off contradicts the wheel. null until /info has landed.
+  digestPos: null,
   theme: 'auto',
   sideW: clampW(parseInt(localStorage.getItem('letsclaw.sideW'), 10)),
   busy: false,
@@ -1560,6 +1569,21 @@ function handle(e) {
       showModel(e.model);
       notice(`🤖 Switched to ${e.model} — context budget ${e.budget} tok.`);
       setHint();
+    } else if (e.what === 'digest' || e.what === 'digest_expanded') {
+      // The state rides with the event, so this repaints every attached tab —
+      // the one that clicked included, which is why the click itself is a
+      // silent rpc. For digest_expanded the event is the only announcement:
+      // the reply is ok-and-done, and other tabs would otherwise watch a turn
+      // come back out of the journal and see nothing about it.
+      S.digest = { on: e.on, set_by: e.set_by, expandable: e.expandable };
+      syncDigestPos();
+      showDigest();
+      if (e.what === 'digest') {
+        notice(`📄 digest ${e.on ? 'on' : 'off'} — ${e.set_by === 'you' ? 'your choice, survives restarts' : 'following config'}`);
+      } else {
+        notice(`📂 expanded ${e.turns.map((t) => `turn ${num(t)}`).join(', ')} — ${num(e.messages)} message(s) back from the journal`
+               + (e.skipped.length ? ` · kept: ${e.skipped.join('; ')}` : ''));
+      }
     } else if (e.what === 'reloaded') {
       // Broadcast to every session the reload touched, not just the one that
       // asked. The budget can have moved under this tab, so the gauge is redrawn
@@ -1572,7 +1596,7 @@ function handle(e) {
       notice(`♻️ Config reloaded — ${e.model}, context budget ${e.budget} tok.`);
       loadModels().then(() => showModel(e.model)).catch(() => {});
       rpc('info', '', true)
-        .then((r) => r.info && setGauge(r.info.used, r.info.budget, false))
+        .then((r) => r.info && (setGauge(r.info.used, r.info.budget, false), applyDigestInfo(r.info)))
         .catch(() => {});
       if (isOpen('#settings')) settingsRefresh();   // the panel shows the live config — redraw it
       setHint();
@@ -1630,6 +1654,15 @@ function handle(e) {
       `<details><summary>🗜️ turn ${num(e.turn_id)} collapsed to a ` +
       `${num(e.tokens)} tok digest</summary>` +
       `<pre>${esc(e.digest_text || '')}</pre></details>`, e);
+    // A collapse just landed, so the digest button's expand position has
+    // work to do now. The event carries no state of its own, so the count is
+    // nudged locally — digest_done only fires when a digest really happened,
+    // which is the moment on=true and expandable grows by one.
+    if (S.digest && S.digest.on !== null) {
+      S.digest = { ...S.digest, on: true, expandable: S.digest.expandable + 1 };
+      syncDigestPos();
+      showDigest();
+    }
     if (S.busy) setWaiting('thinking');
     return;
   }
@@ -1703,9 +1736,11 @@ function hello(e) {
   setBusy(!!e.busy);
   if (e.busy) setWaiting('a turn is already running');
 
-  // The gauge has no reading until a turn completes; /info gives an estimate now.
+  // The gauge has no reading until a turn completes; /info gives an estimate
+  // now. The digest button is painted from the same fetch: the state is
+  // server-owned and attach is when a stale tab (or a fresh one) learns it.
   rpc('info', '', true)
-    .then((r) => r.info && setGauge(r.info.used, r.info.budget, false))
+    .then((r) => r.info && (setGauge(r.info.used, r.info.budget, false), applyDigestInfo(r.info)))
     .catch(() => {});
 }
 
@@ -1801,6 +1836,23 @@ function response(e) {
   }
   if (e.configured) {
     return notice(`🤖 current: ${e.current}   ·   configured: ${e.configured.join(', ') || '(none)'}`);
+  }
+  if (e.digest) {
+    // The bare /digest report. The off/collapse replies do not carry this
+    // key — they are ok-and-done, their announcement is the session_state
+    // broadcast — so this never doubles what the button's silent click sees.
+    S.digest = e.digest;
+    syncDigestPos();
+    showDigest();
+    return notice(`📄 digest ${e.digest.on ? 'on' : 'off'} — `
+      + `${e.digest.set_by === 'you' ? 'your choice, survives restarts' : 'following config'}`
+      + (e.digest.expandable ? `, ${num(e.digest.expandable)} collapsed turn(s) to expand` : ''));
+  }
+  if (e.expanded && !e.expanded.turns.length) {
+    // The no-op half of /digest expand. A real expansion announces itself with
+    // its digest_expanded broadcast, so this only sees the empty one — the
+    // button's on-collapse click is silent and gets no line of its own.
+    return notice('📄 nothing to expand — no collapsed turn in the window');
   }
 }
 
@@ -2052,6 +2104,65 @@ function showReasonMode() {
           + ` — click to cycle (/reasoning off|collapsed|expanded)`;
 }
 
+/* The 📄 button is a three-position wheel in the think button's style —
+   off → collapse → expand → off — where the position is the wheel's own:
+   each click advances it and sends the command the new position names,
+   collapse turns the digest on, expand undoes the last collapse, off
+   turns it off. Both on positions light the lamp. The server state
+   (S.digest) still owns the lamp and the collapsed-turn count, and it
+   pulls the wheel back when it contradicts the wheel — a tab that sees the
+   session go off from elsewhere snaps to off — but between those the wheel
+   is this tab's, as the think button's mode is. A reattach learns the
+   position from the /info it fetches; expanding more than one turn is
+   going around the wheel again, or a typed /digest expand. */
+const DIGEST_MODES = ['off', 'collapse', 'expand'];
+
+function syncDigestPos() {
+  // The wheel snaps only on an on/off contradiction: collapse and expand
+  // both mean on, so the server cannot tell the two apart, and off is the
+  // only state it can see the wheel getting wrong.
+  if (!S.digest || S.digest.on === null) return;
+  if (S.digest.on) {
+    if (S.digestPos === null || S.digestPos === 'off') S.digestPos = 'collapse';
+  } else if (S.digestPos !== 'off') {
+    S.digestPos = 'off';
+  }
+}
+
+function showDigest() {
+  const b = $('#btn-digest');
+  const pos = S.digestPos;
+  if (pos === null) { b.classList.remove('on'); b.textContent = '📄 digest'; return; }
+  b.classList.toggle('on', pos !== 'off');
+  b.textContent = '📄 digest ' + pos;
+  const by = S.digest.set_by === 'you' ? 'your choice, survives restarts' : 'following config';
+  b.title = `digest: ${pos === 'off' ? 'off' : 'on'} (${by})`
+          + ` · ${num(S.digest.expandable)} collapsed turn(s)`
+          + ` — click to cycle (/digest off | collapse | expand [all])`;
+}
+
+function clickDigest() {
+  const pos = S.digestPos;
+  if (pos === null) return;   // /info not landed
+  S.digestPos = DIGEST_MODES[(DIGEST_MODES.indexOf(pos) + 1) % DIGEST_MODES.length];
+  // Silent rpc of the command the new position names: the session_state
+  // broadcast that follows is the notification for every attached tab, the
+  // resync in it the correction, and the repaint for this one.
+  rpc('digest', S.digestPos, true).catch(() => {});
+  showDigest();
+}
+
+/* /info carries the digest state (attach, and the re-fetch a config reload
+   makes, which can move the value when this session has no override of its
+   own). Both call sites feed it in through here. */
+function applyDigestInfo(info) {
+  if (info && info.digest) {
+    S.digest = info.digest;
+    syncDigestPos();
+    showDigest();
+  }
+}
+
 /* ------------------------------------------------------------------- wiring */
 
 $('#send').onclick = submit;
@@ -2059,6 +2170,7 @@ $('#nav-up').onclick = () => goPrompt(-1);
 $('#nav-down').onclick = () => goPrompt(1);
 $('#stop').onclick = () => send({ t: 'stop' });
 $('#btn-reasoning').onclick = () => cycleReasoning();
+$('#btn-digest').onclick = () => clickDigest();
 $('#btn-info').onclick = () => rpc('info').catch(() => {});
 $('#btn-behavior').onclick = () => rpc('behavior').catch(() => {});
 
