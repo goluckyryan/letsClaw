@@ -20,6 +20,7 @@ import copy
 import itertools
 import json
 import logging
+import openai
 import re
 import secrets
 import time
@@ -131,6 +132,13 @@ CONV_SCALARS = (
             # Turning this off mid-session leaves the open segment where it is:
             # it closes at the next rollover, holding what was recorded before.
             note="the append-only record of what this session generates"),
+    _Scalar("turn_retries", "turn_retries", 5, _as_int,
+            # How many times a turn may re-run after a model-server error (a
+            # 400/429/500, a timeout, a dropped connection). 0 = never: the
+            # pre-retry behaviour, where the turn ends and the question is
+            # re-asked by hand. Each retry repairs the history first, so the
+            # failure cannot poison the re-run — see the retry branch in _turn.
+            note="re-runs of a turn after a model server error; 0 = never"),
 )
 
 # digest_turns is deliberately absent, and has to be: it is resolved per session
@@ -1507,6 +1515,11 @@ class Session:
         # start; read only when a round is interrupted.
         emitted = []
         reason_emitted = []
+        # /steering's already moved into the history. Kept here because a
+        # model-server retry unwinds the turn and would take them with it: a
+        # correction is the user's word and must ride on every re-run, so this
+        # is not cleared.
+        steering_drained = []
         # The live thinking-token figure the clients count up with. Produced here
         # rather than in the browser so it is the same tiktoken count the ⚡ line
         # ends the turn on — a chars/4 guess lands 10-20% away on Qwen, and two
@@ -1866,6 +1879,7 @@ class Session:
             """
             queued, self._steering = self._steering, []
             for text in queued:
+                steering_drained.append(text)
                 at = now_stamp()
                 self.history.append({"role": "user", "content": text, "at": at,
                                      **self.mark()})
@@ -1890,100 +1904,144 @@ class Session:
                                      "at": now_stamp(), **self.mark()})
                 await self.jot(f"turn {self.turn_id} partial (steering)", partial)
 
-        try:
-            # Unbounded in rounds, walled by room — the same rule as _think_pad,
-            # for the same reason: a count is not a limit the machine has. This
-            # loop used to stop at tools.max_iterations, which knew nothing
-            # about the window it was filling and so was either in the way of
-            # honest work or (set high) not a limit at all. What actually runs
-            # out is context: every round re-sends a history one tool result
-            # longer, nothing mid-turn can roll over, and with context shift off
-            # the overflow is a 400 that discards the whole turn.
-            while True:
-                # _pad_headroom and not a wall of its own, on purpose: it is
-                # already "what is free once the answer is paid for", which is
-                # exactly what a tool round has to fit inside, and a third name
-                # for one number is how the gate and the wall drifted apart
-                # before (see docs/reasoning.md, invariant 1).
-                if self._pad_headroom() < self._min_tool_round_room():
-                    self.emit(ev("notice", level="warn",
-                                 text="no room left for another tool round — "
-                                      "asking for a final answer"))
-                    result = await call_round()
-                    if was_cut_off(result):
-                        # No room for another tool round, so this conclusion
-                        # must be words.
-                        result = await self._think_pad(call_round, turn_t0,
-                                                       result.reasoning,
-                                                       allow_tools=False)
-                    full_response = result.text
-                    break
-                # A /steering that landed while the previous tool ran (or before any
-                # round) is drained here, before the model is asked again — the
-                # same boundary a mid-stream one reaches, without interrupting
-                # a round that is already between tools.
-                await drain_steering()
-                try:
-                    result = await call_round(tools=self.schemas)
-                except RoundInterrupted:
-                    # A /steering landed mid-round: keep what the model already said
-                    # (it is on the client's screen), hand it the correction,
-                    # and let the next round re-plan. Nothing is lost — the
-                    # partial answer and the interjection both reach history.
-                    await record_partial()
+        attempt = 0
+        while True:
+            try:
+                # Unbounded in rounds, walled by room — the same rule as _think_pad,
+                # for the same reason: a count is not a limit the machine has. This
+                # loop used to stop at tools.max_iterations, which knew nothing
+                # about the window it was filling and so was either in the way of
+                # honest work or (set high) not a limit at all. What actually runs
+                # out is context: every round re-sends a history one tool result
+                # longer, nothing mid-turn can roll over, and with context shift off
+                # the overflow is a 400 that discards the whole turn.
+                while True:
+                    # _pad_headroom and not a wall of its own, on purpose: it is
+                    # already "what is free once the answer is paid for", which is
+                    # exactly what a tool round has to fit inside, and a third name
+                    # for one number is how the gate and the wall drifted apart
+                    # before (see docs/reasoning.md, invariant 1).
+                    if self._pad_headroom() < self._min_tool_round_room():
+                        self.emit(ev("notice", level="warn",
+                                     text="no room left for another tool round — "
+                                          "asking for a final answer"))
+                        result = await call_round()
+                        if was_cut_off(result):
+                            # No room for another tool round, so this conclusion
+                            # must be words.
+                            result = await self._think_pad(call_round, turn_t0,
+                                                           result.reasoning,
+                                                           allow_tools=False)
+                        full_response = result.text
+                        break
+                    # A /steering that landed while the previous tool ran (or before any
+                    # round) is drained here, before the model is asked again — the
+                    # same boundary a mid-stream one reaches, without interrupting
+                    # a round that is already between tools.
                     await drain_steering()
-                    continue
-                if not result.wants_tool:
-                    # A cut-off round is resumed rather than lost — see
-                    # _think_pad. Its conclusion may be an answer or, if the
-                    # thinking decided the ending is an action, a tool call;
-                    # the latter rejoins this loop with the result in hand.
-                    if was_cut_off(result):
-                        result = await self._think_pad(call_round, turn_t0,
-                                                       result.reasoning)
-                        if result.wants_tool:
-                            await run_tools(result)
-                            continue
-                    if self._steering:
-                        # The answer is complete, but a /steering arrived as it was
-                        # finishing — or during the pad resume above, which is
-                        # not interruptible. Record the answer, hand over the
-                        # correction, and let the next round answer it: a /steering
-                        # is never dropped just for arriving a moment late.
-                        if result.text:
-                            self.history.append(
-                                {"role": "assistant", "content": result.text,
-                                 "at": now_stamp(), **self.mark()})
+                    try:
+                        result = await call_round(tools=self.schemas)
+                    except RoundInterrupted:
+                        # A /steering landed mid-round: keep what the model already said
+                        # (it is on the client's screen), hand it the correction,
+                        # and let the next round re-plan. Nothing is lost — the
+                        # partial answer and the interjection both reach history.
+                        await record_partial()
                         await drain_steering()
                         continue
-                    full_response = result.text
-                    break
+                    if not result.wants_tool:
+                        # A cut-off round is resumed rather than lost — see
+                        # _think_pad. Its conclusion may be an answer or, if the
+                        # thinking decided the ending is an action, a tool call;
+                        # the latter rejoins this loop with the result in hand.
+                        if was_cut_off(result):
+                            result = await self._think_pad(call_round, turn_t0,
+                                                           result.reasoning)
+                            if result.wants_tool:
+                                await run_tools(result)
+                                continue
+                        if self._steering:
+                            # The answer is complete, but a /steering arrived as it was
+                            # finishing — or during the pad resume above, which is
+                            # not interruptible. Record the answer, hand over the
+                            # correction, and let the next round answer it: a /steering
+                            # is never dropped just for arriving a moment late.
+                            if result.text:
+                                self.history.append(
+                                    {"role": "assistant", "content": result.text,
+                                     "at": now_stamp(), **self.mark()})
+                            await drain_steering()
+                            continue
+                        full_response = result.text
+                        break
 
-                await run_tools(result)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            had_error = True
-            self.emit(ev("error", msg=f"{type(e).__name__}: {e}", fatal=False))
-            if tools_used == 0:
-                try:
-                    full_response = await self.engine.chat(api_messages(self.history))
-                    self.emit(ev("text", delta=full_response, at=now_stamp()))
-                    # The one answer that never goes through call_round.
-                    await self.jot(f"turn {self.turn_id} fallback text", full_response)
-                    had_error = False
-                except Exception as e2:
-                    self.emit(ev("error", msg=f"{type(e2).__name__}: {e2}", fatal=False))
-                    # repair_history(), not history.pop(): the comment this
-                    # replaces asserted the last entry is the user message, and
-                    # it need not be. A /steering that arrived while the first
-                    # attempt was in flight has already been appended, so the
-                    # pop took the steering line and left the unanswered user
-                    # message behind — the one shape settled() exists to
-                    # prevent, and the one the server 400s on. settled() unwinds
-                    # the whole unfinished turn instead of guessing its length.
+                    await run_tools(result)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if isinstance(e, openai.APIError) and attempt < self.turn_retries:
+                    # A model-server error — a 400/429/500, a timeout, a dropped
+                    # connection — is not a bug in the turn: what is in history is
+                    # still sound and the question is still the question, so unwind
+                    # whatever the failed round left half-written and run the turn
+                    # again. Its first round re-sends the same history the model
+                    # already saw, so this resumes the work rather than re-asking
+                    # the question. Non-API errors are not retried: a KeyError is
+                    # the same failure on every attempt.
+                    attempt += 1
+                    # The client has already seen the dead round's output and the
+                    # journal is the only durable copy of it. record_partial never
+                    # ran — the round died instead of being interrupted — so keep
+                    # what was emitted before the unwind takes it.
+                    if reason_emitted:
+                        await self.jot(f"turn {self.turn_id} interrupted reasoning",
+                                       "".join(reason_emitted))
+                    partial = "".join(emitted)
+                    if partial.strip():
+                        await self.jot(f"turn {self.turn_id} partial (retry)",
+                                       partial)
                     self.repair_history()
-                    return
+                    # settled() unwinds the whole unfinished turn — the question
+                    # included, that is what makes it unfinished — so hand the
+                    # same dict back: _digest_turn finds this turn's start by
+                    # identity, and the retried rounds must see the question.
+                    if self.history[-1] is not user_msg:
+                        self.history.append(user_msg)
+                    for text in steering_drained:
+                        # Unwound as well, being user messages: a retry may not
+                        # silently discard a correction, so it rides on the
+                        # re-run. Re-appended without a new steering event (the
+                        # clients already saw it) and without a new journal
+                        # block, which the drain already wrote.
+                        self.history.append({"role": "user", "content": text,
+                                             "at": now_stamp(), **self.mark()})
+                    self.emit(ev("notice", level="warn",
+                                 text=f"model server error ({type(e).__name__}) — "
+                                      f"retrying the turn ({attempt}/{self.turn_retries})"))
+                    continue
+                had_error = True
+                self.emit(ev("error", msg=f"{type(e).__name__}: {e}", fatal=False))
+                if tools_used == 0:
+                    try:
+                        full_response = await self.engine.chat(api_messages(self.history))
+                        self.emit(ev("text", delta=full_response, at=now_stamp()))
+                        # The one answer that never goes through call_round.
+                        await self.jot(f"turn {self.turn_id} fallback text", full_response)
+                        had_error = False
+                    except Exception as e2:
+                        self.emit(ev("error", msg=f"{type(e2).__name__}: {e2}", fatal=False))
+                        # repair_history(), not history.pop(): the comment this
+                        # replaces asserted the last entry is the user message, and
+                        # it need not be. A /steering that arrived while the first
+                        # attempt was in flight has already been appended, so the
+                        # pop took the steering line and left the unanswered user
+                        # message behind — the one shape settled() exists to
+                        # prevent, and the one the server 400s on. settled() unwinds
+                        # the whole unfinished turn instead of guessing its length.
+                        self.repair_history()
+                        return
+                break
+            break
 
         # The closing round is the one round a /steering cannot interrupt and has no
         # next round to answer it: clear whatever is left rather than let it

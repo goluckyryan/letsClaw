@@ -311,6 +311,13 @@ conversation:
   digest_turns: false
   live_dir: "state/live"        # live conversations; reloaded when the core restarts
   prompt_timeout: 60            # seconds to wait for a rollover answer before keeping the session
+  # How many times a turn may re-run after a model-server error (a 400/429/500,
+  # a timeout, a dropped connection) instead of ending it. The failed round's
+  # half-written tail is unwound first, so the error cannot poison the re-run,
+  # and the retry's first round re-sends the history the model already saw —
+  # it resumes the work, it does not re-ask the question. `0` is the old
+  # behaviour: the turn ends and you re-ask by hand.
+  turn_retries: 5
 
 # Memory settings
 memory:
