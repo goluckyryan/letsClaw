@@ -97,10 +97,10 @@ What the ten cost:
 | `show_image` | 132 tok | 23 |
 | `search_and_inspect` | 262 tok | 22 |
 | `inspect_file` | 183 tok | 23 |
-| `inspect_symbol` | 169 tok | 23 |
+| `inspect_symbol` | 191 tok | 23 |
 | `edit_file` | 190 tok | 23 |
 | `run_and_capture` | 156 tok | 23 |
-| sum of the JSON | 1,530 tok | what letsClaw counts |
+| sum of the JSON | 1,552 tok | what letsClaw counts |
 | **what the server charges** | **not re-measured** | was 715 at 462 local, five tools |
 
 **`reason` is the other one worth watching.** Every tool carries it

@@ -596,7 +596,8 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
                                        replace_all)
 
     def _inspect_symbol(symbol: str, root: str = ".",
-                        file_pattern: str | None = None, max_refs: int = 25) -> str:
+                        file_pattern: str | None = None, max_refs: int = 25,
+                        case_sensitive: bool = True) -> str:
         symbol = str(symbol).strip()
         if not symbol:
             return "error: symbol is empty"
@@ -610,10 +611,16 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
         files, files_stopped = _collect_files(root_p)
         candidates = [f for f in files
                       if not file_pattern or fnmatch.fnmatch(f.name, file_pattern)]
+        # A symbol is a spelling: FooBar is not foobar, and conflating the two
+        # would list a different name's definition and references under the
+        # one asked for. case_sensitive=false is the opt-out for a name the
+        # caller is not sure how to spell.
+        flags = 0 if case_sensitive else re.IGNORECASE
         def_rx = re.compile(
             r"^\s*(?:(?:async\s+)?def\s+|class\s+|function\s+"
-            r"|(?:const|let|var|fn|func|type)\s+)" + re.escape(symbol) + r"\b")
-        ref_rx = re.compile(r"\b" + re.escape(symbol) + r"\b")
+            r"|(?:const|let|var|fn|func|type)\s+)" + re.escape(symbol) + r"\b",
+            flags)
+        ref_rx = re.compile(r"\b" + re.escape(symbol) + r"\b", flags)
         defs: list[str] = []
         refs: list[str] = []
         for f in candidates:
@@ -642,9 +649,10 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
         return "\n".join(out)
 
     async def inspect_symbol(symbol: str, root: str = ".",
-                             file_pattern: str | None = None, max_refs: int = 25) -> str:
+                             file_pattern: str | None = None, max_refs: int = 25,
+                             case_sensitive: bool = True) -> str:
         return await asyncio.to_thread(_inspect_symbol, symbol, root,
-                                       file_pattern, max_refs)
+                                       file_pattern, max_refs, case_sensitive)
 
     async def run_and_capture(command: str, workdir: str | None = None,
                               timeout: int | None = None) -> str:
@@ -774,7 +782,9 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
                  "file_pattern": {"type": "string",
                                   "description": "File-name glob to restrict the search"},
                  "max_refs": {"type": "integer",
-                              "description": "Maximum references listed (default: 25)"}},
+                              "description": "Maximum references listed (default: 25)"},
+                 "case_sensitive": {"type": "boolean",
+                                    "description": "Exact case (default: true)"}},
              "required": ["symbol"]},
             inspect_symbol, max_out,
         ),
