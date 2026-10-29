@@ -22,4 +22,4 @@ are writing a commit and have not touched the line below, the commit is not
 finished.
 """
 
-__version__ = "1.0.33"
+__version__ = "1.0.34"

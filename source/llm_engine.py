@@ -46,9 +46,10 @@ THINK_CLOSE = "\n</think>\n\n"
 class InlineThinkSplitter:
     """Separate an inline thinking block from the answer that follows it.
 
-    Reasoning is supposed to arrive in `reasoning_content`, apart from the
-    answer, so that letsClaw can keep it out of history: the whole notepad
-    design rests on thinking being free because it never joins the
+    Reasoning is supposed to arrive in `reasoning_content` — or in
+    `reasoning`, the spelling newer vLLM builds give the same field — apart
+    from the answer, so that letsClaw can keep it out of history: the whole
+    notepad design rests on thinking being free because it never joins the
     conversation. Two llama.cpp settings break that — `--reasoning-format
     none` sends the trace in `message.content`, and `deepseek-legacy` sends it
     in both — and on that path an unseparated blob is appended to history as
@@ -479,7 +480,8 @@ class LLMEngine:
         Three of letsClaw's load-bearing assumptions are the server's to keep,
         and none of them were checked:
 
-        - **reasoning lands in `reasoning_content`.** Under llama.cpp's
+        - **reasoning lands in `reasoning_content` (or `reasoning`, the
+          newer vLLM builds' spelling of the same field).** Under llama.cpp's
           `--reasoning-format none` it lands in `message.content` instead, and
           `chat_with_tools` does no <think> stripping on that path — so the
           whole trace streams as answer text and is appended to history. The
@@ -540,7 +542,8 @@ class LLMEngine:
                     **params)
                 msg = r.choices[0].message
                 content = msg.content or ""
-                thinking = getattr(msg, "reasoning_content", None) or ""
+                thinking = (getattr(msg, "reasoning_content", None)
+                            or getattr(msg, "reasoning", None) or "")
                 inline = THINK_OPEN.strip() in content
                 caps["reasoning_channel"] = (
                     "both" if thinking and inline else
@@ -710,7 +713,8 @@ class LLMEngine:
                 usage = getattr(response, "usage", None)
                 self.note_schema_cost(messages, params.get("tools"),
                                       getattr(usage, "prompt_tokens", None))
-                reasoning = getattr(msg, "reasoning_content", None) or ""
+                reasoning = (getattr(msg, "reasoning_content", None)
+                             or getattr(msg, "reasoning", None) or "")
                 # Defensive: a server configured to inline its thinking sends
                 # the whole trace here, and letsClaw would append it to history
                 # as the answer. No-op when the content has no opening tag, and
@@ -759,7 +763,8 @@ class LLMEngine:
                     delta = choice.delta
                     if choice.finish_reason:
                         finish = choice.finish_reason
-                    rchunk = getattr(delta, "reasoning_content", None)
+                    rchunk = (getattr(delta, "reasoning_content", None)
+                              or getattr(delta, "reasoning", None))
                     if rchunk:
                         reason_parts.append(rchunk)
                         if on_reasoning:
