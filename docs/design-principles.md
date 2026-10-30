@@ -361,8 +361,9 @@ question and a refusal can end with a period. So the loop cannot catch it, the
 reasoning machinery cannot catch it, and no config key can. **The only lever is
 the prompt** — which makes this the clearest case of [principle
 2](#2-behavior-is-markdown-and-some-of-that-markdown-is-machinery): the rule is
-`## How you work` in `models/base.md`, tunable with `/reload`, and if it is
-weakened there is no backstop behind it.
+item 2 of `# OPERATIONAL PROTOCOLS (HOW YOU WORK)` in `models/base.md`
+("Autonomous Decision-Making"), tunable with `/reload`, and if it is weakened
+there is no backstop behind it.
 
 What `base.md` therefore commits to, in this order:
 
@@ -382,7 +383,7 @@ same model one rollover later.
 
 **The honest limit.** This principle governs the model's *choices*; it does not
 govern the room available to make them. The loop stops on `_pad_headroom()
-< MIN_TOOL_ROUND_ROOM` and asks for words, and by
+< _min_tool_round_room()` (4,400 at the shipped tool clip) and asks for words, and by
 [principle 20](#20-rollover-belongs-to-the-turn-not-the-round) nothing mid-turn
 can roll over. An unfinished task at that wall is cut off, and the fresh window
 starts on the *next* turn rather than resuming this one. `digest_turns` is the

@@ -24,10 +24,10 @@ Routes registered in `build_app()`.
 | `DELETE /sessions/{name}` | yes | 404 if no such session, 409 if a turn is running |
 | `POST /sessions/{name}/rename` | yes | body `{"to": "..."}`. 400 malformed / bad name, 404 missing, 409 busy or taken |
 | `POST /reload` | yes | re-reads `config.yaml` in place; **400 and no change** if it will not load |
-| `GET /config` | yes | `{path, config}` — the live config dict, for the WebUI Settings panel. Authenticated because `core.token` and `discord.token` are in it |
+| `GET /config` | yes | `{path, config}` — the live config dict, for the WebUI Settings panel. `core.token`, `discord.token` and every `models.*.api_key` come back replaced by `********` — redacted rather than dropped, so the panel can still tell "set" from "unset", and there is nothing here to reveal. Authentication is not what protects the secrets (`_redacted` does that, because a secret in a response body is in devtools, in a HAR export and on screen during a screen-share); it protects the *shape* of the install — which model servers, which paths, which ssh forwards, which hosts are allowed |
 | `POST /config` | yes | body `{"webui": {...}}` — rewrites **only the `webui:` block** of `config.yaml` (comments and every other byte untouched; the block is appended if missing), then applies it via the ordinary reload. 400 malformed or unserialisable |
 | `GET /files` | yes | `{ok, dir, total, truncated, can_delete, files[]}` — what is in `webui.files_dir`, newest first, capped at 500. Each entry is `{name, size, mtime, type}`. Top level only: the read route below serves a nested path, but no answer can reference one |
-| `GET /files/{name}` | yes | one image from `webui.files_dir`. Confined to that directory (a traversal or a symlink out of it is 404) and restricted to an image extension. **The one route that also takes the token by `?token=`**, because an `<img>` cannot send a header |
+| `GET /files/{name}` | yes | one image from `webui.files_dir`. Confined to that directory (a traversal or a symlink out of it is 404) and restricted to an image extension. **The one route that must also accept the token by `?token=`**, because its caller is an `<img>` loader and an `<img>` cannot send a header — every authenticated route takes a query token (`_authorised()` reads both), this is just the one whose caller has no choice |
 | `DELETE /files/{name}` | yes + same-origin | unlink one image. Same guards as the read; **403** when `webui.files_delete` is false, 404 for anything the read route would also refuse, 500 with the message if the unlink fails |
 | `GET /ws` | yes | the stream (below) |
 | `GET /` , `GET /static/*` | **no** | the WebUI from `web/` — registered only if `web/index.html` exists |
@@ -36,6 +36,17 @@ Routes registered in `build_app()`.
 **Auth** (`_authorised()`): the token is `core.token`; empty
 means everything is open. Accepts `Authorization: Bearer <tok>` **or**
 `?token=<tok>`. Rejection is a 401.
+
+The **Auth** column above says `yes` for the token and understates the writes.
+Every route that changes state — `DELETE /sessions/{name}`, `POST
+/sessions/{name}/rename`, `POST /reload`, `POST /config`, `DELETE /files/{name}`
+— **and `GET /ws`** call `_guard`, which additionally rejects a cross-origin
+`Origin`; the read-only GETs call `_read_guard`, which checks the token only.
+The WebSocket is the one worth the words: a socket is exempt from the browser's
+same-origin policy by nature, which is exactly why the core checks its `Origin`
+by hand. A fourth client that sends an `Origin` header from another port gets a
+403 that the token alone will not explain — omit the header (as `curl` and a
+native client do) or come from the same origin.
 
 `/` is unauthenticated on purpose — the page holds no secrets and is the thing
 that *asks* for the token.
@@ -100,14 +111,20 @@ during a long turn.
 `/` stripped. Three groups, not two, and the third is the one that was being
 filed under the first:
 
-- **read-only**, reply to the asker: `info`, `behavior`, `models`
+- **read-only**, reply to the asker: `info`, `behavior`, and the bare forms of
+  `model` (the listing) and `digest` (the state) — answered above the busy
+  guard, because the moment you want to know is while a turn is running.
+  (`models` used to be a command of its own returning the first of those; it
+  was a second spelling of bare `/model` and is gone.)
 - **manager-level**, above the busy guard and outside the turn lock: `reload`,
   `restart`. They act on the whole core rather than one session, and taking the
   turn lock here would deadlock — `reload` defers busy sessions, including the
   one that asked. Each does its own refusing instead: `reload` defers, `restart`
   reports every busy session by name and takes `force` to override
-- **turn-lock-taking**: `clear`, `rollover`, `new`, `model` — these return
-  `{"ok": false, "error": "a turn is running…"}` when busy
+- **turn-lock-taking**: `clear`, `rollover`, `new`, `model`, `digest` — these
+  return `{"ok": false, "error": "a turn is running…"}` when busy. The last
+  two are the pair that splits across the guard: their bare form reports and
+  sits in the read-only group above, their argument form mutates and sits here.
 
 `restart` has to sit above the busy guard for a second reason of its own: the
 whole content of its refusal is *which* sessions are busy, and below the guard a
@@ -121,7 +138,7 @@ Every event carries `seq` and `session`, stamped by `Session.emit`
 
 | `t` | payload | |
 |---|---|---|
-| `hello` | `session, seq, proto, version, model, budget, busy, theme, messages, rollover{}, missed[], gap` | the snapshot; `version` is the core's release, which the WebUI shows beside its status pill — a cached page cannot report the build it is talking to from a constant of its own; `theme` is `webui.theme` (`auto`/`dark`/`light`); `messages` excludes the system message, `gap` is true when the replay buffer could not cover `last_seq` |
+| `hello` | `session, seq, proto, version, model, budget, busy, theme, pin, messages, rollover{}, missed[], gap` | the snapshot; `version` is the core's release, which the WebUI shows beside its status pill — a cached page cannot report the build it is talking to from a constant of its own; `theme` is `webui.theme` (`auto`/`dark`/`light`) and `pin` is `webui.pin`, the text of the pinned prompt — the WebUI styles its pinned band from `pin` and reads it off this greeting because `/theme.css` is cached and this is the fresh copy; `messages` excludes the system message, `gap` is true when the replay buffer could not cover `last_seq` |
 | `turn_start` | `turn_id, text, origin` | the core's echo of your own message |
 | `steering` | `turn_id, text` | a `/steering` interjection was taken: the round was interrupted (or the correction queued at a round boundary) and the model re-plans with it. It is a real user message, so a fresh attach sees it in `hello.messages` instead |
 | `text` | `delta` | |
@@ -135,7 +152,7 @@ Every event carries `seq` and `session`, stamped by `Session.emit`
 | `digest_done` | `turn_id, tokens, digest_text` | `conversation.digest_turns` collapsed the turn that just ended, and this is the digest that replaced it — the summary itself, as `rollover_done` carries `handoff_text`, and for the same reason: it is what the model is shown from here on, so a reader who cannot see it finds out about a lossy one only when the model acts on the gap. Emitted **inside** the turn, so it arrives *before* that turn's `turn_end`; a client that buffers its output until `turn_end` has to hold it back or it prints the summary above the answer it summarises (`DiscordBridge._post_digest()`). The digest's own last line is the `grep` that reaches the journal block it stands in for, so the full working-out is one command away |
 | `error` | `msg`, `fatal` | |
 | `busy` | `reason` | |
-| `session_state` | `what` ∈ `reloaded`/`cleared`/`wiped`/`model`/`renamed`/`deleted` | `reloaded` also carries `theme` (the new `webui.theme`); `wiped` and `deleted` also carry `files` + `bytes`: the archives that went with the conversation |
+| `session_state` | `what` ∈ `reloaded`/`cleared`/`wiped`/`model`/`renamed`/`deleted`/`digest`/`digest_expanded` | `reloaded` also carries `theme` (the new `webui.theme`); `wiped` and `deleted` also carry `files` + `bytes`: the archives that went with the conversation; `digest` and `digest_expanded` both carry the digest state as `_digest_state()` shapes it — `on`, `set_by` (`you`/`config`), `expandable` — with `digest_expanded` adding `turns`/`messages`/`skipped` for what the undo restored. These two are what the WebUI's 📄 button paints from |
 | `rollover_start` / `rollover_ask` / `rollover_done` | | `rollover_ask` is the **only** server→client request. There is no `rollover_failed`: a rollover that could not archive its window says so as an `error` notice carrying the reason, and the conversation is kept. The event existed, carried `reason/error/used/budget`, and no client ever read it — it was removed rather than given a consumer, because the one affordance it could have driven is `/rollover`, which the notice already names |
 | `response` | `request_id` + the command's reply | unicast, not broadcast |
 | `pong` | — | |

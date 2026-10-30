@@ -18,17 +18,20 @@ Each file runs its own cases and reports, and
 token except `test_discord_live.py`, which starts a real core on a temp config
 (still no Discord).
 
-A selection, not the whole directory — there are around 45 files:
+A selection, not the whole directory — `ls tests/test_*.py` is the list, and
+it grows:
 
 | file | covers |
 |---|---|
-| `run_all.py` | the runner: every file above, with the environment-gated ones skipped and named |
+| `run_all.py` | the runner: every `test_*.py` in this directory, with the environment-gated ones skipped and named |
 | `test_answer_reserve.py` | the answer reserve, swept across every configured model — the gate's verdict must match the wall's at every point |
-| `test_chunk.py` | the fence-aware chunker, incl. CJK and the real 2000 boundary |
+| `test_chunk.py` | the fence-aware chunker — long lines, CJK, italics, and the real 2000 boundary |
 | `test_clear_new.py` | `/clear` vs `/new` — what each destroys |
 | `test_discord.py` | gate, routing, rendering, all on fakes |
 | `test_discord_live.py` | a real core over the real protocol |
+| `test_doc_claims.py` | **what `clients.md` says the WebUI does**, checked against the code — the behaviour sentences a link check cannot see |
 | `test_doc_pointers.py` | **these docs against the source** — every function, class and constant named in them must still exist, and raw file:line pointers are budgeted at zero |
+| `test_files.py` | all three `/files` routes — confinement, the extension gate, auth, and that the listing agrees with the read route about what is servable — with no core and no browser at all |
 | `test_inline_think.py` | `InlineThinkSplitter`, at every chunk boundary |
 | `test_journal.py` | the journal |
 | `test_server_caps.py` | the server probe — reasoning channel, window, usage |
@@ -37,6 +40,8 @@ A selection, not the whole directory — there are around 45 files:
 | `test_think_pad.py` | the notepad loop |
 | `test_tool_markup.py` | raw-transport tool-call recovery |
 | `test_turn_digest.py` | the per-turn digest, and every path that refuses it |
+| `test_show_image.py` | the one tool that moves a file onto the served side — hermetic, and it runs every name the tool invents through the renderer's own pattern |
+| `test_command_surface.py` | **every command listing against `Session.command()`** rather than against each other — see [Add a command](#add-a-command) |
 
 > ⚠️ **`tests/` is in `.gitignore`.** A fresh clone has no test suite. If you
 > are picking this up from a clone and `tests/` is missing, that is why — ask
@@ -45,6 +50,59 @@ A selection, not the whole directory — there are around 45 files:
 There is no CI. Run the affected files by hand before committing — and
 `test_doc_pointers.py` after touching anything in `docs/`, since it is the
 only test that fails because of a *rename* rather than a behaviour change.
+
+### Tiers, and what each one is allowed to need
+
+`run_all.py` runs two tiers. The fast tier on its own is **hermetic** — no
+network, no ssh, no browser, no spawned core — which is what makes it safe to
+run at all on a machine that may be serving a real conversation. `--full` adds
+the suites the runner names in its `SLOW` set, because they need something from
+outside the process:
+
+| suite | what it needs |
+|---|---|
+| `test_ssh_forward.py` | ssh to localhost |
+| `test_discord_live.py` | spawns a real core on a temp config — handshake, token, `?model=`, `origin`, reconnect-by-seq, everything but Discord itself. No bot token, no network |
+| `test_phase4_server.py` | spawns a real core |
+| `test_steering.py` | Chrome (CDP) **and** a reachable model — it injects a correction into a turn that is actually running |
+| `test_settings.py`, `test_media.py` | Chrome (CDP) |
+| `test_browser.py`, `test_math_render.py` | Chrome (CDP) **and** `CORE=` |
+| `test_image.py` | Chrome (CDP) **and** `CORE=` **and** `FILES_DIR=` |
+
+The last three are a class of their own and the runner skips them **even under
+`--full`** unless `CORE=` is set: they create and delete sessions on whatever
+core that names, and they will not default to your real one. `test_image.py`
+also writes its own image fixture, and only the operator knows where the core
+`CORE=` names serves `/files` from — so it waits for `FILES_DIR=` rather than
+failing on a missing file with a message about `naturalSize`.
+
+A fourth gate lives inside several suites rather than in the runner:
+`test_prompt_nav.py`, `test_reattach.py`, `test_phase4_webui.py` and
+`test_ssh_forward.py` mark their browser- or server-backed cases `test_live*`
+and skip them unless `LIVE_TESTS=1`. Those run under
+`tests/run_full_scratch.py`, which brings up a scratch core and a scratch
+`files_dir` and sets all three variables together.
+
+Two suites are run by hand, not by the runner: `node tests/test_md.mjs`
+(the markdown renderer, headless) and `node tests/test_math.mjs` (the same
+against the real vendored KaTeX). The runner's glob is `test_*.py`, so a `.mjs`
+file is invisible to it by design.
+
+`tests/shot.py <session> [out.png] [dark|light]` takes a screenshot; both themes
+follow `prefers-color-scheme`.
+
+
+### The three that police these pages
+
+`test_doc_pointers.py`, `test_doc_claims.py` and `test_command_surface.py` are in
+the table above, and they are the reason to run the suite after a *rename*: they
+fail because documentation moved, which is the only way doc rot becomes visible
+without a reader noticing it. `test_command_surface.py` is the pattern to copy
+when a listing has to stay true — it parses the `name == "…"` branches out of
+`Session.command` and checks every listing against *that*, not against a list of
+its own (see [Add a command](#add-a-command)).
+
+
 
 ---
 
@@ -107,7 +165,8 @@ drifted:
 | `web/app.js` | `COMMANDS`, and a toolbar handler if it gets a button |
 | `web/index.html` | that button |
 | `source/discord_client.py` | `COMMAND_WORDS` — **miss this one and `!cmd` is sent to the model as chat** — `HELP`, and `_register_commands` for the native slash picker |
-| `README.md` | the terminal command table, the Mermaid `Cmds` node, the Discord prose list |
+| `README.md` | the terminal command table, and the Discord prose list of what the bot accepts |
+| `docs/architecture.md` | the Mermaid `Cmds` node in the picture, and the prose beside it that excuses the non-core words |
 
 `tests/test_command_surface.py` now tells you if you miss one. It parses the
 `name == "…"` branches out of `Session.command` and checks every listing above
@@ -171,8 +230,7 @@ listing either. Nothing tells you if you miss one:
 |---|---|
 | `source/server.py` | `build_app`'s `add_routes` — register a path's methods **adjacently**, or aiohttp builds a second resource for the same pattern. It resolves either way, which is what makes this easy to leave wrong |
 | `source/server.py` | the module docstring's HTTP line |
-| `docs/protocol.md` | the route table — method, auth, and what it returns |
-| `README.md` | the route table, and the auth paragraph under it if the route is an exception to how the token travels |
+| `docs/protocol.md` | the route table — method, auth, and what it returns — and the auth paragraph under it if the route is an exception to how the token travels |
 | `docs/architecture.md` | the `_host_guard` paragraph, if it is a read route that exposes anything |
 | `tests/` | `test_files.py` is the model: an aiohttp test server, no core and no browser. Every refusal is a case, and a delete test asserts the **disk**, not just the status — a 404 from a handler that already unlinked passes a status-only check |
 

@@ -14,6 +14,11 @@ Two things here are less obvious than they look:
     the worker is parked in a blocking tty read that the executor then tries to
     join at shutdown. A daemon thread can simply be abandoned — hence the
     `os._exit` on the way out.
+*   Ctrl-C is caught on the loop (`install_ctrl_c`), not as an exception in the
+    reader thread: mid-turn it asks the core to stop the turn and the prompt
+    stays up, idle it leaves the way EOF does. A tty raises SIGINT to the whole
+    foreground group, so the thread parked in `input()` used to take it as a
+    KeyboardInterrupt and close the socket — abandoning a turn still running.
 *   All output goes through Renderer. Another client's tokens can land while you
     are half-way through typing, so anything printed outside a turn has to erase
     the input line and put your text back afterwards.
@@ -22,6 +27,7 @@ Two things here are less obvious than they look:
 import argparse
 import asyncio
 import os
+import signal
 import sys
 import threading
 import time
@@ -130,6 +136,11 @@ class Renderer:
     def __init__(self):
         self.show_reasoning = False
         self.in_turn = False
+        # A turn the core reported running at attach time. Not folded into
+        # in_turn: that flag also drives where the prompt gets redrawn, and
+        # line() has always treated an attach-mid-turn as an idle prompt.
+        # Ctrl-C needs to know about the turn; the renderer must not change.
+        self.busy = False
         self.opened = None      # None | "text" | "reasoning"
         self.ind = None
         self.thought = 0        # tokens thought this turn, from the core
@@ -232,6 +243,7 @@ class Renderer:
             self._stop_spinner()
             self._close_stream()
             self.in_turn = False
+            self.busy = False       # the turn the greeting reported is over too
         elif t == "rollover_start":
             self.line(f"\n🔄 Rolling over — {e['reason']}.")
         elif t == "rollover_done":
@@ -315,6 +327,10 @@ class Renderer:
         for missed in e.get("missed", []):
             self.handle(missed)
         if e.get("busy"):
+            # Not just a notice: Ctrl-C has to know a turn is running, and the
+            # turn_start that would have said so was emitted before this socket
+            # existed and is not replayed (this client sends no last_seq).
+            self.busy = True
             self.line("   ⏳ a turn is running in this session")
 
     def stats(self, e):
@@ -438,6 +454,38 @@ def start_reader(loop, queue):
                 return
             loop.call_soon_threadsafe(queue.put_nowait, line)
     threading.Thread(target=run, daemon=True, name="stdin").start()
+
+
+def install_ctrl_c(loop, queue, render):
+    """Make Ctrl-C stop the turn in flight instead of dropping the socket.
+
+    A tty raises SIGINT to the whole foreground group, so before this the
+    thread parked in `input()` took it as a KeyboardInterrupt: the reader
+    queued its EOF sentinel, the input loop broke, the socket closed — and the
+    turn went on running on the core, which outlives its clients. Nothing said
+    so, because closing the socket is what leaving looks like.
+
+    `add_signal_handler` is the fix rather than a `signal.signal` one: the
+    loop's wakeup fd absorbs the signal before Python raises, so the blocked
+    `input()` is simply restarted and a half-typed line survives (a
+    `signal.signal` handler reaches the parked thread too, and `continue` there
+    spins). Mid-turn this is exactly a typed `/stop`, through the same queue;
+    at an idle prompt it is the EOF sentinel, which is how you leave.
+
+    `busy` is the attach-mid-turn case: this client sends no last_seq, so the
+    turn_start that would set in_turn was emitted before the socket existed.
+
+    Returns the undo, or None where the platform has no signal fd — Windows
+    raises NotImplementedError, and Ctrl-C there keeps the old behaviour.
+    """
+    def on_ctrl_c():
+        queue.put_nowait("/stop" if (render.in_turn or render.busy) else None)
+
+    try:
+        loop.add_signal_handler(signal.SIGINT, on_ctrl_c)
+    except (NotImplementedError, OSError, ValueError):
+        return None
+    return lambda: loop.remove_signal_handler(signal.SIGINT)
 
 
 async def run_client(url, session_name, render, token=""):
@@ -575,6 +623,7 @@ async def run_client(url, session_name, render, token=""):
             render.line("⚠️  the core accepted the socket but sent no greeting")
         start_reader(loop, lines)
         render.prompt_shown = True
+        unarm_ctrl_c = install_ctrl_c(loop, lines, render)
 
         while True:
             line = await lines.get()
@@ -629,6 +678,14 @@ async def run_client(url, session_name, render, token=""):
             await ws.send_json({"t": "submit", "text": text})
 
         pumping.cancel()
+        # Hand Ctrl-C back now that nothing reads the queue: a handler left
+        # armed fires into a dead queue, and removing it outright would leave
+        # SIGINT at the OS default — a Ctrl-C in the moment before os._exit
+        # would then kill the process quietly instead of printing the goodbye.
+        # default_int_handler is what was in force before this client started.
+        if unarm_ctrl_c:
+            unarm_ctrl_c()
+            signal.signal(signal.SIGINT, signal.default_int_handler)
         await ws.close()
     return 0
 

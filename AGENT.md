@@ -1,9 +1,11 @@
 # AGENT.md — setup for an agent
 
 A short, imperative path from a fresh clone to a running, verified letsClaw core.
-The **README.md** is the deep reference (philosophy, the reasoning model, every
-config key); this file is the *do this, then check this* path and the traps.
-When you need the why, or a key not covered here, go to the README section named.
+The **[README](README.md)** is the front page — what it is, how to run it, what
+the commands do. The depth is in **[`docs/`](docs/README.md)**: the module map,
+the protocol, the per-client internals, the reasoning arithmetic. This file is
+the *do this, then check this* path and the traps. When you need the why, go to
+the `docs/` page named in [Pointers](#pointers-into-the-docs).
 
 ## What it is
 
@@ -58,7 +60,7 @@ exception as "no token" and skipping `discord.py` on a fresh install.
 
 ```bash
 curl -s http://127.0.0.1:8770/health
-# -> {"ok": true, "proto": <int>, "version": "1.0.0", "sessions": 0}
+# -> {"ok": true, "proto": <int>, "version": "<source/version.py>", "sessions": <int>, "restarting": <bool>}
 ```
 
 `/health` needs no token. The core **boots even if no model server is reachable** —
@@ -152,7 +154,8 @@ source/ssh_forward.py    supervised `ssh -N -L` forwards for remote model server
 source/chat.py           the terminal client
 source/discord_client.py the Discord bot (optional)
 source/discord_probe.py  "start the bot?" — serve.sh and install.sh both ask it
-source/chunker.py        fence-aware answer chunking (shared by the clients)
+source/chunker.py        fence-aware answer chunking (one file, used by the
+                         bot rather than reimplemented in it)
 source/version.py        `__version__` — the one place the release number lives
                          (**every commit bumps it**; see the docstring for why)
 web/                     the WebUI (vanilla JS, no build)
@@ -205,11 +208,20 @@ state/                   live conversations, archives, memory (gitignored)
 - **The core holds the conversations.** Closing a client never ends a session; the
   session lives in `state/` and is reloaded on the next core start.
 
-## Pointers into the README
+## Pointers into the docs
 
-- Config keys in full: **README → Config** (and `config.example.yaml`, which is the
-  most commented source of truth).
-- How a turn/round/reasoning pad works: **README → Terminology** and
-  **→ Reasoning: the Notepad and the Answer Sheet**.
-- Rollover and the journal: **README → Context Rollover**.
-- Per-client detail (terminal, WebUI, Discord): the matching **README** section.
+- Config keys in full: **`config.example.yaml`**, which is the most commented
+  source of truth. The README names the sections and what each is for.
+- How a turn/round/reasoning pad works:
+  **[reasoning.md](docs/reasoning.md)** — which cap binds which round, and every
+  way thinking stops.
+- What fills the window, and how accurately:
+  **[tokens.md](docs/tokens.md)** — the input side, written to be read without
+  the source open.
+- Rollover, the digest and the journal:
+  **[architecture.md](docs/architecture.md)** — the disk layer and the turn
+  lifecycle.
+- Per-client detail (terminal, WebUI, Discord):
+  **[clients.md](docs/clients.md)**.
+- The WebSocket and HTTP surface, event by event:
+  **[protocol.md](docs/protocol.md)**.

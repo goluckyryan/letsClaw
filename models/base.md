@@ -91,7 +91,7 @@ level and the spelling are load-bearing; a heading left with nothing under it
 falls back, silently, to a built-in sentence in `behavior.py`. HTML comments
 are dropped on extraction, so they are notes to you and never reach the model.
 A later `# ` heading ends the group and is kept in the prompt as normal. Full
-account: "What the base file commits the model to" in README.md.
+account: "What `base.md` commits the model to" in `docs/architecture.md`.
 
 ## Checkpoint
 <!-- Sent when a thinking pad has filled the context and is about to be

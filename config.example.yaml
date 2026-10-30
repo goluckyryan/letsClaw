@@ -25,8 +25,9 @@ behavior:
 
 # Model registry — every entry is self-contained: it names its own server, so
 # reading one entry tells you everything about that model.
-#   default_model: which entry to start with
-#   -m <name>     : override at startup (./terminalUI.sh -m <name>)
+#   default_model: which entry to start with. A session may be started on
+#                  another with ?model=<name> on the socket, or switched
+#                  with /model <name> — there is no command-line flag for it.
 #   provider_name: the exact model ID the server reports (check /v1/models)
 #   base_url     : required — the OpenAI-compatible endpoint serving this model
 #   api_key      : omit or "" when the server needs no key
@@ -145,9 +146,11 @@ models:
     top_p: 0.95
 
 # Core service — start this first (./serve.sh); clients connect to it
+# ./serve.sh --bind / --port / --config override the first two and this file's
+# path, and nothing else: every other key in this file is config-only.
 core:
   bind: "127.0.0.1"     # tools are unconfined: anyone who can reach this port gets a shell here
-  port: 8770            # also serves the WebUI at http://<bind>:<port>/
+  port: 8770            # also serves the WebUI at http://<bind>:<port>/ — one port, no separate frontend
   token: ""             # shared secret. Optional on loopback; REQUIRED if bind is not
                         # loopback — the core refuses to start otherwise, because the
                         # tools are unconfined. The WebUI prompts for it (the page
@@ -269,7 +272,11 @@ tools:
 
 # Conversation settings  (context_length lives per model, under models:)
 conversation:
-  max_history_messages: 50      # messages kept per session
+  # A backstop, not the mechanism: it trims the oldest messages, never opening
+  # on an orphaned tool result, and only on turns where no rollover happened —
+  # rollover is how a long session is meant to work, and this just stops an
+  # unbounded one when rollover is switched off. 0 (or junk) means never trim.
+  max_history_messages: 50
   rollover_at_percent: 90       # % of the model's context_length that trips a rollover (0 = never)
   rollover_mode: "auto"         # auto = roll over and say so | ask = prompt [y/N] | off = warn only
                                 # /new forces a rollover in any mode

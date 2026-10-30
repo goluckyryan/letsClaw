@@ -11,45 +11,26 @@ over a WebSocket. Behavior is plain MD files — everything visible, nothing hid
 
 - [Philosophy / features](#philosophy--features)
 - [Quick Start](#quick-start)
+- [What using it looks like](#what-using-it-looks-like)
 - [Architecture](#architecture)
-  - [Repo layout](#repo-layout)
 - [Terminology](#terminology)
-  - [Session, turn, round](#session-turn-round)
-  - [The kinds of round](#the-kinds-of-round)
-  - [The paper](#the-paper)
-  - [Limits](#limits)
-  - [Wiring](#wiring)
-- [Behavior Files](#behavior-files)
-  - [What the base file commits the model to](#what-the-base-file-commits-the-model-to)
-- [Agent Tools](#agent-tools)
-- [Context Rollover](#context-rollover)
-  - [Collapsing a finished turn (`digest_turns`)](#collapsing-a-finished-turn-digest_turns)
-  - [The `/digest` command](#the-digest-command)
-  - [The journal](#the-journal)
+- [The behavior files](#the-behavior-files)
+- [The tools](#the-tools)
+- [Context: rollover, digest, journal](#context-rollover-digest-journal)
 - [Reasoning: the Notepad and the Answer Sheet](#reasoning-the-notepad-and-the-answer-sheet)
-  - [The picture](#the-picture)
-  - [How the notepad works](#how-the-notepad-works)
-  - [How the answer sheet works](#how-the-answer-sheet-works)
-  - [Thinking room and answer room](#thinking-room-and-answer-room)
-  - [Can it use tools while thinking?](#can-it-use-tools-while-thinking)
-  - [When does the thinking stop?](#when-does-the-thinking-stop)
-  - [Making the notepad effectively unlimited](#making-the-notepad-effectively-unlimited)
-  - [What the notepad costs afterwards](#what-the-notepad-costs-afterwards)
-  - [The settings](#the-settings)
-  - [Which servers can do this](#which-servers-can-do-this)
 - [Token Counting](#token-counting)
 - [The Core](#the-core)
   - [Reloading config](#reloading-config)
   - [`/restart` — for the keys reload cannot reach](#restart--for-the-keys-reload-cannot-reach)
+- [Security](#security)
+- [Commands you can type](#commands-you-can-type)
 - [Terminal Client](#terminal-client)
 - [WebUI](#webui)
 - [Discord Client](#discord-client)
 - [Installing as a service](#installing-as-a-service)
 - [Future Features](#future-features)
 - [Config](#config)
-
-The developer half — module map, the WebSocket reference, the design
-principles — is in [`docs/`](docs/README.md).
+- [Where the detail lives](#where-the-detail-lives)
 
 ## Philosophy / features
 
@@ -84,9 +65,14 @@ principles — is in [`docs/`](docs/README.md).
   correction without throwing away the work already done.
 - **Operable without a shell on the core's host** — `/reload` re-reads `config.yaml`
   into the running core, and `/restart` covers the few keys reload cannot reach.
-- The model may continue reasoning as long as there is a meaningful next action, but it should not need another inference call merely to orchestrate work that the harness can execute deterministically.
+- **Work it does in batches** — several independent file reads go out in one
+  message and run together, so a task that needs five lookups costs five tool
+  calls and not five trips to the model.
 
 ## Quick Start
+
+You need Python 3 with a working `venv`, and a model server to talk to — the
+address of that goes in the config in the next step.
 
 ```bash
 cd ~/letsClaw
@@ -94,43 +80,14 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt   # core: openai, PyYAML, aiohttp, tiktoken
                                             # + optional discord.py (only for the bot)
 
+cp config.example.yaml config.yaml          # then edit it: your model server's
+                                            # base_url, and which model to start on
+                                            # (skip it and the core writes a
+                                            # starter config, boots, and tells
+                                            # you the model has no base_url)
+
 ./serve.sh                               # 1. the core — start this first, leave it running
 ./terminalUI.sh                          # 2. the terminal client, in another shell
-```
-
-If `python3 -m venv` stops with *"You may need to use sudo"*, the distro ships
-`ensurepip` separately — Ubuntu 26 does. Install it:
-
-```bash
-sudo apt install python3.14-venv      # match the version to your python3
-```
-
-With no sudo to hand, build the venv without pip and fill it from the system pip
-instead — same result:
-
-```bash
-python3 -m venv --without-pip .venv
-python3 -m pip --python .venv/bin/python install -r requirements.txt pip
-```
-
-A venv does not survive a distro upgrade: `.venv/bin/python3` points at the
-unversioned `/usr/bin/python3`, so it follows the new interpreter, while the packages
-stay behind in `.venv/lib/python3.<old>` — along with every `.so` built for the old
-ABI. The symptom is a bare `ModuleNotFoundError` on the first import. Delete `.venv`
-and rebuild it; nothing else is lost.
-
-`./serve.sh` also starts the **Discord bot** when `discord.enabled` is not false and
-`discord.token` is set, and says which of the two was missing and carries on when it is
-not — so it stays the right command either way. Ctrl-C stops both.
-
-They all pass their arguments straight through:
-
-```bash
-./serve.sh --config other.yaml --bind 0.0.0.0 --port 9000
-./serve.sh --no-discord                    # the core on its own
-./terminalUI.sh -s daq-notes               # attach to a session other than 'terminal'
-./terminalUI.sh --url http://lab-box:8770  # a core on another machine
-./run_discord.sh --core ws://lab-box:8770  # a bot by itself, pointed at a core elsewhere
 ```
 
 …or open <http://127.0.0.1:8770/> for the same thing in a browser. The WebUI is
@@ -140,302 +97,198 @@ a machine with no route to the internet.
 The core holds the conversations; the terminal and the WebUI are just windows onto
 them. It keeps running when you close them, and nothing works without it.
 
+**If `python3 -m venv` stops** with *"You may need to use sudo"*, your distro ships
+`ensurepip` separately (Ubuntu 26 does): `sudo apt install python3.14-venv`, or,
+with no sudo, `python3 -m venv --without-pip .venv` and then
+`python3 -m pip --python .venv/bin/python install -r requirements.txt pip`. A venv
+does **not** survive a distro upgrade — delete `.venv` and rebuild it after one.
+[`AGENT.md`](AGENT.md#bootstrap-fresh-clone) has the same path with the details an
+agent needs.
+
+`./serve.sh` also starts the **Discord bot** when `discord.enabled` is not false and
+`discord.token` is set, and says which of the two was missing and carries on when it is
+not — so it stays the right command either way. Ctrl-C stops both.
+
+Every script passes its arguments straight through to the thing it runs:
+
+```bash
+./serve.sh --config other.yaml --bind 0.0.0.0 --port 9000
+./serve.sh --no-discord                    # the core on its own
+./terminalUI.sh -s daq-notes               # attach to a session other than 'terminal'
+./terminalUI.sh --url http://lab-box:8770  # a core on another machine
+./run_discord.sh --core ws://lab-box:8770  # a bot by itself, pointed at a core elsewhere
+```
+
+## What using it looks like
+
+One real turn, taken from a session's journal and rendered the way the terminal
+shows it. Three of the turn's six tool calls are shown, the answer is cut short,
+and the token figures are illustrative — everything else is verbatim.
+
+```
+🤖 Model: qwen38-local   session: PYNQ-Z1   budget: 100000 tok
+📜 Rejoined a conversation already 59 messages long.
+👤 could you write a signal generator using the pmod ADC and DAC?
+
+🐱 Yes — and it's a better generator than the audio jack, because the **Pmod DA3
+   (on PMODB)** is a real 16-bit DAC you drive over SPI, and the **Pmod AD5 (on
+   PMODA)** can read the output back for self-checking. Let me first check what
+   the board's PYNQ image already provides for these parts.
+
+⚙️ exec {"command":"sshpass -p xilinx ssh -o StrictHostKeyChecking=no xilinx@1
+   ↳ 1921 chars
+⚙️ exec {"command":"sshpass -p xilinx ssh -o StrictHostKeyChecking=no xilinx@1
+   ↳ 1272 chars
+⚙️ exec {"command":"sshpass -p xilinx ssh -o StrictHostKeyChecking=no xilinx@1
+   ↳ 703 chars
+
+🐱 Short answer: **yes, but there's a catch I just verified** — and it changes
+   what "signal generator" can mean here. Both of your Pmods are **SPI** devices…
+   but the **stock `base.bit` has no SPI routed to the Pmod pins.** I checked the
+   IOP pin-mux table in the image: each Pmod pin can only be muxed to **GPIO or
+   I2C**. So the stock image can't drive either board at full speed.
+
+   | Path | Works now? | Speed | Good for |
+   |---|---|---|---|
+   | **Audio jack J13** | ✅ yes | 192 kHz, audio band | a real fast generator, today |
+   | **Pmod DA3 via GPIO bit-bang** | ✅ yes | ~1–2 kSPS | DC and slow sweeps |
+
+⚡ ttft 4.1s · user 41 + LLM 1180 tok + reasoning 3640 tok · 6 tool calls · out 5000 tok · context 21340/100000 (21%)
+👤
+```
+
+Three things in those lines are worth knowing before you start typing:
+
+- **The `⚙️` lines are the agent running commands on that machine**, each printed
+  *before* it runs. All six were it checking what the board actually has rather
+  than answering from memory — a behavior file tells it to do that. Every one is
+  still there afterwards, untruncated, in the session's journal.
+- **The `out` figure is not the same number as the LLM one.** LLM is the answer;
+  `out` is everything the model generated to get there — the thinking and the
+  tool arguments included. What a metered endpoint bills is `out`.
+- **`context` is what the *next* request will cost**, not what this one did. It is
+  the number to watch, and the one the rollover threshold is measured against.
+
+The thinking is not in that transcript because it is hidden until you ask for it —
+`/reasoning` in the terminal, the `🧠 think` button in the browser. Shown, it
+streams as it happens, dimmed, with a running count beside it. It never enters the
+conversation, which is why a twenty-minute think does not push that `context`
+figure any closer to the wall.
+
 ## Architecture
 
-```mermaid
-graph TD
-    subgraph Clients
-        REPL[Terminal client\nchat.py]
-        Web[WebUI\nweb/ served by the core]
-        Disc[Discord bot\ndiscord_client.py]
-    end
+Two moving parts.
 
-    subgraph Core["Core service (server.py)"]
-        Sessions2[Sessions\ncore.py\nhistory + rollover]
-        Engine[LLM Engine\nllm_engine.py]
-        Config[Config\nconfig.yaml]
-        ModelFile["Behavior MD files\nbase (shared) + per-model\n+ per-session"]
-    end
+**The core** is one long-running process. It holds every conversation, talks to
+the model server, runs the agent's tools, and writes what happens to disk. It
+keeps running when you close every window onto it — and nothing works without
+it.
 
-    subgraph Modules
-        Cmds[Commands\n/clear /rollover /new /info /model\n/behavior /reasoning /stop /steering\n/reload /restart /session /digest]
-        TokenCounter[Token Counter\ntoken_counter.py\nper-message stats]
-        ThinkingUI[Thinking indicator\nui.py\nlive spinner + TTFT]
-        Tools[Tool executor\ntools.py\nexec / read / write / list]
-        Roll[Session rollover\nsession.py\narchive + handoff]
-    end
+**The clients** are windows. The terminal REPL, the browser page and the Discord
+bot are three separate processes, each of which does two things: show you what
+is happening, and send what you type. None of them holds a conversation. Close
+one mid-answer and the turn carries on; open another window on the same session
+and you both see the same stream.
 
-    subgraph State
-        Live[Live Sessions\nstate/live/]
-        Sessions[Archived transcripts\n+ journals\nstate/sessions/]
-        Memory[Long-term Memory\nstate/memory_store/]
-    end
-
-    REPL -->|WebSocket| Sessions2
-    Web -->|WebSocket| Sessions2
-    Disc -->|WebSocket| Sessions2
-    Sessions2 --> Cmds
-    Sessions2 --> Tools
-    Sessions2 --> Roll
-    Sessions2 --> Live
-    Roll --> Sessions
-    Roll --> Memory
-    Cmds --> Engine
-    Engine --> Config
-    Engine --> ModelFile
-    Cmds --> TokenCounter
-```
-
-**Data flow:**
-- **Core (`server.py` + `core.py`):** holds named sessions — history, model, rollover
-  state, tools. Runs turns and emits events. Knows nothing about terminals.
-- **Clients:** attach to a session by name over `ws://host:port/ws?session=<name>`.
-  Several may attach to the same session and all see the same stream.
-- **`chat.py`** is the reference client: it renders events and sends `submit` /
-  `command` / `rollover_reply` / `stop`.
-- **`web/`** is the same client in a browser, speaking the same protocol.
-- **`discord_client.py`** is the same client again, with Discord on the far side:
-  one socket per active channel, and nothing the core does not already hold.
-  The core never imports `discord.py` and does not know it exists.
-
-### Repo layout
+They speak one protocol over a WebSocket, so a fourth client — a phone app, a
+watchdog, an integration — attaches the same way and needs no change to the
+core.
 
 ```
-letsClaw/
-  serve.sh                 the core          — start this first; also starts the bot
-  install.sh               install serve.sh as a systemd service (user or system)
-  terminalUI.sh            the terminal client
-  run_discord.sh           the Discord bot on its own (serve.sh usually starts it for you)
-  config.yaml              your settings (gitignored — it holds API keys and the bot token)
-  config.example.yaml      the documented template to copy from
-  models/                  behavior Markdown: base.md + per-model
-  web/                     browser client: index.html, app.js, style.css
-  tests/                   every suite and helper; run_all.py runs them
-                           (gitignored — local to the machine it was written on,
-                            so a clone has none)
-  source/                  all Python
-    paths.py                 where the repo root is — one definition
-    server.py  core.py       the core service and the session logic
-    config.py                config.yaml → engines; building them is the validation
-    behavior.py              the behavior-file cache and the base.md directives
-    config_edit.py           saving the webui: block back into config.yaml as text
-    logging_setup.py         one rotating log file per writer, core and bot
-    ssh_forward.py           supervised ssh -L forwards to remote model servers
-    chat.py    ui.py         the terminal client
-    discord_client.py        the Discord client
-    discord_probe.py         "start the bot?", asked by serve.sh and install.sh
-    chunker.py               splitting an answer into messages Discord accepts
-    llm_engine.py            talking to the model server
-    session.py               persistence, archives, rollover handoffs
-    tools.py  token_counter.py
-  state/                   live conversations + archived transcripts and journals (gitignored)
-  logs/                    (gitignored)
+   terminal  ─┐
+   browser    ├─ one WebSocket ─→  the core  ──→  your model server
+   Discord   ─┘                     │
+                                    ├──→ tools (shell, files, …)
+                                    └──→ disk (conversations, archives, journals)
 ```
 
-Two things worth knowing about this shape:
+Three consequences worth holding in mind, because they explain most of the rest
+of this manual:
 
-- **The scripts stay at the root and the code lives in `source/`.** `serve.sh`
-  runs `source/server.py`, which puts `source/` on the import path, so the modules
-  import each other by plain name (`import core`) with no package machinery.
-- **Everything the code reads is at the root, not beside it** — config, `models/`,
-  `web/`, `state/`, `logs/`. `source/paths.py` holds the single definition of
-  where the root is (`REPO_ROOT`) and a `resolve()` for config paths, which are
-  taken as-is when absolute and root-relative otherwise. Anything needing a repo
-  path should use those rather than computing its own from `__file__`.
+- **A conversation belongs to the core, not to the window you typed it in.**
+  That is why closing a terminal does not stop a turn, why the WebUI can show a
+  session started from Discord, and why restarting the machine costs you at most
+  the turn that was running.
+- **The core is shared.** One slow thing blocks everyone, so anything that might
+  take a moment is moved off the main loop. This is why a big file read is
+  visible as a tool call rather than a frozen screen.
+- **Nothing is hidden from you.** What the model was sent is on disk, the
+  behaviour files are plain Markdown you can edit, and the whole thing is plain
+  Python and three static files — no framework in front of either, and no build
+  step to sit between you and the source.
+
+The module map, the turn lifecycle and the disk layout are in
+[`docs/architecture.md`](docs/architecture.md).
 
 ## Terminology
 
-These words appear throughout this README, in the progress notices during a
-turn, and in the code. They nest, largest first.
+Five words carry most of this manual. They nest, largest first.
 
-### Session, turn, round
+| word | means |
+|---|---|
+| **session** | one named, persistent conversation — its history, model and settings. Survives restarts. |
+| **turn** | one thing you asked → one answer you got back. |
+| **round** | one request to the model server, and its reply. **A turn is not a round:** a simple question is one of each; a question that needs a file read, some thinking and an answer is still *one turn* — but five or six rounds. |
+| **notepad** | everything the model has thought so far this turn. Lives for one turn and never joins the conversation. |
+| **answer sheet** | the separate allowance for the final reply, sized when the thinking stops. |
 
-| word | means | how many |
-|---|---|---|
-| **session** | one named, persistent conversation — its history, model and settings. `chat-1`, `discord-…`. Survives restarts. | lives until deleted |
-| **turn** | one thing you asked → one answer you got back. Starts at `turn_start`, ends at `turn_end`. | many per session |
-| **round** | one request to the model server, and its reply. | **one or many per turn** |
+Three more, for the walls rather than the work:
+
+| word | means |
+|---|---|
+| **rollover** | the *conversation* outgrew the model's window, so it is archived and restarted from a summary. |
+| **journal** | the running record beside the archive: every round's reasoning, and every tool result untruncated. |
+| **context window** | everything the model can hold at once — the conversation, the notepad and the reserved answer sheet together. |
 
 A **round** and a **request** are the same thing seen from two sides: a round is
 one question-and-answer with the model, a request is the HTTP call carrying it.
-The README says "round" for the unit of work and "request" when the network
-matters.
+This manual says "round" for the unit of work and "request" when the network
+matters. The kinds of round, and what caps each one, are in
+[`docs/reasoning.md`](docs/reasoning.md#which-round-runs-under-which-cap); the
+words a client prints (`transport`, `client`, `event`) are in
+[`docs/protocol.md`](docs/protocol.md).
 
-The important one is that **a turn is not a round**. A simple question is one
-turn, one round. A question that needs a file read, some thinking, and an answer
-is still *one turn* — but five or six rounds.
+## The behavior files
 
-### The kinds of round
+The system prompt is four parts, in this order:
 
-All of these are rounds. They differ in what the model is being asked for:
+1. **Base behavior** — `models/base.md`, shared by every session and every model:
+   the identity, the working style, and the tool notes. Plain Markdown, so all of
+   it is tunable without a code change.
+2. **Per-model behavior** — one file per model entry, layered on top of the base.
+3. **Per-session behavior** — `models/sessions/<session name>.md`. Dropping the
+   file in is the whole operation, and `ls models/sessions/` says which sessions
+   are tuned. This is also how one Discord channel gets its own rules without the
+   core knowing Discord exists: the bot names each session after its channel.
+4. **Continued session** — after a rollover, the handoff and the path of the
+   previous window's journal.
 
-| kind | what it is | what caps it |
-|---|---|---|
-| **first round** | the opening request of a turn | `max_tokens` |
-| **tool round** | a round that came back asking to run a tool | `max_tokens` |
-| **resume round** | *continues* a thought that ran out of room — the notepad handed back, still open | `max_tokens` |
-| **checkpoint round** | condenses a full notepad so thinking can continue | the answer reserve |
-| **closing round** | the last one: the thought is shut and the model writes the reply | the answer reserve |
+No framework-injected boilerplate: if it is not in one of those files or in the
+conversation, it is not sent.
 
-There is **no budget on resume rounds.** The model may take as many as it needs;
-what stops it is time, context, or having nothing more to say. See
-[When does the thinking stop?](#when-does-the-thinking-stop).
+Two rules are worth knowing before you edit anything, because neither is visible
+from the outside:
 
-You will see them counted in the live notices:
+- **An edit lands at the next window rebuild, not on `/reload`.** The layers sit
+  in the prompt prefix the server has already tokenised, so rewriting them
+  mid-conversation costs that session its cache. `/reload` stages the change and
+  says so; `/clear` or a rollover applies it.
+- **Two sections of `base.md` are machinery, not prose.** `## Checkpoint` and
+  `## Forced conclusion` are lifted out and sent as a user message at the one
+  moment each applies — and both are cut from the system prompt, every model,
+  every turn. Their headings are matched literally, so the level and the spelling
+  are load-bearing.
 
-```
-reasoning cut off — resuming it (round 2, pad ~320 tok)
-```
+The one rule in the file that changes how the agent behaves with you: it is told
+to **decide rather than ask**. That matters because a question ends the turn — the
+loop runs while the model calls tools, and the moment it writes text instead the
+turn is over, whether or not it meant to stop. See
+[principle 2](docs/design-principles.md#2-behavior-is-markdown-and-some-of-that-markdown-is-machinery).
 
-The number is how many resumes this turn has taken so far — a progress
-indicator, not a countdown.
+What each layer is for, the cache rules, and why the `# Directives` group never
+reaches the prompt: [`docs/architecture.md`](docs/architecture.md#the-four-layer-system-prompt).
 
-### The paper
-
-| word | means |
-|---|---|
-| **notepad** (or **pad**) | everything the model has thought so far this turn, accumulated across resume rounds. Lives in memory for one turn, never joins the conversation. |
-| **answer sheet** | the separate allowance for the final reply, worked out when the thinking stops: 10% of what is still free, at least 4,096, never more than `max_output_tokens`, and never more than the room actually left. |
-| **checkpoint** | the model's own note of what it has established, written when the notepad fills up, replacing the older reasoning. |
-
-### Limits
-
-| word | means |
-|---|---|
-| **wall** | a limit that stops the thinking: time, or context. Whichever hits first, the answer still gets written. |
-| **rollover** | the *conversation* outgrew the model's window, so it is archived and restarted from a summary. One level up from a checkpoint, which is the same idea applied to a single turn's notepad. |
-| **context window** | `context_length` — the total the model can hold at once: conversation **plus** notepad **plus** the reserved answer sheet. |
-
-### Wiring
-
-| word | means |
-|---|---|
-| **transport** | how this server is asked to resume a thought — `chat` or `raw`. See [Which servers can do this](#which-servers-can-do-this). |
-| **client** | a terminal, browser or bot attached to a session. Several can watch the same one. |
-| **event** | one message from core to client — `text`, `reasoning`, `notice`, `tool_call`, `turn_end`… |
-
-## Behavior Files
-
-The system prompt is assembled from four parts, in this order:
-
-1. **Base behavior** — `models/base.md` (config: `behavior.base_file`), shared by every
-   session and every model: the identity, the working style, and the tool notes. It is
-   plain Markdown, so all of it can be tuned without a code change. A missing base file
-   is a warning at core startup and an empty base — the core keeps running, the same
-   behavior as a missing per-model file.
-2. **Per-model behavior** — one MD file per model entry via `behavior_file`
-   (e.g. `models/default.md`), layered on top of the base for tuning a specific LLM.
-3. **Per-session behavior** — `models/sessions/<session name>.md`
-   (config: `behavior.session_dir`; unset switches the layer off). A session with no
-   file of its own just gets the two layers above.
-4. **Continued session** — after a rollover, the model-written handoff and the path of
-   the previous window's [journal](#the-journal), with the grep commands for searching
-   it, carried in the system message.
-
-**The third layer is per Discord channel without the core knowing Discord exists.** It
-is keyed on the *session* name, and the bot already names each session after its channel
-(`auto_names` → `dudus-den-solaris`), so `models/sessions/dudus-den-solaris.md` is that
-channel's file. The same mechanism covers `terminal.md` and any WebUI session, which a
-channel-id-keyed design would have excluded. A directory rather than a config map,
-because sessions spring into existence on attach: dropping the file in is the whole
-operation, and `ls models/sessions/` says which sessions are tuned.
-
-The session name is turned into a filename by the same rule `state/` uses — everything
-outside `[A-Za-z0-9-_.]` becomes `_` — and the result must sit directly in `session_dir`
-or it is refused. Both guards matter: `?session=` is not validated on attach, so a
-session named `../../etc/passwd` can exist, and this is the one place a session name
-becomes a path that is *read*.
-
-The prompt is not frozen at startup, but it is only ever replaced at a point where that
-costs nothing. The three layers live in `history[0]`, which is the prompt prefix the
-server has already tokenised, so rewriting it mid-conversation throws away the KV cache
-for that session. Two rules follow:
-
-* **`/reload` moves settings, never the window.** It re-reads `config.yaml`, rebuilds the
-  engines and tools, and reconciles the behavior files with disk — then leaves every live
-  conversation exactly as it was. It reports which files changed and that they are
-  pending.
-* **`/rollover`, `/clear` and `/new` move the prompt.** Each rebuilds `history[0]` anyway,
-  so each re-reads all three layers on the way through and says in the transcript which
-  ones moved. A file created for an already-live session is picked up the same way.
-
-So an edited `base.md` or `models/sessions/<name>.md` lands at the session's next window
-rebuild. `/reload` tells you it is waiting; `/clear` applies it immediately if you do not
-want to wait for a rollover. A file that reads back *empty* is treated as a save in
-progress and ignored, since that is the state an editor passes through.
-
-The carryover is always last: `/clear` drops it, `/rollover` writes a new one, and the
-three behavior layers sit above it. The rollover summariser never sees those layers —
-they are re-read verbatim into the fresh window, so summarising them would put the same
-instructions in the prompt twice, the second copy degrading at every later rollover. The
-carryover itself *is* passed to the summariser, or the chain would forget everything
-before the window that just ended.
-
-No framework-injected boilerplate: if it's not in the files above or the conversation,
-it's not sent.
-
-### What the base file commits the model to
-
-`models/base.md` is not just an identity blurb — several of its rules are load-bearing,
-and two directives in it are lifted out by the core and used as machinery.
-
-| section | what it does |
-|---|---|
-| **How you work** | check with a tool rather than answer from memory; **decide rather than ask**; finish the whole task before answering |
-| **Tools** | `read_file` has no offset, so large files go through `inspect_file` (structure map + line ranges); independent read-only calls may be batched in one message, because the core runs them together |
-| **The record on disk** | search the previous window's [journal](#the-journal), and the `grep` line a turn digest ends with, before re-investigating anything |
-| **Directives → `## Checkpoint`** | the text sent when a full notepad is about to be compacted — extracted by `extract_checkpoint_directive` |
-| **Directives → `## Forced conclusion`** | the text sent when a server cannot resume a cut-off thought — extracted by `extract_conclude_directive` |
-
-#### The two directives
-
-The last section of `base.md`, `# Directives`, is machinery rather than
-behavior, and it is the one part of the file the core treats specially.
-`behavior.py` matches each `## ` heading under it literally, lifts out the
-paragraph beneath (HTML comments dropped — they are notes to whoever edits the
-file, not words for the model), and sends it as a **`user` message at the one
-moment it applies**: the checkpoint when a notepad has filled the context and
-is about to be condensed, the forced conclusion when a cut-off round cannot be
-resumed. They live in Markdown rather than in source so the wording is yours to
-tune with `/reload`, no code change and no restart. Delete a heading and the
-core falls back, silently, to a short built-in sentence in `behavior.py`.
-
-**The group never reaches the system prompt.** `strip_directive_sections()`
-cuts everything from `# Directives` to the next `# ` heading out of the base
-layer before the prompt is assembled — every model, every turn. The prompt
-should carry behavior and nothing else, and a standing copy of a directive is
-worse than redundant: a model that reads its whole prompt as instruction will
-simply obey it. Claude Opus 5 over Argo, told on every turn that "this is not
-the final answer", answers nothing at all. Stripping used to be opt-in per
-model (`strip_directives: true`); that key is gone, because no model benefited
-from the copy and the ones that merely ignored it were still paying for it in
-tokens. An old `config.yaml` carrying the key still loads — unknown model keys
-are ignored.
-
-Stripping and extraction read the file independently, which is what lets both
-be true at once: `extract_*_directive()` works on the base **as written**, so
-the directives still arrive at the moment they are meant to.
-
-Two constraints if you edit the file. The `## ` headings are matched on the
-literal string, so the level and the spelling are both load-bearing. And a
-bare `## Checkpoint` or `## Forced conclusion` with no `# Directives` group
-around it — the layout the file used before the group existed — is still
-stripped, but only as far as the next heading of either level.
-
-The **decide rather than ask** rule is the one to know about. Faced with a fork —
-two designs, two libraries, two readings of your request — the model is told to
-investigate both with tools, pick one, and say in its answer which it picked and
-why it rejected the other. It asks you only when proceeding would destroy data or
-cost money, or when the missing fact exists nowhere a tool can reach.
-
-This matters because **a question ends the turn.** The agent loop runs while the
-model calls tools; the moment it emits text instead, the turn is over — and the
-core cannot tell a finished answer from *"shall I do A or B?"*. Nothing in the
-reasoning machinery catches that case, so if you want the model to stop asking
-and start deciding, this file is the only lever. Edit it and `/reload` to stage it, or
-`/clear` to put it in front of the model straight away.
-
-## Agent Tools
+## The tools
 
 The model can call tools to act on the real environment. Each turn, the agent
 loop runs until the model gives a plain answer:
@@ -453,43 +306,26 @@ graph TD
 
 Built-in tools: `exec` (shell), `read_file`, `write_file`, `list_dir`,
 `show_image`, `search_and_inspect`, `inspect_file`, `inspect_symbol`,
-`edit_file`, `run_and_capture`.
-Add a tool: define a `Tool(name, description, json_schema, async_handler)`
-entry in `tools.py` and list its name in `tools.allow`.
+`edit_file`, `run_and_capture`. Every result is clipped so one call cannot blow
+up the window, and `exec` runs in `tools.workdir` under a timeout — the keys and
+their defaults are in [`config.example.yaml`](config.example.yaml).
 
-All tool I/O is truncated (`max_output_chars`) so a single call can't blow
-up the context, and the file tools do their reading and writing off the event
-loop — in the shared core one slow read would otherwise stall every session's stream.
+The loop is capped by **room, not a round count**: before each round the core
+checks that the free window still holds enough for one clipped tool result and the
+message carrying it. Below that it makes one final call with no tool schemas, so
+the model must answer in plain text. The other wall is time. Why a count of rounds
+is not a limit the machine actually has, and what the check is derived from:
+[`docs/reasoning.md`](docs/reasoning.md#can-a-tool-run-while-the-pad-is-open).
 
-The loop is not capped in **rounds** — a round is one model call plus every tool call it
-returns, so one round can run several tools, and a count of them is not a limit the
-machine actually has. What it is capped by is room: before each round the core checks
-that the free window (what is left once the answer reserve is paid for) still holds
-`MIN_TOOL_ROUND_ROOM` — enough for one clipped tool result and the message carrying it.
-Below that it makes one final call with no tool schemas, so the model must answer in
-plain text. The other wall is time, `turn_timeout`.
+## Context: rollover, digest, journal
 
-This matters because rollover is only evaluated *after* the loop fully drains: nothing
-mid-turn can roll over, every round re-sends a history one tool result longer, and with
-context shift off an over-window prompt is a hard 400 that discards the whole turn. The
-room check is what the turn runs into instead.
+A conversation that outgrows the model's window gets rejected by the server.
+Rather than silently dropping the oldest turns, letsClaw rolls the session over
+once it passes `rollover_at_percent` of the window:
 
-`exec` runs in `tools.workdir` (default: the letsClaw directory itself). This matters
-now that the core is a daemon: its own cwd is wherever `./serve.sh` was launched from,
-which is not the shell you were sitting in, so relative paths need a stated base. Each
-command gets **its own process group**, so a timeout — or a `stop`, or a core shutdown —
-kills the children too instead of leaving a detached shell behind.
-
-## Context Rollover
-
-A conversation that outgrows the model's window gets rejected by the server. Rather
-than silently dropping the oldest turns, letsClaw rolls the session over once it
-passes `rollover_at_percent` of the active model's `context_length`:
-
-1. the message list is archived to `state/sessions/<session>_<timestamp>.json`,
-   and the journal segment beside it — see [The journal](#the-journal) — is closed
-2. the model writes a handoff — objective, what's established, **what was ruled out**,
-   what's still open — appended to `memory.long_term_file`
+1. the message list is archived, and the journal segment beside it is closed
+2. the model writes a handoff — objective, what's established, **what was ruled
+   out**, what's still open
 3. a fresh window starts from that handoff plus the last exchange verbatim, and is
    told to **grep the journal** for anything the handoff does not answer
 
@@ -497,349 +333,62 @@ The **RULED OUT** section is not decoration. A dead end is neither a settled fac
 nor outstanding work, so without a section of its own it survives nowhere — and
 the fresh window walks straight back into an approach the old one had already
 eliminated. Losing a fact costs a re-derivation; losing a rejection costs a loop.
-It is the same rule as the `## Checkpoint` directive in `base.md` ("every approach
-you ruled out and why"), applied one level up.
 
-The handoff is the *entire* memory of everything before the rollover, so it is
-also what the summariser is given room for. Three caps apply, smallest wins:
+`/rollover` forces one at any time, in any mode, and `rollover_mode` picks what
+happens on its own. There is an earlier trigger: a window that is nearly full
+still has room for one more exchange but none to *think* in, so with
+`rollover_before_think` a thinking model's turn rolls first rather than arriving
+already degraded. The percentage is the server's own figure where the server
+reports one; where it does not, a calibrated local estimate stands in, and a `~`
+beside the number is what tells you so.
 
-| cap | value | why |
-|---|---|---|
-| `HANDOFF_MAX_TOKENS` | 1500 | four sections do not fit in less |
-| a share of the window | `context_length / 20` | on a small model a fixed 1500 would be a permanent tax on the context it exists to save |
-| what is free right now | `context_length − used − 200` | below `HANDOFF_MIN_TOKENS` (256) the summary is skipped and the last exchange is carried alone |
+**The cheaper move is not to fill the window at all.** Measured across four real
+sessions, the tool calls and their results were **91–95%** of the context; the
+answers anyone actually reads were 2–8%. With `digest_turns` on, each finished
+turn's working-out is replaced by one short digest — the question and the answer
+stay word for word — and that digest ends with the `grep` line that reaches
+everything it collapsed. Nothing is lost, and that is *checked* rather than
+claimed: the collapse requires the journal to be on, healthy, and demonstrably
+larger than when the turn started, and on any doubt the turn is kept in full.
+`/digest` chooses this per session; the WebUI's 📄 button is the same switch. It
+ships **off** — it is the first feature that discards context by design.
 
-At 100k and above the absolute cap binds and you get the full 1500; only a
-small-window model is scaled back.
+**Two directories under `state/`, easily confused.** `state/live/` is the
+conversation you are having — rewritten as you go and reloaded at startup — while
+`state/sessions/` is the archive, a write-once record of a window that filled up.
+A rollover writes to the second and starts the first over. Archives are named
+`<session_id>_<session>_<timestamp>.json`, and the **id leads because it is the
+half that cannot change**: a session can be renamed, so `ls a3f91c2e_*` finds
+every archive of it whatever it was called at the time.
 
-For the same reason the summariser is shown each tool call's **arguments**,
-clipped to 200 characters. Names alone would say that a search returned nothing
-without saying what was searched for — which is exactly the sentence RULED OUT
-needs to be able to write.
+Beside each `.json` archive sits a `.md` **journal** — the other half of the
+record, and not a second copy of it. The JSON holds the message list, and two
+things cannot be added to that afterwards: the reasoning, which never enters
+history by design, and the full tool output, which is clipped before it does. So
+a rolled-over window could see what the previous one *concluded* but not what it
+*did* — and re-did it. The journal is written as the turn runs, one block per
+round, holding all of it.
 
-`rollover_mode` picks the behaviour: `auto` rolls over and says so, `ask` prompts
-first, `off` only warns. **`/rollover` forces a rollover at any time**, in any mode — and
-unlike `/clear`, which discards the conversation, `/rollover` files it and carries the
-thread forward.
-
-There is a second, earlier trigger. A window that is nearly full still has room for
-one more exchange, but none to *think* in — so a thinking model would have its
-reasoning squeezed out exactly where a hard question needs it (see
-[Reasoning](#reasoning-the-notepad-and-the-answer-sheet)). With
-`rollover_before_think` the core rolls over *before* such a turn rather than after
-one that was already degraded. Auto mode only: `ask` must not put a question before
-the turn has even started, and `off` means off.
-
-### Collapsing a finished turn (`digest_turns`)
-
-Rolling over is a last resort — it costs a round, and the fresh window knows
-only what the handoff says. The cheaper move is not to fill the window in the
-first place.
-
-Measured across four real sessions, the tool calls, their arguments and their
-results were **91–95%** of the context. The answers anyone actually reads were
-2–8%, and the questions asked were under half a percent. So with
-`digest_turns: true`, at the end of each turn the part in between is replaced
-by one short model-written digest:
-
-```
-before:   system │ user │ ⟨call ▸ result ▸ call ▸ result ▸ …⟩ │ answer
-after:    system │ user │ answer │ DID / FOUND / CHANGED / RULED OUT
-```
-
-The question and the answer stay word for word; the working-out becomes
-~300–500 tokens. On a 21-turn session that is roughly 173k → 24k, which is the
-difference between rolling over routinely and rarely.
-
-**Nothing is lost, and that is checked rather than claimed.** Every tool call,
-every full result and every round of reasoning is already in the journal,
-written *as the turn runs* — so the collapse only removes a second copy. But
-`jot` never raises, which means a journal that filled the disk on the turn's
-first call looks exactly like one that recorded it perfectly. The digest
-therefore requires the journal to be switched on, healthy, *and* demonstrably
-larger than when the turn started. Failing any of those, the turn is kept in
-full and a warning says so. The same is true if the summariser errors, returns
-nothing, or there is no room for the call.
-
-Each digest ends with the line that reaches what it replaced:
-
-```
-[full record: grep -n '^## turn 7 ' state/sessions/a3f91c2e_letsClaw_….md]
-```
-
-and `models/base.md` tells the model to run it rather than re-derive — the
-same instruction a rolled-over window already gets, pointed at the segment it
-is still inside instead of a closed one.
-
-**You are shown the digest, not just told one happened.** Every client prints
-it as the turn closes — folded shut under a one-line headline in the WebUI,
-indented under the answer in the terminal, posted after the answer on Discord.
-It is the same treatment the rollover handoff gets, for the same reason: this
-text is what the model sees from here on in place of the turn, so a digest
-that quietly dropped the finding the turn existed to produce should be
-visible while the turn is still fresh in your mind, rather than inferred two
-turns later from an answer that has forgotten it. A token count could not
-have told you that.
-
-Three caps bound the digest, smallest wins, mirroring the handoff's: 600
-tokens absolute, `context_length / 50`, and what is free in the call itself.
-That last one is measured against **the turn being summarised**, not the
-session's current usage — the handoff summarises the whole history, so there
-`context_length − used` is the room in its own prompt, but this call sends
-only one turn. Budgeting it against `used` made the digest decline on exactly
-the turns big enough to be worth digesting.
-
-It is not free on every turn. A digest costs its own round and ~200–500
-tokens that every later turn then carries, so a turn whose tool output was a
-handful of lines comes out slightly *bigger* collapsed than left alone —
-measured on a three-turn session with small tool results, 3,134 tokens against
-the control's 2,719. It pays when tool output dominates, which is the common
-case and the one the 91–95% was measured on: the same three turns reading
-whole files instead came out at 3,115 against the control's 35,441.
-
-It ships **off**. It is the first feature that discards context by design, so
-it is opt-in until a model has run clean with it.
-
-**A model entry may override it**, and `digest_turns` is the only
-`conversation:` setting that one may. The reason is in the paragraph above:
-the digest costs its own round, and that round is billed to whichever model
-the session is on. A model whose `context_length` is large enough that a turn
-will never need collapsing would pay for every digest and benefit from none,
-so it can opt out on its own:
-
-```yaml
-conversation:
-  digest_turns: true            # the default for every session
-
-models:
-  big-window-model:
-    context_length: 1000000
-    digest_turns: false         # ...except this one
-```
-
-Omitting the key in a model entry means "follow the conversation setting";
-`false` there means off. A `/model` switch re-resolves it, so moving a live
-session onto that model stops the digesting and moving it back resumes.
-
-### The `/digest` command
-
-The config answers what every session should do; `/digest` answers what *this*
-session will do. It is in every client — terminal, WebUI, Discord — and the
-WebUI's toolbar carries it as a 📄 button.
-
-- **`/digest off`** and **`/digest collapse`** are state, and the session's
-  own. While set, the choice outranks both config layers, so a config edit,
-  a `/model` switch, a `/clear` or a restart cannot take it back — it is
-  written to the session's live file, which is what carries it across a
-  restart. A session that never chose follows the config as before.
-- **`/digest expand`** and **`/digest expand all`** are the undo of a
-  collapse, not a state: the last collapsed turn back out of the journal, or
-  every collapsed turn in the window. The re-inserted turn is bigger than the
-  digest it replaces, which is the whole of the risk, so `all` is opt-in.
-- **`/digest`** with nothing after it is the read-only report: on or off, by
-  config or by you, and how many collapsed turns an expand would reach. It
-  answers while a turn is running, for the same reason `/info` does.
-
-Expansion works the way the collapse's promise says it should. Every digest
-ends in the grep line pointing at the segment that holds the turn in full,
-and `expand` parses that line — code-appended, not model-written — and
-rebuilds the turn from it. The question and the answer stay the copies
-already in the window; the working-out comes back the way it ran, one
-assistant message per round of tool calls with the results in the order they
-were issued, and unclipped where the journal kept more than the window had
-room for.
-
-And it fails the way the collapse fails: no pointer, a segment with no record
-of the turn, a call with no recorded result — the digest stays, the reply
-names which turn was kept and why, and nothing else in the window moves. A
-partial expansion would be a partial loss, and the journal is the only other
-copy.
-
-The 📄 button is a three-position wheel in the think button's style —
-**off** → **collapse** → **expand** → **off** — where the position is the
-wheel's own: each click advances it and sends the command the new position
-names, `collapse` turns the digest on, `expand` undoes the last collapse,
-`off` turns it off. Both on positions light the button's on lamp; the
-server's state still owns that lamp and the collapsed-turn count, and a
-broadcast that contradicts the wheel pulls it back — a tab that sees the
-session go off from elsewhere snaps to off — but between those, the wheel is
-the tab's, as the think button's mode is. A reattach learns the position
-from the `/info` it fetches. The wheel's `expand` with nothing collapsed is
-a no-op the core reports as "nothing to expand" rather than refusing — a
-click is never an error — and expanding more than one turn is going around
-the wheel again, or a typed `/digest expand` (`all` stays a typed argument).
-
-Two directories under `state/`, easily confused: **`state/live/` is the conversation
-you are having** — rewritten as you go and reloaded at startup — while
-**`state/sessions/` is the archive**, a write-once record of a window that filled up.
-A rollover writes to the second and starts the first over.
-
-Archives are named `<session_id>_<session>_<timestamp>.json`, stamped at the
-moment of the rollover:
-
-```
-a3f91c2e_letsClaw_2026-09-22T15-22-35.json
-a3f91c2e_daq-notes_2026-09-22T16-04-11.json     ← same conversation, renamed
-ff052414_scratch_2026-09-22T16-40-02.json       ← a different one
-```
-
-The **id leads because it is the half that cannot change.** A session can be
-renamed, so grouping by name scatters one conversation across two prefixes,
-while `ls a3f91c2e_*` finds every archive of it whatever it was called at the
-time. The name is still there because an id alone tells you nothing at a glance,
-and the timestamp sorts within a conversation. Nothing parses the name — it is
-for you, not the code.
-
-The name is not disambiguated. Two rollovers of one session inside the same
-second write the same filename and the later one wins; that needs a rollover
-whose handoff never runs (the model server unreachable, or no headroom left to
-summarise), and is accepted rather than guarded against.
-
-### The journal
-
-Beside each `.json` archive sits a `.md` **journal** with the same name. They are
-not two copies of one thing. The JSON is the *message list*, and two things are
-missing from it that cannot be added afterwards:
-
-- **the reasoning.** The core never puts it in history — not between tool rounds,
-  not at the end of a turn, and least of all the thinking pad, which by design
-  lives in `_think_pad` and nowhere else. None of it is in the archive because
-  none of it was ever in the list being archived.
-- **the full tool output.** `role="tool"` messages are clipped to
-  `max_output_chars` (8000) before they enter history, middle elided. A 300 KB
-  grep result is archived as its first and last 4000 characters.
-
-So a window that has rolled over could see what the previous one *concluded* but
-not what it *did* — and re-did it. The journal is the other half: written as the
-turn runs, one block per round, holding every round's reasoning, every tool call
-and every tool result **untruncated**.
-
-```
-## turn 12 user  [16:03:58]
-## turn 12 round 1 reasoning  [16:04:02]
-## turn 12 round 1 tool_call exec call_a1b2  [16:04:02]
-## turn 12 round 1 tool_result exec call_a1b2 41822 chars  [16:04:09]
-## turn 12 resume 4 reasoning  [16:07:31]      ← a thinking pad, kept at last
-## turn 12 closing 5 text  [16:08:02]
-```
-
-**It is Markdown, not JSON, because of who reads it.** Nothing loads it back into
-a conversation; its readers are you at a shell and the model itself. And the
-model cannot use `read_file` on a file this size — that tool has no offset
-argument and truncates at `max_output_chars`, so a 400 KB archive comes back as
-2% of itself with the middle replaced by a marker. Telling a model to `read_file`
-something it can only ever see a fraction of is worse than telling it nothing: it
-looks, sees an elision, and concludes the detail is not there. One header per
-line, on the other hand, is reachable at any size:
+It is Markdown rather than JSON because of who reads it. The model cannot use
+`read_file` on a 400 KB archive — that tool has no offset and clips, so the
+archive comes back as 2% of itself — while one header per line is reachable at any
+size:
 
 ```bash
-grep -n '^## turn'      state/sessions/a3f91c2e_letsClaw_*.md   # contents
-grep -n 'tool_call exec' state/sessions/a3f91c2e_letsClaw_*.md  # every command run
-sed -n '820,900p'        state/sessions/a3f91c2e_letsClaw_*.md  # read one block
+grep -n '^## turn'       state/sessions/a3f91c2e_letsClaw_*.md   # contents
+grep -n 'tool_call exec' state/sessions/a3f91c2e_letsClaw_*.md   # every command run
+sed -n '820,900p'        state/sessions/a3f91c2e_letsClaw_*.md   # read one block
 ```
 
-That is exactly what the carryover block in the new window's system prompt tells
-the model to do, and what the `## The record on disk` rule in `base.md` tells it
-to do *before* starting any investigation the handoff does not already answer.
+That is what the carryover block in a fresh window tells the model to do, and what
+`base.md` tells it to do *before* starting any investigation the handoff does not
+already answer.
 
-The segment is stamped at its **first write**, not at construction, so a session
-nobody speaks in leaves nothing behind; a rollover closes it and the next turn
-opens the next one. Unlike the JSON archive the name *is* disambiguated with a
-`-2` suffix — a rollover closes one segment and opens the next within the same
-second as a matter of course, and a collision here would not overwrite the closed
-segment but silently append the new window to the end of it.
-
-Writes never raise. Losing the record is worth a log line, never a turn, and one
-failure closes the segment rather than warning once per block forever. Set
-`conversation.journal: false` to switch it off; `journal_max_block_chars`
-(default 1,000,000) caps a single block so that one runaway `cat` costs a
-megabyte rather than the volume.
-
-Every session carries a **`session_id`** — 8 hex characters, minted once, stored
-in its live file, unchanged by a rename. It leads the transcript filename, and
-it is also written inside each transcript and into `state/sessions/index.jsonl`,
-one JSON object per line:
-
-```json
-{"t":"archive","id":"a3f91c2e","name":"letsClaw","file":"a3f91c2e_letsClaw_2026-09-22T15-22-35.json","at":"…","model":"qwen38-local","messages":142}
-{"t":"journal","id":"a3f91c2e","name":"letsClaw","file":"a3f91c2e_letsClaw_2026-09-22T15-22-35.md","at":"…","model":"qwen38-local","blocks":387}
-{"t":"rename","id":"a3f91c2e","from":"letsClaw","to":"daq-notes","at":"…"}
-{"t":"archive","id":"a3f91c2e","name":"daq-notes","file":"a3f91c2e_daq-notes_2026-09-22T16-04-11.json","at":"…","model":"qwen38-local","messages":98}
-```
-
-With the id in the filename, the everyday lookup needs no index at all:
-
-```bash
-ls state/sessions/a3f91c2e_*                            # every archive, either name
-grep '"id":"a3f91c2e"' state/sessions/index.jsonl       # …plus when it was renamed
-```
-
-The index earns its place for what filenames cannot show: **a rename leaves no
-file**, so without the `rename` records a conversation that was renamed between
-two rollovers has a gap in its story. It also carries message counts, the model
-in use, and exact timestamps, so you can survey a session without opening a
-megabyte of JSON.
-
-JSON Lines rather than a JSON document, for three reasons: an append never
-rewrites what is already there, so two sessions archiving at the same moment
-cannot lose each other's entry; a torn write costs one line instead of the file;
-and it is greppable from the shell, which is how it is meant to be used.
-
-#### `logs/session_ID.log` — the registry of ids in use
-
-Tab-separated, one line per live session, rewritten in full on every change:
-
-```
-# session_id	name	created
-dbdb9e23	system	2026-09-22T15:46:30
-e19e3855	solaris daq	2026-09-22T15:46:30
-3d523676	letsClaw	2026-09-22T15:46:30
-```
-
-Tabs rather than spaces because session names contain them (`solaris daq`), and
-rewritten rather than appended because an id has to be able to *leave* — the file
-holds one short line per session, so there is nothing to gain by being cleverer.
-
-It does two jobs:
-
-- **Minting checks it.** 32 random bits already collide about once in 4.3 billion;
-  the registry is what turns that into *cannot happen*, which is worth having
-  because a collision would be silent — two conversations sharing an archive
-  prefix, with nothing to complain about it.
-- **It says what each id is.** A rename updates the name in place and keeps the
-  original creation time, so the registry never points at a conversation by a
-  name it no longer answers to.
-
-A deleted session's id is removed, returning it to the pool. Nothing on disk
-still carries it: the archives that named it are purged in the same breath, so
-a future session drawing the same id inherits nothing. (With 32 bits that draw
-is a ~1-in-4.3-billion event anyway, which is the remaining argument for the one
-case that can leave files behind — a purge that failed.)
-
-A live session file written before ids existed has none; it is assigned one at
-the next restart, registered, and persisted from then on.
-
-The index is a convenience over the transcripts, never a dependency — if writing
-it fails, the archive is still written and the failure only warns. `session_id`
-was added to the live-file payload *without* bumping `LIVE_SCHEMA`, because a
-bump makes `load_live` skip every file written before it; a session restored
-from an older file keeps the id minted at startup and persists it on its next
-save.
-
-The trigger reads the server's own `usage.prompt_tokens`, so the percentage is exact.
-Servers that withhold usage fall back to a local estimate carrying three separately
-fitted corrections — `PROSE_SCALE` for the encoding difference, `MESSAGE_FRAMING_TOKENS`
-per message, and the tool block measured from a reported `prompt_tokens` where one
-exists (`schema_cost()` as the fallback formula). Not one upward multiplier: the single
-`×1.6` this replaced read +34% on an empty window and +47% on a full one, because it
-applied a ratio to errors that were not ratios ([`docs/tokens.md`](docs/tokens.md)).
-The direction it does err in is deliberate — rolling over early costs a summary,
-rolling over late costs a rejected request. The `~` in the stats line marks an
-estimated figure.
+The numbers — the handoff's three caps, the digest's, what each costs, and the id
+registry under `logs/` — are in
+[`docs/architecture.md`](docs/architecture.md#rollover).
 
 ## Reasoning: the Notepad and the Answer Sheet
-
-### The picture
 
 Think of the model as a student at a desk with a **notepad** for working things
 out and an **answer sheet** for the reply you actually see.
@@ -849,559 +398,238 @@ sheet of paper for both. It works out the problem, and it writes the answer, out
 of the same allowance. Fill the sheet with working-out and you get no answer at
 all — just a wall of half-finished thought and a `finish_reason=length`.
 
-letsClaw gives it two separate things instead:
+letsClaw gives it two separate things instead: a **notepad** it can keep writing
+on for as long as it needs, and an **answer sheet** kept aside, untouched, until
+the thinking is done.
 
-- a **notepad** it can keep writing on for as long as it needs
-- an **answer sheet** that is kept aside, untouched, until the thinking is done
+A server will only ever generate so much in one request — that limit is
+`max_tokens`, and it is hard. So the core does the thinking in instalments. When
+a round fills its cap it keeps what was written, hands the whole pad back with
+the thought still **open**, and the model carries on from the exact word it
+stopped at rather than from the beginning. Each of those is a **resume round**,
+and you see them in the progress notices (`reasoning cut off — resuming it
+(round 2, pad ~320 tok)`). Because the thought is never closed in between, it
+reads as one continuous piece of reasoning, and you watch it stream live.
 
-### How the notepad works
+**There is no limit on how many resume rounds a turn may take.** What ends it is
+a real constraint — the clock, the context window, or the model having nothing
+left to add — never a count. When thinking does stop, the core closes the thought
+itself and only then asks for the answer, under its own allowance. Closing it does
+two jobs: past that mark the model *cannot* go back to thinking, so the budget is
+really separate; and a model left inside an open thought will often just keep
+thinking, so closing it is also what guarantees you get an answer.
 
-The catch is that a server will only ever generate `max_tokens` at a time. You
-cannot ask for one enormous uninterrupted thought; it is a hard per-request
-ceiling.
+**What you will notice**
 
-So the core does it in instalments. When a round fills its cap:
+- **A long think is visible.** It streams as it happens, dimmed and foldable,
+  with a running token count beside it.
+- **A hard question costs time, not quality.** The answer is not truncated to
+  make room for the thinking, because the thinking did not come out of the
+  answer's budget.
+- **A turn does not end empty.** However the thinking stops — out of time, out of
+  room, or out of ideas — the answer still gets written.
+- **The thinking does not fill up your conversation.** It is never added to the
+  history, so a twenty-minute think does not push a rollover any closer. It is
+  written to the [journal](#context-rollover-digest-journal), so it is still there
+  afterwards to grep.
 
-1. it keeps what was written (this is the part that used to be thrown away),
-2. hands the whole pad back to the model with the thought still **open**, and
-3. the model carries on from the exact word it stopped at — not from the
-   beginning.
+**The one setting people get wrong is `max_tokens`**, because its name suggests a
+budget for thinking. It is not — it is how much the model may write in *one*
+request, and the same thought simply continues in the next. Changing it changes
+how many round-trips a thought takes, not how far the thought can go. The other
+number people look for is a cap on total thinking, and there isn't one: what caps
+thinking is the room left in the window once the answer's share is held back, and
+the turn clock. Both are real limits; neither is a knob labelled "thinking".
 
-Each of those is a **resume round**, and you will see them in the progress
-notices during a turn (`reasoning cut off — resuming it (round 2, pad ~320
-tok)`). The notepad grows round by round, and because the thought is never
-closed in between, it reads as one continuous piece of reasoning rather than
-several restarts. You see it stream in live, exactly like a normal reply.
-
-**There is no limit on how many resume rounds a turn may take.** The notepad is
-effectively unbounded, and what ends it is a real constraint — the clock, the
-context window, or the model having nothing left to add — never a count.
-
-### How the answer sheet works
-
-When the thinking has to stop, the core closes the thought itself by writing
-`</think>`, and only then asks for the answer, under its own separate cap.
-
-Closing it is doing two jobs at once. It guarantees the budget really is
-separate — once the model is past that mark it *cannot* go back to thinking. And
-it guarantees you get an answer at all: a model left inside an open thought will
-very often just keep thinking and never come out on its own.
-
-### Thinking room and answer room
-
-These are the two budgets, and they are completely separate. That separation is
-the whole reason the core closes the thought itself before asking for a reply.
-
-```
-answer room    =  10% of what is still free,
-                  but at least 4,096 and never more than max_output_tokens
-                  (a fresh sheet, after the thinking is shut)
-
-thinking room  =  context_length − conversation − answer room − margin
-                  (everything left over in the window)
-```
-
-Note what is **not** in the second line: no setting caps the thinking
-directly. The notepad simply grows into whatever the window has spare.
-
-The answer sheet is sized from the room that is left rather than fixed at
-`max_output_tokens`, and the difference is large. A fixed 32,768 on a 100k
-window is a third of the context held back on *every* turn, including the
-empty ones — which put the pre-turn rollover at 61% of the window while the
-UI drew its first warning at 80% and the rollover tick at 90%. The rollover
-that actually fired did so 29 points before anything said it would.
-
-| setting | it is | it is **not** |
-|---|---|---|
-| `max_tokens` | how much one request may generate — a **chunk size** | a limit on how much the model may think in total |
-| `max_output_tokens` | the **ceiling** on the answer sheet — what the server will actually emit | the size of the sheet, nor a reservation taken on every turn |
-| `context_length` | the real ceiling on everything | per-request |
-
-Worked through with your `qwen38-local` settings, on a short conversation:
-
-| | |
-|---|---|
-| `context_length: 100000` | the whole window |
-| − conversation (say ~2,000) | question, history, tool results |
-| − answer room (9,800) | 10% of the 98,000 free; under the 32,768 ceiling |
-| − margin (2,000) | slack, since the token count runs low |
-| **= thinking room** | **~86,000 tokens** |
-
-Late in the same window the shares invert: at 95% full, 10% of what is free is
-500 tokens, the 4,096 floor takes over, and what is left after the margin is
-the answer sheet's real limit. By then the pre-turn gate is closing and the
-session rolls over.
-
-That gate trips on an **absolute** amount of free window — about 10,100 tokens
-— not on a percentage, so where it lands depends on how big the window is:
-
-| `context_length` | gate trips at about |
-|---|---|
-| 1,000,000 | 99% |
-| 262,144 | 96% |
-| 100,000 | 90% |
-| 32,768 | 69% |
-| 12,000 | 16% |
-
-On a 100k window it coincides with `rollover_at_percent: 90`, so the headroom
-wall and the rollover tick stop being two different walls — they used to sit 29
-points apart. On a small window it is still a much earlier second wall.
-
-At `max_tokens: 8192` that is roughly **eight** resume rounds — but eight is an
-outcome, not a setting. Shrink the conversation and it rises; fill history with
-tool results and it falls.
-
-Three things this catches people out with:
-
-- **Raising `max_output_tokens` mostly buys nothing.** It is a ceiling, and
-  the ceiling only binds where 10% of the free window is above it — on a 1M
-  context that share is ~100k tokens, so a model that emits at most 8,192
-  stays pinned there however the number is set. Lower it below ~10% of your
-  window and it does start costing thinking room, because then it is what the
-  answer sheet is sized to.
-- **`max_tokens` does not change how much the model can think**, only how many
-  round-trips it takes to get there. Smaller chunks are not cheaper: the pad is
-  re-sent every round, so halving `max_tokens` roughly **quadruples** the prompt
-  tokens processed. Its real value is finer-grained wall checks.
-- **Thinking room is a ceiling, not a reservation.** Nothing is pre-allocated;
-  a simple question answers on the first round and costs one request.
-
-See [When does the thinking stop?](#when-does-the-thinking-stop)
-
-```mermaid
-graph TD
-    Start["Ask the model\none request = max_tokens"] --> Fin{"What came back?"}
-    Fin -->|"an answer"| Answer([Answer])
-    Fin -->|"a tool call"| Tools[Run the tool] --> Start
-    Fin -->|"thinking that hit the cap,\nno answer yet"| Seed["Keep it —\nit becomes the notepad"]
-
-    Seed --> Wall{"Room to keep\nthinking?"}
-    Wall -->|"out of space,\nbut may condense"| Ckpt["Checkpoint: condense the old reasoning,\nkeep the tail word for word"]
-    Ckpt --> Wall
-    Wall -->|yes| Lap["Hand the notepad back,\nthought still open —\nmodel carries on mid-sentence"]
-    Lap --> LapFin{"How did it end?"}
-    LapFin -->|"more thinking,\ncap hit again"| Grow["Add it to the notepad"] --> Wall
-    LapFin -->|"it finished and answered"| Answer
-    LapFin -->|"nothing written —\nno progress"| Close
-    Wall -->|"no: out of time\nor out of space"| Close["Close the thought, then ask\nfor the answer on a fresh sheet\n= the answer reserve"]
-    Close --> CFin{"The conclusion is..."}
-    CFin -->|"an answer"| Answer
-    CFin -->|"an action"| Act["Run the tool\nnotepad has served its purpose"]
-    Act --> Start
-    Answer --> Hist["Answer is kept in history.\nNotepad leaves the conversation —\nbut is written to the journal."]
-```
-
-"Thrown away" means *out of the conversation*, not off the disk. Every round of
-it — each resume, each checkpoint — is appended to the session's
-[journal](#the-journal) as it happens, so a notepad that cost twenty minutes of
-thinking is still greppable afterwards even though the next prompt has no trace
-of it. The two are separate questions and the distinction matters: keeping the
-pad on disk costs nothing, while keeping it in history would re-send it every
-round and drag the rollover point forward.
-
-### Can it use tools while thinking?
-
-Not mid-thought, but yes at the end.
-
-**Mid-thought, no.** There is nowhere to put the result. A conversation has no
+**Can it use tools while it is thinking?** Not mid-thought — a conversation has no
 way to say *"here is what `exec` returned — now carry on inside the sentence you
-were halfway through"*. Calling a tool mid-thought would mean abandoning the
-notepad, which is the one thing this whole mechanism exists to protect.
-
-**At the end, yes.** By then the notepad has done its job: it worked out *what to
-do*. If the model's conclusion is an action rather than a sentence, the tool
-runs, and the turn carries on with the result in hand — thinking afresh from
-there if it needs to. Subject to the same room check as any other tool round.
-
-Two safety rails:
-
-- **A tool call that got cut off is never run.** Chopped-off arguments mean a
-  chopped-off command, and `rm -rf /tmp/scratch` truncated to `rm -rf /` is the
-  accident waiting to happen. The call is recorded as empty, the model is told it
-  was cut short, and the turn continues.
-- **On llama.cpp, tools are not offered at this stage at all**, because the
-  endpoint used for resuming returns plain text and cannot report a tool call
-  properly — you would just see raw `<tool_call>` markup. There the model is
-  asked for words instead, and any markup that shows up anyway is stripped out.
-
-### When does the thinking stop?
-
-Three things can call time on it. Whichever comes first, the answer still gets
-written — a turn never ends empty just because the thinking ran long.
-
-| what runs out | the model stops thinking when |
-|---|---|
-| **time** | the turn has been going for `turn_timeout` minus `answer_time_reserve`, so there is still time left to write the answer |
-| **space** | the notepad, the conversation so far, and the reserved answer sheet would together overflow the model's `context_length` |
-| **ideas** | a round comes back having written nothing, or stops without hitting the cap — the model has finished thinking |
-
-Note what is *not* on that list: a round count. There is no budget on how many
-times a thought may resume, because a count is not a limit the machine actually
-has. The first two are physics; the third is the model saying it is done.
-
-"Space" needs one sentence of explanation: the whole notepad is re-sent to the
-model on every round — that is *how* it remembers what it was thinking — so the
-notepad takes up room in the context window while the turn is running.
-
-The "ideas" row is also what stops the loop spinning. A round that hits the cap
-having produced no reasoning cannot grow the pad, so the space wall would never
-move and every further round would be identical; the core concludes instead.
-
-### Making the notepad effectively unlimited
-
-Of those three, only the space limit can be pushed back, and
-`max_pad_compactions` pushes it.
-
-When the notepad fills up, instead of stopping there the core asks the model to
-write a **checkpoint**: a note of every figure it has worked out, every
-assumption it made, and what is still to do. That note, plus the **last ~2,000
-tokens kept word for word**, becomes the new notepad — and off it goes again
-with room to spare. It is the same thing [Context Rollover](#context-rollover)
-does for a conversation that fills its window: keep the meaning, drop the bulk.
-
-Keeping that last bit word for word is the whole trick, not a detail. A summary
-of where the model *was* cannot be carried on mid-sentence. So the older
-reasoning gets condensed and the sentence it is actually in the middle of is
-left alone.
-
-Turn this on and thinking is limited by **time alone** — which is what the space
-limit was really standing in for. Set it to any **negative** number and there is
-no compaction budget at all; `0` already meant "never", so there was no spelling
-for "always" until there was. It is still bounded, just not by a count: the turn
-clock stops it, and a cycle that fails to make the notepad smaller stops it too.
-
-**It is off by default (`0`), on purpose.** Condensing loses detail, and for a
-calculation that carries exact numbers through many steps, finishing from a
-complete notepad usually beats carrying on from a summarised one — a lost
-intermediate value gives you a wrong answer that looks perfectly reasonable.
-Turn it up for work long enough that running out of room is the bigger risk.
-
-A checkpoint the model cannot write does not end the turn's thinking. The core
-keeps the last ~2,000 tokens and carries on — cruder than a real checkpoint,
-since the older reasoning is simply dropped rather than distilled, but the kept
-part is the sentence being carried on mid-stream, which is the part that had to
-survive word for word anyway. Only when even that cannot make the notepad
-smaller does it stop, and it stops by finishing from the whole notepad rather
-than losing it. The wording is yours to edit, under `## Checkpoint` in
-`models/base.md`.
-
-### What the notepad costs afterwards
-
-Nothing, in context. It lives in memory for the length of one turn and **never
-becomes part of the conversation** — only the answer does. So a long think does
-not bloat the history or bring a rollover forward.
-
-It does not vanish, though. Each round of it is appended to the
-[journal](#the-journal) as it is generated, which is the only record of it there
-has ever been: before that, a notepad that filled the context and produced one
-paragraph left nothing behind but the paragraph.
-
-The reverse problem is handled too. A conversation that has nearly filled its
-window still has room for one more exchange, but no room to *think* in — so with
-`rollover_before_think` the core rolls over **before** such a turn, rather than
-after one whose thinking got squeezed out. (Auto mode only; `ask` and `off` are
-never interrupted before a turn starts.)
-
-### The settings
-
-| setting (per model) | default | what it does |
-|---|---|---|
-| `max_tokens` | — | **one instalment** — how much the model may write in a single request. A chunk size, not a thinking budget |
-| `reasoning` | `true` | whether a cut-off thought is resumed at all (`false` turns the notepad off entirely) |
-| `max_output_tokens` | `32768` | the **ceiling** on the answer sheet — the most this server will write. Not a reservation; it only binds while 10% of the free window would exceed it |
-| `max_pad_compactions` | `0` | how many times a full notepad may be condensed so thinking can go on (`0` = stop and answer; **negative = no limit**) |
-| `turn_timeout` | `36000` | seconds one whole turn may take, thinking included (`0` = no limit) |
-| `answer_time_reserve` | `120` | seconds of that held back so the answer still gets written |
-| `resume_mode` | `auto` | how to resume a thought on this server — normally leave it alone |
-| `reasoning_effort` | unset | how hard to tell the model to think, if its template supports it |
-
-Rules of thumb: for **more thinking**, give the window more room — a shorter
-conversation, `digest_turns`, or a bigger `context_length`. For **fewer
-round-trips** covering the same thinking, raise `max_tokens`. For a **longer
-final answer**, raise `max_output_tokens`. For a **faster, shorter-thinking**
-model, lower `reasoning_effort`.
-
-`max_output_tokens` only does anything while 10% of the free window would
-exceed it. Below that threshold, lowering it buys thinking room and raising it
-buys answer; above it, the answer sheet is pinned at the 10%/4,096 figure and
-neither does a thing. See [reasoning.md](docs/reasoning.md) for the arithmetic.
-
-> Worth checking on llama.cpp: `reasoning_effort` defaults to **`xhigh`** there,
-> which quietly adds *"think carefully… validate key assumptions, consider
-> plausible alternatives"* to every request. That alone causes a good share of
-> the rounds that fill up without an answer. `medium` adds nothing at all.
-
-`turn_timeout` also sets the network read timeout, because the client's own
-600-second default would otherwise drop a long request at the socket before the
-model had finished. If the wall is hit mid-request the turn is cancelled exactly
-as `/stop` would do it — the conversation is repaired and saved.
-
-### Which servers can do this
+were halfway through"*, and calling a tool would mean abandoning the notepad,
+which is the one thing this mechanism exists to protect. At the end, yes: the
+notepad has already worked out *what to do*, and if that is an action rather than
+a sentence, the tool runs and the turn carries on with the result in hand.
 
 Resuming a thought means asking the server to *continue* a half-written reply
-instead of starting a new one. Not every server exposes that, so
-`resume_mode: auto` tests yours once and picks the right method:
+rather than start a new one, and not every server exposes that. The core tests
+yours once and picks the right method; `/info` reports what it found. If a server
+can do neither, the core falls back to telling the model *"you ran out of room,
+answer now"* and asking again from scratch — which throws the thinking away, and
+is a fallback and nothing more.
 
-| server | method |
-|---|---|
-| vLLM, SGLang | `continue_final_message` on the normal chat endpoint |
-| llama.cpp | its raw `/completion` endpoint, with the prompt built by `/apply-template` — its chat endpoint ignores a half-written reply |
-
-If a server can do neither (or you set `resume_mode: off`), the core falls back
-to the old approach: it tells the model *"you ran out of room, answer now"* and
-asks again from scratch. That throws the thinking away — it is exactly what the
-notepad was built to avoid, so it is a fallback and nothing more.
+The arithmetic — how the answer's share is worked out, which cap binds which kind
+of round, the eight distinct ways thinking can stop, what a checkpoint does when
+the pad fills the window, and how each server's dialect is parsed off the wire —
+is in [`docs/reasoning.md`](docs/reasoning.md). The per-model keys are commented
+in [`config.example.yaml`](config.example.yaml).
 
 ## Token Counting
 
-The `⚡` line after every turn carries three different numbers, and they answer
+The `⚡` line after every turn carries four different numbers, and they answer
 different questions:
 
 | | |
 |---|---|
 | `user N + LLM N tok` | the sizes of the question and of the final answer |
-| `out N tok` | **everything the model generated** this turn — the answer, the thinking, and the arguments of every tool call, summed across all rounds of the agent loop. This is what a metered endpoint bills |
+| `+ reasoning N tok` | what the thinking cost, this turn (absent when there was none) |
+| `out N tok` | **everything the model generated** this turn — the answer, the thinking, and the arguments of every tool call, across all rounds. This is what a metered endpoint bills |
 | `context N/N` | how full the window is, i.e. what the *next* prompt will cost |
 
-`context` measures the message list that is sent to the model, plus the tool
-schemas — not what has been written to disk. That is why a long thinking round
-does not move it (reasoning never enters the message list) while one verbose
-tool result does, and why `/info` and `docs/design-principles.md` call that
-list `history` even though the durable record is somewhere else entirely.
+Two of those behave in ways that surprise people:
 
-That also makes `context` the one number that can go *down* at the end of a
-turn, which it does when
-[`digest_turns`](#collapsing-a-finished-turn-digest_turns) is on: the turn's
-tool traffic leaves the message list while staying on disk in full. The digest
-that replaces it is counted like any other message — the collapse is visible
-in the conversation and in this figure, never a silent subtraction.
+- **`context` can go *down* at the end of a turn.** It measures the message list
+  that is sent to the model plus the tool schemas — not what is on disk. With
+  [`digest_turns`](docs/architecture.md#digest) on, a turn's tool traffic leaves
+  that list while staying on disk in full, so the number drops. The digest that
+  replaces it is counted like any other message: the collapse is visible in the
+  conversation and in this figure, never a silent subtraction.
+- **A long thinking round does not move `context` at all**, because reasoning
+  never enters the message list — while one verbose tool result moves it a lot.
+  That asymmetry is the whole reason the notepad is affordable.
 
-`out` is read from the server's `usage.completion_tokens`, and only when **every**
-round of the turn reported one — a partial sum would look exact while missing rounds.
-Otherwise it is a local estimate and carries a `~`, independently of the `~` on the
-context figure: the prompt side and the output side can be measured or estimated
-separately.
+**A `~` in front of any of them means the number is letsClaw's own estimate
+rather than a figure the server reported.** The estimate is calibrated and usually
+within about 1%, but it is an estimate. Once the server reports a size for the
+current window the `~` drops away; rebuilding a window (`/rollover`, `/clear`,
+`/new`) discards the measurement, so it returns until the next turn.
 
-The `~` on `context` means the same thing everywhere it appears, `/info` included:
-the figure is the local estimate rather than a count the server reported. The
-estimate is calibrated — `PROSE_SCALE` corrects the encoding difference, and the
-tool block is measured from a reported prompt size where one exists and falls
-back to a formula where none does — but it is still an estimate. Once the server
-has reported a
-`prompt_tokens` for the current window, that count is what gets shown and the `~`
-drops away. This matters beyond cosmetics — it is also the figure the pre-turn
-thinking-headroom check works from, so spending the pad when the real number is known
-rolls sessions over on context that was never there. A window rebuild (`/rollover`,
-`/clear`, `/new`) discards the measurement along with the window, so the `~` comes
-back until the next turn.
+`/info` reports what the server was *probed* to do rather than what the config
+assumes: whether thinking arrives in its own field or mixed into the answer, the
+window the server was actually started with, and whether it reports usage at all.
+Anything that disagrees with your config is said once, as a warning, on the
+session's first turn — because a `context_length` larger than the server's real
+window, and a server returning thinking as answer text, are both otherwise silent
+and both corrupt the numbers above. The probe costs one tiny completion per model,
+once.
 
-Which of the two you are getting is not a guess. `/info` carries a `🛰️` line
-reporting what the server was **probed** to do rather than what the config
-assumes of it: whether thinking comes back in its own field or inline in the
-answer, the window the server was actually started with, and whether usage is
-reported at all. Anything that disagrees with the config is also said once, as
-a warning, on the session's first turn — a `context_length` larger than the
-server's real window, or a server returning thinking as answer text, are both
-otherwise silent and both corrupt the figures above. The probe costs one tiny
-completion per model, once, and a server that cannot answer it is reported as
-unknown rather than allowed to fail a turn.
-
-Beside it, `(N this session)` is a running total, also shown by `/info`. It is an
-odometer, not a gauge: it counts what the session has ever generated, so `/clear` does
-not rewind it and it comes back with the session after a restart. Deleting the session
-is what resets it. A turn that still produces no answer — rare now that reasoning is
-resumed rather than discarded, but possible if even the closing round comes back
-empty — says what it spent anyway, so the cost is never invisible.
+What each figure is worth, which are the server's truth and which are estimates,
+and how far off the estimates run: [`docs/tokens.md`](docs/tokens.md).
 
 ## The Core
 
 Start `./serve.sh` once; clients come and go around it.
 
-| | |
-|---|---|
-| `GET /health` | liveness, the core's version, and the protocol version |
-| `GET /models` | configured models, and the state of any ssh forwards |
-| `GET /sessions` | live sessions: model, message count, attached clients, busy |
-| `GET /sessions/<name>/history` | the tail of one conversation, newest last — `?limit=` messages (10 by default), system message omitted. Capped on purpose: a switch digest wants the last few lines, not a slow copy of everything |
-| `POST /sessions/<name>/rename` | `{"to": "..."}` — same conversation, different name |
-| `DELETE /sessions/<name>` | forget one — the history is discarded, nothing is written |
-| `POST /reload` | re-read `config.yaml` into the running core; `400` and no change if it will not load |
-| `GET /config` | the live config for the Settings panel, with `core.token`, `discord.token` and every `models.<name>.api_key` replaced by a placeholder — redacted rather than dropped, so the panel can still tell "set" from "unset" |
-| `POST /config` | save `{"webui": {…}}` back into `config.yaml` and apply it. Only that section is accepted: it is the one a browser has any business editing, and the only one whose change needs no restart |
-| `GET /theme.css` | the `webui.pin` styling as CSS custom properties, generated from the config so `/reload` re-themes without a restart |
-| `GET /files` | what is in `webui.files_dir`, for the WebUI's Media panel: `{name, size, mtime, type}` per entry, newest first, capped at 500 with `total` and `truncated` beside them. Top level only — the read route below will serve `sub/deep.png`, but the renderer refuses any `src` with a slash in it, so a nested file is one no answer could ever display |
-| `GET /files/<name>` | an image the agent wrote into `webui.files_dir`, for the WebUI to show inline — see [WebUI](#webui) |
-| `DELETE /files/<name>` | remove one picture from `webui.files_dir`. Token **and** same-origin, like the other writes; `403` when `webui.files_delete` is off |
-| `WS /ws?session=<name>` | the live stream |
-| `GET /` , `GET /static/*` | the WebUI, from `web/` |
+Everything is on **one port** — the WebUI and the API share `core.port`, so there
+is nothing to open separately. A client sends `submit`, `command`, `stop`,
+`steering`, `rollover_reply` or `ping`, and the core answers with a stream of
+named events plus a `response` to whoever asked. The full route list, the query
+parameters, every event and the replay rules are in
+[`docs/protocol.md`](docs/protocol.md).
 
-The socket takes four query parameters. `session` is the name to attach to,
-created on demand. `last_seq` replays what was missed while detached.
-`reasoning=0` withholds the thinking text for a client that will never draw it
-(the Discord bot sets it; the running token count still comes through).
-`model=<name>` picks the model **only when this attach is what creates the
-session** — re-attaching never switches a live one, since that would move the
-conversation out from under anyone else attached to it.
+**Sessions** are created on demand by name — `terminal`,
+`discord-987654321098765432`, whatever a client asks for. Each has its own
+history, model and rollover state; `/model` in one does not disturb another.
+Each is written to `state/live/` after every turn and reloaded before the first
+request is served, so the most a crash can cost is the turn that was still
+running — a half-finished turn is never written. Nothing expires: a session stays
+until you delete it, and `/clear` keeps the session while emptying it, which is
+the difference between throwing away a conversation and throwing away the session.
 
-Client → core messages are `submit`, `command`, `rollover_reply`, `stop`,
-`steering` and `ping`. `submit` may carry an `origin` naming who is speaking, for a client
-where the session name does not say: the Discord bot sends
-`discord:<username>`, so one channel's shared session still records who typed.
-It is clamped to 64 characters and falls back to the session name.
-
-When `core.token` is set every route above needs it — as `Authorization: Bearer <token>`
-or `?token=` — **except** `GET /health`, which stays open so a monitor can check
-liveness without holding the secret, and the WebUI itself (`GET /`, `/static/*` and the
-generated `/theme.css`), which holds no secrets and is the thing that asks for the
-token. `GET /files/<name>` is the one route that takes the token *only* by query
-parameter, because it is fetched by the browser's own `<img>` loader, which cannot be
-given a header. The listing and the delete beside it take a header like everything
-else — they are called from `fetch`, which can send one. Each client carries it its own way: the WebUI in the
-token gate (kept in the browser's `localStorage`), the Discord bot from `core.token` in
-the config it loads (or `discord.core_token` when it runs elsewhere), and the terminal
-client from `--token`, the `CLAW_TOKEN` env var, or — when it runs on the same machine
-as its core — the `core.token` in the local `config.yaml`, so a local attach needs no
-extra step. A terminal client pointed at a core whose token it cannot see is told exactly
-that, with the two ways to pass one.
-
-A token is not what keeps a web page out, though, because on loopback there is often no
-token to keep it out with. That job belongs to two headers, and it takes both. A browser
-attaches `Origin` to every cross-origin request and to the WebSocket handshake and cannot
-forge it, so an `Origin` that does not name this very server is refused; a client that
-sends none at all — the terminal, the bot, `curl` — is unaffected, because the attack being
-closed is specifically a browser and a browser always tells us. On its own that only says
-the browser agrees with itself: it is compared against `Host`, and `Host` comes from the
-client too, so a page served from a domain whose address has been re-pointed at `127.0.0.1`
-sends a matching pair perfectly honestly. So every route except `GET /health` must also
-carry a **`Host` this machine actually answers to** — loopback, the `core.bind` address,
-the hostname and FQDN, and whatever those resolve to. A nameserver can point any name
-here; it cannot add that name to the allowlist. If something in front of the core forwards
-a name the core has never heard of — a reverse proxy — list it in **`core.allowed_hosts`**,
-which is read per request and so needs only a `/reload`. Both refusals are a `403` with
-the reason, and a line in the log saying which header it was.
-
-**Sessions** are created on demand by name — `terminal`, `discord-987654321098765432`,
-whatever a client asks for. Each has its own history, model and rollover state; `/model` in one
-does not disturb another, because engines are shared per model and never closed
-underneath a session still using them.
-
-**Sessions survive a restart.** Each one is written to `state/live/` as a single JSON
-file after every turn and again on a clean stop, and reloaded before the first request
-is served — so the sidebar is right on its very first paint, with no client having
-attached yet. The file is replaced by an atomic rename, so a `kill -9` mid-write leaves
-the previous good copy rather than a truncated one, and the most a crash can cost is the
-turn that was still running. A half-finished turn is never written: an unanswered tool
-call or an unanswered question is unwound before saving, so what comes back is always a
-conversation you could pick up.
-
-Nothing expires. A session stays on disk until you delete it, at which point its file
-goes with it; renaming moves the file, and a name you attached to but never spoke in is
-never written at all. `/clear` keeps the session and empties it, which is the difference
-between throwing away a conversation and throwing away the session.
+**Because the core outlives its clients**, closing a terminal mid-answer does not
+stop the turn. Reattach and the output you missed is replayed. One turn at a time
+per session: a second submit is refused with `busy` rather than silently queued
+behind a context its sender never saw.
 
 ### Reloading config
 
 `POST /reload`, the `/reload` command, or **♻️ reload** in the WebUI re-reads
-`config.yaml` and applies it to everything already running — no restart, no dropped
-socket, no interrupted turn.
+`config.yaml` and applies it to everything already running — no restart, no
+dropped socket, no interrupted turn.
 
-**Nothing is committed until the new file parses and produces a working engine for every
-model in it.** A half-finished edit — the normal state of a file open in an editor —
-comes back as `400` with the parser's own complaint, and the core carries on exactly as
-it was. Building the engines *is* the validation: it is the same code path a real turn
-takes, so it catches a missing `base_url` that a schema check would wave through.
+**Nothing is committed until the new file parses and produces a working engine
+for every model in it.** A half-finished edit — the normal state of a file open in
+an editor — comes back as `400` with the parser's own complaint, and the core
+carries on exactly as it was. Building the engines *is* the validation: it is the
+same code path a real turn takes, so it catches a missing `base_url` that a schema
+check would wave through. The reply then names what moved, key by key
+(`models.qwen38-local.context_length: 100000 -> 128000`), so a reload says what it
+did rather than only that it happened.
 
-Three tiers:
+**Most settings apply on reload** — every key in every model entry, added and
+removed models, the behavior files, the tool allowlist, everything under
+`conversation:` and `logging.level`. Only three kinds need a restart: where the
+core listens (`core.bind`, `core.port`), the keys that size the log files, and —
+on the bot's side — everything in `discord:` except its allowlist. **`/restart`
+applies the core's restart-only keys from any client** (below), so that is no
+longer a trip to the core's host; the `discord:` half needs the *bot* restarted,
+which `/restart` does not touch.
 
-| | |
-|---|---|
-| **Live already** | `core.token`, `core.allowed_hosts`, the `state/` paths, and the model list `GET /models` serves — these are read per request, so the reload is what updates the file, not what plumbs it through |
-| **Reload picks it up** | **every setting in every model entry** — the engines are rebuilt from scratch, so `context_length`, `base_url`, `provider_name`, the sampling parameters, and all of the reasoning settings (`reasoning`, `max_tokens`, `max_output_tokens`, `max_pad_compactions`, `turn_timeout`, `answer_time_reserve`, `resume_mode`, `reasoning_effort`) come across; added and removed models; behavior files including `base.md`; the tool allowlist and `exec_timeout`; every `conversation.*` setting; `logging.level`; and, in the bot's own process, the Discord allowlist (`discord.users`, `mention_only`, `mention_list`) — see [Discord Client](#discord-client) |
-| **Restart-only** | `core.bind` and `core.port` — the socket is already bound, and rebinding drops every client, which is the thing being avoided — and the three keys that are read once when the log handlers are installed: `logging.file`, `logging.max_bytes`, `logging.backups`. **`/restart` applies these from any client** (see below); it is no longer a trip to the core's host. On the bot's side, **everything in `discord:` except the allowlist trio above** — `enabled` (`serve.sh` reads it before deciding to launch at all), the three that say *where* the bot logs in (`token`, `core`, `core_token`), and the four it reads once when it builds its `Settings` (`idle_detach_min`, `max_lines`, `show_tools`, `auto_names`). All of them restart the *bot*, which `/restart` does not touch — the bot is a sibling process, so restart it yourself |
+Two behaviours are easy to mistake for a reload that did not work:
 
-An idle session takes the change immediately; one mid-turn takes it the moment that turn
-ends, and the reply says how many of each. **A setting a session changed for itself is
-left alone** — the test is whether it still holds what the *old* config said, so a
-session that auto-disabled its own rollover is not dragged back into the loop it just
-escaped. A model deleted from the config does not move the sessions using it: they keep
-the engine they have, which still works, and are told that `/model` can no longer return
-to it.
+- **A session mid-turn takes the change when its turn ends**, not during it. The
+  reply says how many sessions were applied and how many are waiting.
+- **A setting a session changed for itself is left alone.** If a session turned
+  its own rollover off, a reload will not quietly turn it back on.
 
-The reply names what moved, key by key
-(`models.qwen38-local.context_length: 100000 -> 128000`), so a reload says what it did
-rather than just that it happened.
+Every key and which tier it sits in — a key can only move between tiers by
+someone changing where it is read — is tabulated in
+[`docs/architecture.md`](docs/architecture.md#which-key-is-in-which-tier).
 
 ### `/restart` — for the keys reload cannot reach
 
-`/restart` restarts the core process itself, from any client, which is what the
-restart-only tier needs and used to mean a shell on the core's host.
+`/restart` restarts the core process itself, from any client. It is **the same
+process afterwards** — the PID does not change, so systemd never sees a service
+that stopped — and conversations are saved on the way down and restored on the way
+up. Every client is disconnected for about a second; the WebUI and the bot
+reconnect on their own, and **the terminal does not** — it says so and exits, so
+run it again.
 
-It is **the same process afterwards**: the core `execv`s over itself, so the PID
-does not change, `serve.sh`'s `wait` keeps waiting and systemd never sees a
-service that stopped. Conversations are persisted on the way down and restored
-on the way up. Every client is disconnected for roughly a second; the WebUI and
-the Discord bot reconnect on their own, and the terminal client does not — it
-prints that the core is restarting and exits, so run it again.
+**The Discord bot is not restarted.** It is a sibling process, not a child of the
+core, and it survives the whole thing: editing `discord_client.py` and typing
+`/restart` runs none of what you just wrote. That needs `serve.sh` restarted.
 
-**The Discord bot is not restarted.** It is a sibling process started by
-`serve.sh`, not a child of the core, and it survives the whole thing. Editing
-`discord_client.py` and typing `/restart` runs none of what you just wrote; that
-needs `serve.sh` itself restarted.
+It refuses in two cases — **a turn is running anywhere** (not only where you typed
+it; `/restart force` goes ahead and those turns are lost), and **a config that
+would stop the next core from booting**. The second matters more than it looks: a
+restart onto a broken config is not a failed restart but a core in a restart loop,
+and `/restart` is exactly what you reach for just after editing the config. How it
+is armed, and how it declines to come back if you stop the service in the instant
+between the reply and the exit, is in
+[`docs/architecture.md`](docs/architecture.md#restart--for-the-keys-reload-cannot-reach).
 
-Two refusals, both before anything is armed:
+## Security
 
-- **A turn is running**, anywhere, not just where you typed it. The reply names
-  the sessions. `/restart force` goes ahead and those turns are lost.
-- **`config.yaml` would not load, or would stop the core booting** — a port that
-  is not a number, or a non-loopback `bind` with no `core.token`. This matters
-  more than it looks: `serve.sh` hands the core's exit status to a unit with
-  `Restart=on-failure` and no `StartLimitBurst`, so a restart onto a broken
-  config is not a failed restart but a core in a loop. And `/restart` is exactly
-  what you reach for just after editing the config.
+Tools are unconfined by design: `exec` runs shell commands and `read_file` /
+`write_file` reach any path this process can. **Anyone who can open a WebSocket
+to the core can therefore run commands on this machine.** That is what makes an
+agent useful, and it is not sandboxed, because a sandbox around a tool that
+exists to work on your real files would remove the point.
 
-A `systemctl stop` or a Ctrl-C arriving in the fraction of a second between the
-reply and the exit wins: the core stays stopped rather than coming back from a
-stop nobody could then undo.
+So the boundary is the network, and there are two knobs:
 
-**Because the core outlives its clients**, closing the terminal mid-answer does not
-stop the turn. Reattach and the output you missed is replayed, then the conversation
-carries on. One turn at a time per session: a second submit is refused with `busy`
-rather than silently queued behind a context its sender never saw.
+- Keep **`core.bind`** on loopback (the default) — then only processes on this
+  machine can reach it.
+- Or set **`core.token`** — then every route and every socket needs the secret,
+  and you can put a frontend in front of it. Each client finds the token its own
+  way: the browser in a prompt it remembers, the terminal from `--token` or
+  `CLAW_TOKEN`, or from the local `config.yaml` when the core is on the same
+  machine. `/health` and the WebUI page itself are the two exceptions — a monitor
+  should be able to check liveness without holding the secret, and the page holds
+  no secrets and is the thing that asks for it.
 
-**Events** (core → client): `hello` `turn_start` `text` `reasoning`
-`reasoning_stat` `tool_call` `tool_result` `stats` `turn_end` `steering`
-`rollover_start` `rollover_ask` `rollover_done`
-`session_state` `notice` `busy` `error` `response` `pong`.
-**Messages** (client → core): `submit` `command` `rollover_reply` `stop`
-`steering` `ping`.
+Binding to a non-loopback address with no token is refused at startup for exactly
+this reason.
 
-There is no attach message: the session name is a query parameter on the socket, and
-`hello` — the first event on every connection — carries the snapshot back. So attaching
-is a connection, not a handshake, and reconnecting is the same operation as connecting.
+**A token is not what keeps a hostile *web page* out**, because on loopback there
+is often no token to keep out with. That job falls to two HTTP headers a browser
+cannot forge: the request must come from this very origin, and it must be
+addressed to a name this machine actually answers to. The second half is what
+closes DNS rebinding — a page on a name re-pointed at `127.0.0.1` sends a
+perfectly honest origin pair, so the core checks the address rather than the
+header alone. Something in front of the core that forwards a name it has never
+heard of — a reverse proxy — goes in `core.allowed_hosts`, which needs only a
+`/reload`. Which routes each check covers, and what a refusal looks like, is in
+[`docs/protocol.md`](docs/protocol.md).
 
-`tool_call` is emitted *before* the tool runs, so a slow `exec` is visible instead of
-silent. Read-only commands (`/info`, `/behavior`, bare `/model`) come back as a
-`response` to the asking client only, not broadcast to everyone attached.
+**Note what the Discord bot does to that boundary.** It is a local process, so a
+loopback-bound core does not keep *it* out — it *bridges* the core to anyone who
+can send the bot a message, which by default is everyone on Discord. Running the
+bot means the allowlist in `discord.users`, not `core.bind`, is what stands
+between a stranger and a shell on this machine. It ships empty, which refuses
+everybody. Fill it in deliberately — see [Discord Client](#discord-client).
 
-> **Security.** Tools are unconfined by design: `exec` runs shell commands and
-> `read_file`/`write_file` reach any path this process can. Anyone who can open a
-> WebSocket to the core can therefore run commands on this machine. Keep `core.bind`
-> on loopback, or set `core.token`, and only connect frontends you control.
->
-> Note what the Discord bot does to that last sentence. It is a local process, so
-> a loopback-bound core does not keep it out — it *bridges* the core to anyone who
-> can send the bot a message, which by default is everyone on Discord. Running it
-> means the allowlist in `discord.users`, not `core.bind`, is what stands between
-> a stranger and a shell here. See [Discord Client](#discord-client).
+## Commands you can type
 
-## Terminal Client
-
-`./terminalUI.sh` is a thin client: it renders events and sends `submit` / `command` /
-`rollover_reply` / `stop`, and holds no conversation state of its own. Two flags —
-`-s/--session` picks the session name (default `terminal`), `--url` points at a core
-somewhere other than the `core.bind`/`core.port` in the config, and `--token` passes the
-shared secret when the core wants one (or set `CLAW_TOKEN`; a client on the same machine
-picks the token up from the local `config.yaml` on its own).
+Every client understands these; three are handled by the window itself rather
+than sent to the core (`/quit`, `/exit`, `/reasoning`).
 
 | command | |
 |---|---|
@@ -1416,8 +644,12 @@ picks the token up from the local `config.yaml` on its own).
 | `/stop` | interrupt the turn in progress |
 | `/steering <text>` | send a correction *into* the turn in progress — the model picks it up at the next round, and it enters the history as the ordinary user message it is. Refused when nothing is running, rather than held over for the next turn |
 | `/reload` | re-read `config.yaml` into the running core |
-| `/restart` | restart the core process, in place and keeping its PID — the only way to apply the restart-only keys. Refused while a turn is running anywhere; `/restart force` goes ahead and loses those turns. This client has no reconnect, so it says so and exits |
+| `/restart` | restart the core process, in place and keeping its PID — the only way to apply the restart-only keys. Refused while a turn is running anywhere; `/restart force` goes ahead and loses those turns. The terminal has no reconnect, so it says so and exits |
 | `/quit` , `/exit` | leave — the core keeps running, and so does the turn |
+
+Discord adds `/session [name]`, which points a channel at a different session;
+the terminal and the browser pick their session when they attach, so they have no
+use for it. `/steering` is the other way round — terminal and browser only.
 
 **Three ways to end a window**, and the difference is how much of the past goes
 with it. `/clear` forgets the conversation and leaves every archive alone.
@@ -1428,338 +660,103 @@ deletes every transcript and journal this session has written, matched on its
 session id so no other session's files can be caught. There is no undo, which
 is why it is `/new` and not `/clear` — the reflexive keystroke is the safe one.
 
-**Tab completes** commands, and model names after `/model `. The completion list prints
-each command with its description rather than a bare column of names. `/quit`, `/exit`
-and `/reasoning` are handled in the terminal — they change this window, not the
-conversation — so they never reach the core; everything else is a `command` message and
-comes back as a `response` to this client alone.
+A command's reply goes back **to the client that asked**, never broadcast: a
+read-only `/info` never appears in anyone else's stream, while everything the
+*model* does is seen by everyone attached.
 
-Readline needs a blocking read, so input runs on its own thread and is fed to the event
-loop through a queue: the prompt stays editable while an answer streams in above it.
+## Terminal Client
+
+`./terminalUI.sh` opens a conversation in a terminal window. It is a thin client:
+it renders what the core sends and types what you send, and holds no conversation
+of its own — close it and the turn carries on.
+
+```bash
+./terminalUI.sh                              # the `terminal` session
+./terminalUI.sh -s daq-notes                 # a different session
+./terminalUI.sh --url http://lab-box:8770    # a core on another machine
+```
+
+`-s/--session` picks the name, `--url` points somewhere other than the address in
+the config, and `--token` passes the shared secret (or set `CLAW_TOKEN`). A client
+on the same machine as the core reads the token out of the local `config.yaml` by
+itself, so you usually need none of these. Tab completes commands, and model names
+after `/model `.
+
+**Ctrl-C stops the turn in flight** rather than closing the window — the same as
+typing `/stop` — and leaves whatever you had half-typed still on the line. At an
+idle prompt it leaves the way `Ctrl-D` does, core still running. Closing the
+terminal *window* is the different thing: that drops the connection and the turn
+goes on without you.
+
+This is the least robust of the three windows, deliberately: it does not reconnect.
+If the core restarts, run it again — the WebUI and the bot both come back on their
+own. The flags, the readline thread and why Ctrl-C works the way it does:
+[`docs/clients.md`](docs/clients.md#terminal--sourcechatpy).
 
 ## WebUI
 
-<http://127.0.0.1:8770/> — three static files (`index.html`, `app.js`, `style.css`)
-plus the vendored KaTeX in `web/vendor/`, served by the core. No framework, no build
-step, no CDN: the core often sits on an isolated lab network, so everything the page
-needs comes from the core itself — which is why KaTeX is a checked-in copy rather than
-a CDN link. The `/static/` route serves the whole `web/` directory, which used to
-mean the test helpers (`test_md.mjs`, `browser_test.py`, `shot.py`) were reachable
-under it too; they now live in `tests/`, which the core does not serve, so the
-directory holds only the three files and the vendored KaTeX.
+<http://127.0.0.1:8770/> — everything the terminal does, plus three things:
 
-**The sidebar** on the left is the session list, rebuilt from `GET /sessions` rather
-than tracked locally, so a session someone started in another window shows up here
-too. Each row carries its message count, a dot while a turn is running, and `✎` and
-`✕` on hover; `+` opens a name field, and switching to a name that does not exist yet
-*is* how you create it — sessions spring into existence on attach. `☰` hides the list,
-and `?session=<name>` still picks one from the URL.
+- **A session sidebar.** The list is rebuilt from the core every few seconds, so a
+  session someone started in another window shows up here too. `+` creates one,
+  `✎` renames one in place — same conversation, and anyone attached follows it —
+  and `✕` discards the conversation *and every file it wrote*, asking first and
+  saying how much is about to go.
+- **Foldable thinking.** `🧠 think` has three states — off, folded, open — and each
+  block can be opened on its own. A folded block still shows what it cost.
+- **Two panels:** ⚙️ **Settings**, which shows every parameter in `config.yaml`
+  (secrets never shown at all) and edits the `webui` section live; and 🖼️ **Media**,
+  a grid of every picture the agent has made.
 
-`✎` (or a double-click on the name) **renames in place** — same session object, same
-conversation, same socket; only the label moves. Anyone attached is told over their
-own socket and follows it, URL included, so a reload lands on the same conversation.
-Blank names, names containing `/`, and names longer than 64 characters are refused
-(400), as is a name already in use (409). Like delete, it is refused while a turn is
-running: every event is stamped with the session's name, so a rename mid-turn would
-split one turn's output across two names. Transcripts already archived under `state/`
-keep the old name in their filename — they record what the session was called then.
+Answers render as markdown with copyable code blocks, maths renders through the
+KaTeX the core serves itself, the agent can show you an image it made (there is no
+upload — pictures go agent → you), `/` triggers command autocomplete, and the
+context gauge marks the rollover threshold. Nothing is rendered optimistically:
+your own message appears when the core echoes it back, so every window on a session
+shows the same transcript in the same order. It reconnects with backoff and replays
+what you missed, so closing the laptop mid-answer loses nothing.
 
-`✕` **discards the conversation and every file it wrote**, so it asks first and
-tells you how many messages are about to go. Along with the live conversation go
-all of this session's archived transcripts and journals under `state/sessions`,
-matched on its id rather than its name so that anything written before a rename
-goes too; the reply says how many files that was. It is refused (409) while a
-turn is running, since dropping the session out of the registry would not stop
-the turn. Anyone attached to a deleted session keeps their socket: they get a
-notice, and their next message transparently lands on a fresh, empty session of
-the same name. What survives is `models/sessions/<name>.md`, which is authored
-input rather than state and belongs to the name, not the conversation.
-
-Everything the terminal client can
-do is there: streaming answers with markdown and copyable code blocks, tool calls
-appearing *before* they run, the context gauge with the rollover threshold marked,
-the `🧠 think` control, the rollover prompt with its live countdown, and the same
-slash commands with `/`-triggered autocomplete.
-
-The thinking is the one place it does more than the terminal. `🧠 think` has
-three states rather than two — off, shown folded (`▸`), shown open (`▾`) —
-cycled by clicking it or by a bare `/reasoning`, and `/reasoning off`,
-`/reasoning collapsed` or `/reasoning expanded` jumps straight to one. The
-setting decides how a *new* block of thinking arrives; each block is a
-`<details>` the reader can open or shut on its own from there, and changing
-the setting reaches the blocks already on screen too. A folded block still
-shows what the think cost, because the `🧠 thought … tok in …s` stamp rides in
-the summary. Like the rest of the WebUI's per-browser preferences it lives in
-`localStorage` (`letsclaw.reasoning`), so it is per browser, not per session.
-
-Two things worth knowing about how it behaves:
-
-- **Nothing is rendered optimistically.** Your own message appears when the core
-  echoes it back in `turn_start`, so every client attached to a session shows the
-  same transcript in the same order — including yours.
-- **It reconnects on its own** and replays the session history on attach, so closing
-  the laptop mid-answer loses nothing.
-
-If `core.token` is set the page asks for it before connecting. The page itself is
-served unauthenticated on purpose: it holds no secrets, and it is the thing that
-asks for the token.
-
-**Pictures.** The agent can show you an image it made. Anything written into
-`state/files/` (or `webui.files_dir`) is served at `/files/<name>`, and an answer
-containing `![a plot](run42.png)` renders it inline — click to see it full size.
-Only a flat filename with an image extension is accepted: a remote URL, a `data:`
-URL, a subdirectory, a traversal and a symlink pointing out of the root are all
-refused, by the renderer and again by the route, because this is the one path that
-turns model output into a filesystem read. A src that is refused is shown as its
-own literal text rather than quietly dropped, and a file that is not there becomes
-a visible note instead of a broken-image icon. There is no upload: pictures go
-agent → you, not the other way.
-
-The agent gets a picture there with the `show_image` tool: hand it any path on
-disk and it copies the file into `webui.files_dir` and replies with the name to
-write in the `![…]()`. It copies rather than serving the original path, which is
-the whole point — `exec` and `read_file` already reach anything this process
-can, and `show_image` is the single place a file crosses from that unconfined
-side to the side anyone holding `core.token` can fetch over HTTP. Keeping
-"what is servable" equal to "what is in one directory" is the invariant the
-`/files` route is built on. It refuses a non-image extension (saying which ones
-work, rather than leaving you a thumbnail that will not load) and anything over
-25 MB, and it never overwrites: a name already taken by *different* bytes gets
-`-2`, because the directory is shared by every session and a silent clobber
-would cross conversations. Re-copying the identical file reuses what is there.
-It costs 121 tokens of schema on every request of every tool-enabled session —
-see [docs/tokens.md](docs/tokens.md) — so drop it from `tools.allow` if you
-never want pictures.
-
-**🖼️ media.** The button under the session list opens a grid of everything in
-`webui.files_dir`, newest first: a plot from a conversation you cleared, or one
-scrolled past the log's node cap, is still on disk and still here. Click a tile
-for the same full-size view as an inline image. `this session` narrows it to
-the pictures the transcript on screen is showing — a scan of the log when the
-panel opens, not a list kept as the session runs, so it cannot go stale; its
-one limit is that an image trimmed away by the log cap is no longer "on
-screen". 🗑 deletes the file itself, after a confirm, and `webui.files_delete:
-false` takes the button away for a `files_dir` whose contents are not
-disposable. The tiles are the full images scaled by CSS: there is no
-thumbnailer, because that means a dependency on a machine this core cannot
-assume is online. Lazy loading, a reserved tile height and a 500-file cap keep
-that affordable, but the first open of a large directory is slow — the fix if
-it ever bites is a thumbnail route, not more JavaScript.
-
-**Maths.** `$…$` and `\(…\)` render inline, `$$…$$` and `\[…\]` as a centred block,
-via KaTeX. Formulas are lifted out before the markdown pass, so `*` and `_` in an
-exponent stay maths instead of turning into emphasis, and `$` inside a code span or a
-fenced block is never treated as maths — `echo $HOME` and `it cost $5` stay literal.
-A formula KaTeX rejects is shown in the theme's error colour with its source intact
-rather than taking the message down, and if KaTeX fails to load the page falls back to
-showing the TeX source in a code span.
-
-**Tests.** Every suite and helper lives in `tests/`, whatever it tests — and
-`tests/` is gitignored, so everything in this section describes the tree it was
-written in, not a clone. `.venv/bin/python tests/run_all.py` runs them all: the fast tier on its own is
-hermetic — no network, no ssh, no browser, no spawned core — and `--full` adds the
-ones that need something from outside the process. `test_browser.py`,
-`test_image.py` and `test_math_render.py` stay skipped even under `--full` until
-you also set `CORE=`: they create and delete sessions on whatever core it names,
-and they will not default to your real one. Individually:
-`node tests/test_md.mjs` exercises the markdown renderer headlessly;
-`node tests/test_math.mjs` does the same against the real vendored KaTeX,
-`.venv/bin/python tests/test_math_render.py` checks the rendered maths in a real
-browser (fonts, metrics, colour, overflow) without sending a turn,
-`.venv/bin/python tests/test_files.py` covers all three `/files` routes —
-confinement, the extension gate, auth, and that the listing agrees with the read
-route about what is servable — with no core or browser at all,
-`.venv/bin/python tests/test_show_image.py` checks the tool that puts pictures
-there (hermetic, and it runs every name the tool invents through the renderer's
-own pattern), `.venv/bin/python tests/test_media.py` drives the Media panel in a
-real browser, and `.venv/bin/python tests/test_image.py` checks that an
-image actually decodes, paints, stays inside its column and does not break the
-auto-scroll.
-`.venv/bin/python tests/test_browser.py` drives real headless Chrome over the DevTools
-Protocol against a running core — no Selenium, no Playwright, nothing to install —
-and asserts against the live DOM, so a JS error that stops the render fails a check
-rather than passing quietly. `tests/shot.py <session> [out.png] [dark|light]` takes a
-screenshot; both themes follow `prefers-color-scheme`.
+If `core.token` is set the page asks for it before connecting; the page itself is
+served unauthenticated on purpose. What makes inline pictures safe, and what
+`show_image` costs in schema tokens: [`docs/clients.md`](docs/clients.md#browser--web)
+and trap 14 of [`docs/architecture.md`](docs/architecture.md#traps).
 
 ## Discord Client
 
-A client like the other two, in its own process. `./serve.sh` starts it alongside
-the core whenever `discord.enabled` is not false and `discord.token` is set, so
-there is usually nothing separate to run; `./run_discord.sh` starts one on its own,
-for a bot on a different machine from its core, and `./serve.sh --no-discord`
-leaves it out. `discord.enabled: false` is the off switch: the bot does not start
-and `./run_discord.sh` refuses to run while it is set — flip it back to `true`
-when you want the bot again.
-
-The core never imports `discord.py` and does not know it exists; the bot holds one
-WebSocket per active channel and translates between Discord messages and core
-events. Restarting it costs nothing, because the session on the core's side *is*
-the conversation.
+`./serve.sh` starts the bot alongside the core whenever `discord.enabled` is not
+false and `discord.token` is set, so there is usually nothing separate to run;
+`./run_discord.sh` starts one on its own, for a bot on a different machine from its
+core. The core never imports `discord.py` and does not know it exists, so
+restarting the bot costs nothing: the session on the core's side *is* the
+conversation.
 
 > ⚠️ **A bot is a remote shell.** The tools are unconfined, so anyone who can get
-> a message to this bot can run commands on the machine hosting the core. Anyone
-> on Discord can DM a bot by default, and inside a guild the only wall is
-> Discord's own channel permissions. So `discord.users` is a **required**
-> allowlist of snowflake IDs: an empty list refuses everybody, which is the
-> startup default rather than an oversight.
->
-> **Taking someone's access away is a `/reload`, not a restart.** `discord.users`,
-> `mention_only` and `mention_list` are re-read by every attached bridge when the
-> core announces a reload, and nothing else in the `discord:` section is touched —
-> a reload is not a reason to re-point a running bot at a different core. It fails
-> closed: a `config.yaml` that will not parse leaves the allowlist already in force
-> rather than widening it. An allowlist that needed a restart would not be one, and
-> for a while this was exactly that — removing a snowflake and reloading printed
-> "♻️ config reloaded" and changed nothing at all.
+> a message to this bot can run commands on the machine hosting the core — and
+> anyone on Discord can DM a bot by default. So `discord.users` is a **required**
+> allowlist of user IDs, and an empty list refuses everybody, which is the startup
+> default and not an oversight. Taking someone off it is a `/reload`, not a
+> restart; an allowlist that needed a restart would not be one.
 
-**Setup.** Make a bot at <https://discord.com/developers/applications> → New
-Application → Bot. Copy its token into `config.yaml` under `discord.token`
-(`config.yaml` is gitignored, so it stays put), and switch **Message Content
-Intent** on under Privileged Gateway Intents — without it every message arrives
-with empty text. Invite it with the `bot` scope and Send Messages + Read Message
-History. Then put your own user ID in `discord.users` (Discord → Settings →
-Advanced → Developer Mode, then right-click yourself → Copy User ID).
+**One channel is one conversation**, named after itself: `<server>-<channel>` in a
+guild, the thread's own name for a thread, `discord-dm-<user_id>` in a DM. The
+server prefix is not decoration — two servers each having a `#general` is the
+normal case, and without it their conversations would silently merge. Rename the
+channel and the conversation follows rather than forking.
 
-**One channel is one conversation**, named after itself:
+**Setup:** make a bot at <https://discord.com/developers/applications>, copy its
+token into `discord.token`, switch **Message Content Intent** on (without it every
+message arrives with empty text), invite it with the `bot` scope and Send Messages
++ Read Message History, then put your own user ID in `discord.users`.
 
-| where | session |
-|---|---|
-| guild channel | `<server>-<channel>` — `dudus-den-solaris` |
-| thread | the thread's own name, its own conversation, not the parent's |
-| DM | `discord-dm-<user_id>` — a DM has no channel name to use |
+In a guild it answers when @mentioned or replied to — hygiene in a busy channel,
+not a security control; DMs never need a mention. `mention_only` can invert that
+per channel, and the bot prints the resolved answer for every channel it can see at
+startup. **The answer arrives once, at the end** — nothing is streamed to Discord,
+which keeps a slow Discord from ever stalling a turn. `/reasoning` does nothing
+here: this client asks the core not to send the thinking at all.
 
-The **snowflake is still the key**. The bot records which name it last gave each
-channel id in `state/discord_names.json`, and when Discord's name no longer
-matches it renames the *core session* rather than starting an empty one — so
-renaming `#esps` carries its conversation across. If that rename is refused
-(the session is mid-turn, or the new name is taken) it keeps using the old name
-and tries again next time, rather than splitting the conversation in two.
-
-The server prefix is not decoration: two servers each having a `#general` is the
-normal case, and without it their conversations would silently merge into one
-session. `auto_names: false` goes back to bare `discord-<channel_id>`.
-
-**Pointing a channel at another session.** One-to-one is the default, not a
-wall: `/session <name>` (or `!session <name>`) repoints the channel at any
-session the core already has — or creates it if it does not. The old
-conversation is untouched and stays reachable from wherever else it is bound;
-the channel simply stops talking to it and starts talking to the other one,
-and the last three lines of the session it joined are posted so you can see
-where it landed. `/session` with no name shows the current binding, and
-`/session auto` brings the channel back to its default name. The mapping is
-persisted in `state/discord_session_map.json`, so it survives a bot restart —
-and a mapped channel is left alone by the rename-following logic, which is
-user intent, not a name the bot chose. Several channels can share one
-session; `/info` in any of them says which channel it is bound from.
-
-**Talking to it.** In a guild the bot answers when @mentioned or replied to —
-hygiene, so it stays quiet in a busy channel, not a security control. DMs never
-need a mention. `mention_only` takes four values:
-
-| | |
-|---|---|
-| `true` | always address it (the default) |
-| `false` | it answers everything |
-| `white` | address it **only** in the channels in `mention_list` |
-| `black` | address it **everywhere except** those channels |
-
-`mention_list` takes channel names, `#name`, `server/channel` when two servers
-share a channel name, or raw snowflakes — matched as slugs, so `#Ptolemy-Translation`
-and `ptolemy-translation` are the same entry. A bare name matches that channel in
-*every* server. Rather than ask you to remember which way round `white` and `black`
-go, the bot prints the resolved answer for every channel it can see at startup:
-
-```
-must @mention in: #general, #novel
-answers freely in: #solaris, #caen, #esps, #ptolemy-translation, #analysis_11c
-```
-
-An unreadable value warns and falls back to `true`, so a typo never opens the bot up. The slash commands work as
-plain messages: `/info`, `/model [name]`, `/rollover`, `/new`,
-`/clear`, `/behavior`, `/stop`, `/reload`, `/restart`, `/session [name]`, plus a
-local `/help`. Two are not shared with the other clients, in either direction:
-`/session` is Discord-only, because it maps a *channel* to a session and the
-terminal and the browser pick their session when they attach; `/steering` is the
-other way round, terminal and WebUI only. `/restart` restarts the *core*; the bot
-is a separate process and stays up, reconnecting on its own backoff.
-`/reasoning` is answered but does nothing — this client asks the core not to
-send the thinking at all (`reasoning=0`), so none of it crosses the wire.
-
-**The answer arrives once, at the end.** Nothing is streamed: deltas are
-buffered and posted on `turn_end`, which keeps the reader loop off the Discord
-API so a slow Discord can never stall a turn. A typing indicator runs meanwhile.
-
-**A tool round leaves a line, not a hole.** Buffering the whole turn used to
-mean a tool round contributed nothing to it — worse than nothing, in fact: the
-`<tool_call>` block is lifted out of the text stream by `ToolMarkupFilter` but
-the newlines that surrounded it are not, so a round the model did not introduce
-in words arrived as a blank band in the middle of the answer. Now the band is
-trimmed and one line of Discord subtext goes in its place:
-
-```
-Let me check the bus.
-
-⚙️ checking the USB bus ↳ 412 chars
-
-No CAEN 21e1 device on dcs0's buses.
-```
-
-What it says is the **`reason`** — every tool's schema carries one
-(`tools.py:REASON_KEY`), a phrase the model fills in saying what it is about to
-find out, which never reaches the handler and exists only to be shown. A model
-that leaves it out costs nothing; the line falls back to the tool's name.
-That choice is deliberate: a reader on a phone wants to know *why* the agent
-went away for ninety seconds, and the command itself is both longer and, on a
-`cd … && grep -n … | sed -n …`, much less informative. The command is still
-there in the WebUI and the terminal, which show the raw arguments.
-
-The line is part of the answer, not a message of its own, so a turn that ran
-twenty commands is still one post.
-`show_tools: false` drops the lines but keeps the trimming — the blank band was
-a bug, not a setting.
-The answer is then split by `chunker.py` — 2000 characters, a soft 17-line cap,
-and fences closed and reopened so a code block never leaks into the next
-message. **Every chunk is posted, however many.** There was a cap,
-`max_messages`, which posted the opening and filed the rest as an `answer.md`
-attachment; it was removed, because filing the tail turned a readable thread
-into a download at exactly the length that most needed reading. The length is
-bounded anyway: an answer cannot exceed the model's
-`max_output_tokens`, which is about 65 messages on a 32k model and 16 on an 8k
-one, and discord.py waits out a 429, so a long burst is slow rather than lost.
-A send Discord refuses does not
-drop the rest of the answer in silence — the remainder goes up as a
-file, saying which message failed.
-
-**The rollover question** is posted like any other, and `yes`/`no` answers it —
-addressed the normal way, so replying to the question works. Not answering
-within `prompt_timeout` keeps the session, exactly as in the other clients. With
-`mention_only: false` a bare "yes" in the channel can also answer it, which is
-one more reason to leave it on.
-
-**The channel stays attached** for the life of the bot by default
-(`idle_detach_min: 0` = never). That is what keeps Discord and the WebUI in
-lockstep: a turn you run from the WebUI still posts to the channel, because the
-bridge never detaches and misses it. Set `idle_detach_min` to a number of
-minutes to get the old behavior back — the channel's socket is dropped when it
-goes idle that long and re-attached on the next message; the conversation is on
-the core, not here, so nothing is lost. The link reconnects on its own with
-backoff and resumes by `last_seq`, so a core restart mid-answer loses nothing.
-
-**A rename is followed, so a reconnect lands on the right session.** The core
-*creates* a session on an unknown name, so a reconnect that still dials an old
-name would open an empty twin while the real conversation sits under the new
-name. The bridge therefore tracks renames: a rename it drove itself (a Discord
-channel rename) is already in its name map, and a rename from elsewhere (the
-WebUI) is adopted and the channel is bound to the new name — a WebUI rename is
-user intent, exactly like `/session <name>`. Either way the next reconnect dials
-the conversation, not a twin.
-
-**Tests.** `.venv/bin/python tests/test_chunk.py` covers the chunker (fences,
-long lines, CJK, the 2000 boundary, italics), `tests/test_discord.py` drives the
-gate, the routing and the rendering against fake Discord objects and a fake
-link, and `tests/test_discord_live.py` spawns a real core on a temp config and
-checks the protocol end to end — handshake, token, `?model=`, `origin`, and
-reconnect-by-seq. None of the three needs a bot token or a network.
+How names are persisted and followed, the chunking and fence rules, and the
+slash-command tree: [`docs/clients.md`](docs/clients.md#discord--sourcediscord_clientpy).
 
 ## Installing as a service
 
@@ -1811,18 +808,62 @@ refuses to install one flavour while the other is present — uninstall first.
 
 ## Config
 
-[`config.example.yaml`](config.example.yaml) is the reference: every key,
-inline, with its type, its default, and what a change costs. Read it beside the
-three-tier table above — the table says *which tier*, the file says *what the
-key does*. It is a template, so it is also the thing you copy to start:
-`cp config.example.yaml config.yaml`, then edit your copy (`config.yaml` is
-gitignored — it holds the API key and the bot token).
+One file, `config.yaml`, at the root of the repo. Copy the template and edit
+your copy:
 
-**Key sections:**
-- `models` — Registry of named models. Each entry is self-contained: its own `base_url` (required), `api_key`, exact server model ID (`provider_name`), behavior file, `context_length` and sampling parameters — so two models can live on two different servers with different window sizes, and reading one entry tells you everything about that model. `default_model` picks the model a new session starts on; `/model <name>` switches one session at runtime without disturbing the others.
-- `core` — The service itself: `bind` (loopback by default — see the security note above), `port` (the WebUI is on the same one), `token`, an optional shared secret, and `allowed_hosts`, extra `Host` header values to accept for a reverse proxy in front of the core (loopback, the bind, this machine's hostname and FQDN and the addresses they resolve to are already accepted). `--bind` / `--port` / `--config` on `./serve.sh` override the first three.
-- `tools` — Agent tools: enable flag, allowlist, `exec_timeout`, `max_output_chars`, and `workdir` — the base directory `exec` runs in and relative paths resolve against, defaulting to the letsClaw directory.
-- `conversation` — `max_history_messages`, a backstop that trims the oldest messages (never opening on an orphaned tool result) and only applies on turns where no rollover happened — rollover is the real mechanism, this just stops an unbounded session with rollover switched off. Then rollover policy: `rollover_at_percent` (0 disables), `rollover_mode` (`auto`/`ask`/`off`), `prompt_timeout` (seconds to wait for an answer in `ask` mode before keeping the session). Two directories: `live_dir` holds the running conversations and is reloaded at startup, `sessions_dir` holds archived transcripts and the journal segments beside them. Then the journal itself: `journal` (default true — the `.md` record of every round's reasoning and every untruncated tool result, which is what stops a rolled-over window repeating work; see [The journal](#the-journal)) and `journal_max_block_chars` (default 1,000,000, the cap on one recorded block). The context window itself is per model, under `models`.
-- `discord` — the Discord bot, and only ever read by it: `enabled` (the off switch — `false` keeps the bot from starting and makes `./run_discord.sh` refuse to run; absent means enabled), `token` (the bot token), `core`/`core_token` (where the core is and its shared secret, both defaulting to the `core` section above), `users` — the **required** allowlist of snowflake IDs, empty meaning nobody — `mention_only` (`true`/`false`/`white`/`black`) with `mention_list`, `idle_detach_min` (`0` = never, the default — the channel stays attached so a WebUI turn still posts to Discord), `max_lines` for how an answer is split (there is no cap on the number of messages — see [Discord Client](#discord-client)), `show_tools` (one grey line per tool call saying why it was made; `false` drops the line but still closes the blank a tool round leaves in the answer), and `auto_names` (sessions named `<server>-<channel>`, renamed to follow Discord). Omit the whole section if you do not want a bot. See [Discord Client](#discord-client) for the security note that goes with it.
-- `memory` — `long_term_file`, where rollover handoffs accumulate
-- `logging` — `level`, `file`, and the rotation ceiling, `max_bytes` (default 10 MB, and anything under a 1 MB floor is not believed, because `0` would mean "never rotate") with `backups` (default 5). Each process logs to stderr and to a file of its own: the writer's name goes into the stem, so `logs/letclaw.log` becomes `letclaw-core.log` and `letclaw-discord.log`. Two processes appending to one file interleave their lines, and worse, whichever one rotated it would rename the file out from under the other — one file per writer is what makes the ceiling safe, not a tidiness on top of it. Every session event of consequence (restore, rename, delete, rollover, a dropped tool-call turn) is one line in there.
+```bash
+cp config.example.yaml config.yaml     # config.yaml is gitignored — it holds your keys
+```
+
+**[`config.example.yaml`](config.example.yaml) is the reference.** Every key is
+there inline with its default and what a change costs, and it is a template
+rather than a manual page, so it cannot go stale the way a list of keys can.
+Read it beside the reload table under [The Core](#the-core): the table says
+*which tier* a key is in, the file says *what the key does*.
+
+Seven sections, and one place to read each properly:
+
+| section | what it is for |
+|---|---|
+| `models` | which model servers this core can talk to, and each one's window and limits. A session starts on `default_model` and `/model <name>` switches it |
+| `behavior` | which Markdown files describe how the agent behaves — see [The behavior files](#the-behavior-files) |
+| `core` | where the service listens, and the shared secret if it has one |
+| `tools` | which tools the agent may call, and the limits on each |
+| `conversation` | how long a session is kept, when it rolls over, and what gets written to disk |
+| `discord` | the bot, and the allowlist that decides who may talk to it. Omit the section entirely if you do not want a bot |
+| `logging` | how much log to keep |
+
+Two of them are worth more than a skim, because getting them wrong costs
+something other than a feature:
+
+- **`core.bind` and `core.token`** — see [Security](#security). A non-loopback
+  bind with no token puts an unconfined shell on the network.
+- **`discord.users`** — an empty list refuses everybody, which is the shipped
+  default and not an oversight. Anyone who can message the bot can run commands
+  on this machine until you fill it in.
+
+Anything not listed here is commented in the template. Where a key is absent
+from your `config.yaml` entirely, the default comes from the code that reads it,
+not from the template — the two are not always the same number (`max_history_messages`
+defaults to 100 in the core and the template sets 50), so the template is where
+a default gets *explained* and the code is where an omitted key's default lives.
+
+## Where the detail lives
+
+This page is the front door. The depth — written for someone who has to change
+the code, and readable by anyone who wants the exact figure rather than the shape
+of it — is in [`docs/`](docs/README.md):
+
+| page | answers |
+|---|---|
+| [architecture.md](docs/architecture.md) | the module map, one turn end to end, the disk layer, config reload — and a numbered list of traps that is worth reading on its own |
+| [reasoning.md](docs/reasoning.md) | the arithmetic of the notepad and the answer sheet: which cap binds which round, and every way thinking can stop |
+| [tokens.md](docs/tokens.md) | what fills the window, what each figure on the `⚡` line is worth, and how far off the estimates run |
+| [protocol.md](docs/protocol.md) | every HTTP route, every event, the auth rules and the replay rules |
+| [clients.md](docs/clients.md) | the terminal, the browser and the bot, each in as much detail as changing one needs |
+| [design-principles.md](docs/design-principles.md) | the rules the codebase follows, each with its evidence — read this before proposing a change |
+| [extending.md](docs/extending.md) | how to add a tool, a command, a route or a client, and what to run before committing |
+
+[`config.example.yaml`](config.example.yaml) is the reference for every setting,
+and [`AGENT.md`](AGENT.md) is the short imperative path from a fresh clone to a
+running, verified core.

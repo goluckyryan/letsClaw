@@ -23,8 +23,8 @@ are used strictly from here on.
 |---|---|
 | **history** | the list of messages **letsClaw** keeps on its own side: the system message, then every question, answer, tool call and tool result. It lives in the core's memory and on disk. It is the only part letsClaw can edit, trim or collapse. |
 | **prompt** | what is actually **sent to the model on one request**: the history, plus the tool schemas, rendered into one block of text. The model gets this and nothing else — it remembers nothing between requests. |
-| **tool schema** | the machine-readable description of one tool — its name, what it is for, and the arguments it takes. The model's menu. See the box below; there are ten of them here, costing **1,530 tokens** locally on every round that offers tools (more at the server — see the box below). |
-| **window** | the model's hard ceiling on how big a prompt can be. Here, **262,144 tokens** (`context_length` in `config.yaml`; the clients call it `budget`). Fixed by the model, not by letsClaw. |
+| **tool schema** | the machine-readable description of one tool — its name, what it is for, and the arguments it takes. The model's menu. See the box below; there are ten of them here, costing **1,552 tokens** locally on every round that offers tools (more at the server — see the box below). |
+| **window** | the model's hard ceiling on how big a prompt can be — `context_length` in `config.yaml`, per model entry; the clients call it `budget`. Here that means **100,000 tokens** on the default `qwen38-local` (262,144 on `qwen38-dgsSpark`). Fixed by the model, not by letsClaw. |
 | **used** | how much of the window the current prompt would take. This is what the `⚡` line and the WebUI gauge show as `used/budget`. |
 | **turn** | one question from you and the final answer back. |
 | **round** | one request-and-reply with the model. **A turn can take several rounds** — one per tool call, plus any resumed thinking. This distinction is the single most important idea on this page. |
@@ -45,7 +45,7 @@ from it:
       history  =  system message  +  the whole conversation so far
       prompt   =  history  +  tool schemas          ← sent on EVERY round
       used     =  the size of that prompt, in tokens
-      window   =  the ceiling it must stay under    (262,144)
+      window   =  the ceiling it must stay under    (100,000 on the default)
 ```
 
 The system message is part of the history — it is literally the first message in
@@ -108,7 +108,7 @@ What the ten cost:
 that will not show the command can still say why the call was made, which is
 what the Discord bot does with it. The field is four words of description and
 one `required` entry, and it still costs **228 tokens on every request of every
-tool-enabled session** — 1,302 → 1,530 — because it is paid once per tool,
+tool-enabled session** — 1,324 → 1,552 — because it is paid once per tool,
 ten times over. Spelling out what a good reason looks like in the field itself
 would pay that fraction per tool again; `models/base.md` carries the sentence
 once instead. That is the whole lesson of this page in one field: the per-tool
@@ -117,7 +117,7 @@ sent once, is the cheap one.
 
 The server figure below has **not** been re-measured since. 715 was the charge
 when the local count was 462, for five tools; the re-render scales with the
-JSON, so at 1,530 local for ten tools expect roughly 2,350–2,450, but do not
+JSON, so at 1,552 local for ten tools expect roughly 2,350–2,450, but do not
 quote it until someone diffs `prompt_tokens` for real. Measured numbers and
 extrapolated ones do not go in the same table.
 
@@ -153,7 +153,7 @@ Add the two always-present pieces together and you get the floor:
 
 Both figures are server-measured and **both are out of date** — they predate
 `reason` and the five search and edit tools added since. The local counts now
-stand at 1,302 → 1,530 for the schemas and 1,953 for the behavior files
+stand at 1,324 → 1,552 for the schemas and 1,953 for the behavior files
 (`base.md` 1,753 plus `default.md` 200, counted with
 `token_counter.count_text`); the floor has risen by whatever the pair
 re-renders to. The arithmetic above is kept as it was rather than quietly
@@ -209,14 +209,16 @@ those files and nothing else, so the same files always give the same number.
 The floor is constant *per rebuild of the system message*; the four rows above
 are the four ways to trigger a rebuild.
 
-How much the floor matters is entirely a function of the window it sits in:
+How much the floor matters is entirely a function of the window it sits in
+(each share is the 1,979-token floor above divided by that window):
 
 | model | window | the floor is |
 |---|---|---|
-| `qwen38-local` (the default) | 262,144 | 0.71% |
-| `qwen38-flash` | 524,288 | 0.35% |
-| Argo Opus | 1,000,000 | 0.19% |
-| **a 12k window** | **12,000** | **15.5%** |
+| `qwen38-local` (the default) | 100,000 | 1.98% |
+| `qwen38-dgsSpark` | 262,144 | 0.75% |
+| `qwen38-flash` | 524,288 | 0.38% |
+| Argo Opus | 1,000,000 | 0.20% |
+| **a 12k window** | **12,000** | **16.5%** |
 
 On the big windows it is a rounding error. On a 12k window a sixth of the
 context is gone before anyone says hello — which is why trimming behavior files
@@ -494,6 +496,14 @@ Across the same nine checkpoints this lands within **0.5%**. Section 8 has the
 figure at every point, and the alternative forms that were considered and
 rejected.
 
+**What this replaced was one upward multiplier, and it is worth naming why it
+failed.** A single `×1.6` read **+34%** on an empty window and **+47%** on a full
+one — because a ratio was being applied to errors that were not ratios. The prose
+term scales with prose, the framing term with message count, and the schema term
+with neither, so their disagreement with a flat scale grows as the window fills.
+The direction the current estimate does err in is deliberate: rolling over early
+costs a summary, rolling over late costs a rejected request.
+
 ---
 
 ## 3. A worked example: one session, turn by turn
@@ -501,6 +511,13 @@ rejected.
 Rather than describe it, here is a real session, turn by turn. Every number
 below was measured against the live server — a real request was sent and the
 server's own `prompt_tokens` recorded. Nothing here is calculated or guessed.
+
+That session ran against `qwen38-dgsSpark`, so its denominator is a 262,144
+window — not the 100,000 a default session gets on `qwen38-local`. The
+occupancies below are real; the *share of the window* they imply is not, and
+the same conversation hits its walls roughly two and a half times sooner on
+the default model. Sections 3 and 8 are left on the window they were measured
+on: a measurement renumbered to match a different model stops being one.
 
 It ran when `tools.allow` held four tools, so its floor is 1,859 rather than
 the 1,979 a fifth schema makes it today. Every figure in this section is 120

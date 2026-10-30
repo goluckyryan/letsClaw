@@ -26,6 +26,13 @@ models/sessions/*.md
 # One `git add -A` would commit the lot and there is no taking it back out.
 voices/
 
+# Working note, by Ryan's instruction (2026-10-30): the README split plan stays
+# on this machine. Named rather than `docs/*-plan.md` because the webcam plan is
+# tracked, and a wildcard would quietly swallow the next plan that is meant to
+# ship. It is referenced from docs/README.md as a path, not a link, so no gate
+# can see it either way.
+docs/readme-split-plan.md
+
 # Editor / OS
 .vscode/
 .idea/
