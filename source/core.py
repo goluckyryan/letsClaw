@@ -1954,7 +1954,8 @@ class Session:
                         # _think_pad. Its conclusion may be an answer or, if the
                         # thinking decided the ending is an action, a tool call;
                         # the latter rejoins this loop with the result in hand.
-                        if was_cut_off(result):
+                        cut_off = was_cut_off(result)
+                        if cut_off:
                             result = await self._think_pad(call_round, turn_t0,
                                                            result.reasoning)
                             if result.wants_tool:
@@ -1972,6 +1973,23 @@ class Session:
                                      "at": now_stamp(), **self.mark()})
                             await drain_steering()
                             continue
+                        if (not cut_off and not (result.text or "").strip()
+                                and self.engine.reasoning):
+                            # A round that said nothing is not an answer. Ending
+                            # the turn here is how b9aec0f9's turns 8 and 15
+                            # stopped dead and went straight to the digester:
+                            # the model returned reasoning-only (or entirely
+                            # empty) and the harness read silence as "finished".
+                            # _think_pad always ends on a closing round, so the
+                            # turn gets one more chance to say something. Only
+                            # with the pad available — reasoning: false means a
+                            # cut-off round is deliberately the end (see the
+                            # pad-disabled contract).
+                            result = await self._think_pad(call_round, turn_t0,
+                                                           result.reasoning)
+                            if result.wants_tool:
+                                await run_tools(result)
+                                continue
                         full_response = result.text
                         break
 
@@ -2431,8 +2449,14 @@ class Session:
                 # stripped. Either way the pad is complete — fall through and let
                 # the closing round write the answer under the answer budget.
                 text = strip_tool_markup(result.text)
-                if text and result.finish_reason != "length":
+                if (text and result.finish_reason != "length"
+                        and "</tool_call>" not in result.text):
                     return ChatResult(text)
+                # A resume is offered no tools, so a model that wants to act
+                # writes a complete call as markup instead. What is left after
+                # stripping is its narration ("Now the client docs ..."), not an
+                # answer — turn 9 of b9aec0f9 ended there. Fall through: the
+                # closing round is offered the tools and can act for real.
                 break
             if result.finish_reason != "length":
                 break  # stopped without text and without being cut off
