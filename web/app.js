@@ -2255,7 +2255,7 @@ async function refreshSessions() {
   } catch { return; }        // core down; the status pill already says so
 
   if (!list.some((s) => s.name === S.session)) {
-    list.push({ name: S.session, messages: 0, turns: 0, rounds: 0,
+    list.push({ name: S.session, messages: 0, turn: 0, round: 0,
                 clients: 1, busy: false, pending: true });
   }
   list.sort((a, b) => a.name.localeCompare(b.name));
@@ -2265,9 +2265,10 @@ async function refreshSessions() {
   for (const s of list) {
     const row = node(`srow${s.name === S.session ? ' on' : ''}`);
     row.dataset.name = s.name;
+    row.dataset.messages = s.messages ?? 0;
     row.title = `${s.name} — `
-              + (s.turns !== undefined
-                 ? `${s.turns} turns · ${s.rounds} rounds · `
+              + (s.turn
+                 ? `turn ${s.turn}${s.round ? '.' + s.round : ''} · `
                  : '')
               + `${s.messages} messages · ${s.model || 'no model yet'}`
               + (s.clients ? ` · ${s.clients} attached` : '');
@@ -2282,15 +2283,10 @@ async function refreshSessions() {
     // tooltip, which is to say nowhere. Shown from two up; one is the normal case
     // and a badge on every row would just be noise.
     const ct = node('ct');
-    // turns.rounds: the questions and the model rounds, the two components the
-    // old total lumped together (tool results are neither). Both are scoped to
-    // the window, as the total was — a turn rolled into the archives is not
-    // counted here. The keys exist only on a core new enough to count them,
-    // so until the restart lands the badge falls back to the old total rather
-    // than going blank.
-    ct.textContent = (s.turns !== undefined)
-      ? ((s.turns || s.rounds) ? `${s.turns}.${s.rounds}` : '')
-      : (s.messages || '');
+    // The gutter's mark: the live round while a turn runs, the last round it
+    // reached once idle. Unlike a history count, it does not reset when a
+    // rollover empties the window.
+    ct.textContent = s.turn ? `#${s.turn}${s.round ? '.' + s.round : ''}` : '';
     const eyes = node('eyes');
     eyes.hidden = !(s.clients > 1);
     eyes.textContent = `⧉${s.clients}`;
@@ -2355,13 +2351,13 @@ async function renameSession(name) {
 
 async function deleteSession(name) {
   const row = [...$('#side-list').children].find((r) => r.dataset.name === name);
-  const n = row ? row.querySelector('.ct').textContent : '';
+  const n = row ? Number(row.dataset.messages) : 0;
   // Discards the conversation AND every transcript and journal it archived, so
   // ask first — and say how much is about to go, which is the number that makes
   // people hesitate. The file count is not one of them: the core knows it, the
   // browser does not, so the archives are named rather than counted.
   if (!confirm(`Delete session "${name}"?`
-             + (n ? `\n\n${n} message${n === '1' ? '' : 's'} will be discarded,` : '\n\nThis discards the conversation')
+             + (n ? `\n\n${n} message${n === 1 ? '' : 's'} will be discarded,` : '\n\nThis discards the conversation')
              + ' along with every archived transcript and journal this session has written.'
              + '\n\nThis cannot be undone.')) return;
   try {

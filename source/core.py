@@ -4042,13 +4042,15 @@ class SessionManager:
     def describe(self):
         return [{"name": s.name, "model": s.model_name,
                  "messages": len([m for m in s.history if m["role"] != "system"]),
-                 # The window's turns and rounds, separately: user messages and
-                 # assistant messages. The sidebar shows them as turns.rounds
-                 # (tool results are neither), and both stay scoped to the
-                 # current window, as messages does — turns rolled into the
-                 # archives are not counted twice.
-                 "turns": sum(1 for m in s.history if m["role"] == "user"),
-                 "rounds": sum(1 for m in s.history if m["role"] == "assistant"),
+                 # The session's own counters, the same pair the gutter stamps
+                 # blocks with. turn_id survives a rollover; round_id is 0
+                 # between turns, so an idle session reports the last round it
+                 # reached instead — the last mark its gutter carries. History
+                 # is only consulted for that; a live round_id wins.
+                 "turn": s.turn_id,
+                 "round": max([s.round_id]
+                              + [m.get("round") or 0 for m in s.history
+                                 if m.get("turn") == s.turn_id]),
                  "clients": len(s.subscribers), "busy": s.busy}
                 for s in self.sessions.values()]
 
