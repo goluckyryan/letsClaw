@@ -206,7 +206,10 @@ Every default and every parse failure resolves to the more restrictive option:
 - Tool-markup parsing is **confined to the raw transport** (`ToolMarkupFilter`).
   On the chat endpoint the server parses tool calls properly, so the same
   markup arriving as text is the model *writing about* a tool call — prose in
-  an answer — and executing that would be a real hazard.
+  an answer — and executing that would be a real hazard. On the raw transport
+  a recovered block is only run when no prose follows it: a real call ends the
+  round while the model waits for its result, whereas prose after the markup
+  means the block was an example.
 - A bad `rollover_mode` logs and uses `auto` (`Session.__init__()`).
 
 ## 10. The reflexive keystroke is the safe one

@@ -10,7 +10,6 @@ import logging
 import re
 import secrets
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import aiohttp
 from openai import AsyncOpenAI
@@ -78,11 +77,12 @@ class InlineThinkSplitter:
     there is no opening tag, the first chunk decides that, and everything
     after is forwarded unexamined.
 
-    The close tag ends the block only when it starts a line, as the template
-    writes it. A thought that merely *writes about* the markup puts a
-    `</think>` inside a sentence — "so  thinking and  indicate the
-    boundary" — and that is prose, not the end of the block: taking it for the
-    tag cut the thought in half and sent the words after it on as the answer.
+    The close tag ends the block only when the template's blank line follows
+    it, as `THINK_CLOSE` writes it (`\n</think>\n\n`). A thought that merely
+    *writes about* the markup — inline, or on a line of its own inside a code
+    fence, where it has no blank line after it — is prose, not the end of the
+    block: taking it for the tag cut the thought in half and sent the words
+    after it on as the answer.
     """
 
     OPEN, CLOSE = "<think>", "</think>"
@@ -95,11 +95,6 @@ class InlineThinkSplitter:
         # The newline after an opening tag belongs to the tag. It may arrive
         # in a later chunk than the tag did, so this outlives one feed().
         self._eat_open_newlines = False
-        # Last character of the stream already forwarded as reasoning. A close
-        # tag at the front of `_buf` starts a line only if this is a newline;
-        # the hold-back below can leave a tag at index 0 after emitting the
-        # prose in front of it, and that space must not become a fresh line.
-        self._prev = "\n"
 
     def feed(self, chunk):
         """One chunk in; `(text, reasoning)` out, either possibly empty."""
@@ -148,32 +143,34 @@ class InlineThinkSplitter:
             tail = tail.lstrip("\n")
             self._state = "done" if tail else "after_close"
             return tail, head.rstrip("\n")
-        if len(self._buf) > len(self.CLOSE):
-            # Hold back as much as a split close tag could still occupy — and
-            # the newlines in front of it, which are the tag's if the tag is
-            # what follows. Emitting those eagerly is how a thought ends up
-            # with a trailing blank line that belongs to the markup.
-            cut = len(self._buf) - len(self.CLOSE)
+        # Hold back a split close tag and the blank line that has to follow it
+        # before it counts as the tag. Emitting those eagerly is how a thought
+        # ends up with a trailing blank line that belongs to the markup.
+        hold = len(self.CLOSE) + 2
+        if len(self._buf) > hold:
+            cut = len(self._buf) - hold
+            # The newlines in front of the tag are the tag's too, if the tag is
+            # what follows.
             while cut and self._buf[cut - 1] == "\n":
                 cut -= 1
             if cut:
                 out, self._buf = self._buf[:cut], self._buf[cut:]
-                self._prev = out[-1]
                 return "", out
         return "", ""
 
     def _find_close(self):
-        """Index of a close tag that starts a line, or -1.
+        """Index of a close tag followed by the template's blank line, or -1.
 
-        The template puts the close tag on a line of its own. A tag inside a
-        sentence is the thought quoting the markup, so skip it and keep
-        looking: the real close, if any, is further on.
+        The template writes `\n</think>\n\n`. Requiring the blank line is what
+        tells the real close from a thought that quotes the tag: written inline
+        it has a space after it, and written on its own line in a code fence it
+        has one newline, not two. The tag may be inline in the real close too —
+        the model is not obliged to put it on its own line — so line start is
+        not part of the test.
         """
         i = self._buf.find(self.CLOSE)
         while i != -1:
-            line_start = (self._buf[i - 1] == "\n" if i
-                          else self._prev == "\n")
-            if line_start:
+            if self._buf.startswith("\n\n", i + len(self.CLOSE)):
                 return i
             i = self._buf.find(self.CLOSE, i + 1)
         return -1
@@ -182,6 +179,14 @@ class InlineThinkSplitter:
         """Flush whatever is held back. `(text, reasoning)`."""
         buf, self._buf = self._buf, ""
         if self._state == "reasoning":
+            # A close tag at the very end of the stream has no blank line left
+            # after it to prove itself. If only whitespace follows, it is still
+            # the template's close and belongs to the tag, not the thought.
+            i = buf.find(self.CLOSE)
+            while i != -1:
+                if not buf[i + len(self.CLOSE):].strip():
+                    return "", buf[:i].rstrip("\n")
+                i = buf.find(self.CLOSE, i + 1)
             return "", buf        # ended mid-thought; the remainder is thinking
         if self._state == "after_close":
             return "", ""         # only the tag's own trailing newlines left
@@ -255,12 +260,22 @@ class ToolMarkupFilter:
     <tool_call> block is taken out and kept, and a partial one is held back
     until it is one or the other. That is what stops a client rendering half an
     XML tag, and what stopped Discord posting the whole call as prose.
+
+    A block is only returned as a call when no prose follows it. A real call
+    ends the round because the model stops to wait for its result; prose after
+    the markup means the model was describing a call, not making one, and
+    running that would act on an example.
     """
 
     def __init__(self):
         self.buf = ""
         self.blocks = []
         self.inside = False
+        self._prose_after_block = False
+
+    def _note_text(self, text):
+        if self.blocks and text.strip():
+            self._prose_after_block = True
 
     def feed(self, chunk):
         self.buf += chunk
@@ -275,18 +290,23 @@ class ToolMarkupFilter:
                     # nothing than to show markup.
                     return "".join(out)
                 self.blocks.append(self.buf[:end])
+                self._prose_after_block = False
                 self.buf = self.buf[end + len(TOOL_CLOSE):]
                 self.inside = False
                 continue
             start = self.buf.find(TOOL_OPEN)
             if start >= 0:
-                out.append(self.buf[:start])
+                before = self.buf[:start]
+                out.append(before)
+                self._note_text(before)
                 self.buf = self.buf[start + len(TOOL_OPEN):]
                 self.inside = True
                 continue
             keep = _partial_suffix(self.buf, TOOL_OPEN)
             cut = len(self.buf) - keep
-            out.append(self.buf[:cut])
+            before = self.buf[:cut]
+            out.append(before)
+            self._note_text(before)
             self.buf = self.buf[cut:]
             return "".join(out)
 
@@ -300,9 +320,16 @@ class ToolMarkupFilter:
             self.buf = ""
             return ""
         rest, self.buf = self.buf, ""
+        self._note_text(rest)
         return rest
 
     def tool_calls(self):
+        if self._prose_after_block:
+            logger.warning(
+                "dropping %d recovered tool call(s): prose follows the markup, "
+                "so the model was describing a call rather than making one",
+                len(self.blocks))
+            return []
         calls = [parse_tool_block(b) for b in self.blocks]
         return [c for c in calls if c]
 
@@ -633,22 +660,6 @@ class LLMEngine:
             return response.choices[0].message.content or ""
         except Exception as e:
             logger.error(f"LLM chat failed: {e}")
-            raise
-
-    async def chat_with_stream(self, messages: list, model: str | None = None):
-        """Generator that yields chunks from a streaming completion."""
-        params = self.get_model_params(model)
-        try:
-            response = await self.client.chat.completions.create(
-                messages=messages,
-                stream=True,
-                **params,
-            )
-            async for chunk in response:
-                if chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
-        except Exception as e:
-            logger.error(f"LLM stream failed: {e}")
             raise
 
     # Below this much prose, a round is worth solving the schema cost against.
