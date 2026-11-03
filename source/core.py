@@ -34,7 +34,7 @@ import config as configlib
 import config_edit
 import paths
 import session as store
-from llm_engine import ChatResult, RoundInterrupted
+from llm_engine import ChatResult, RoundInterrupted, TOOL_CLOSE, TOOL_OPEN
 from ssh_forward import SSHForwardManager
 from token_counter import (count_text, count_tools, corrected_messages,
                            corrected_text, schema_cost, tokenizer_status)
@@ -572,19 +572,47 @@ def _reconstruct_turn(region, turn_id, blocks):
     return messages, ""
 
 
-def strip_tool_markup(text):
-    """Drop tool-call markup a resumed round may have written as prose.
+# Built from the engine's own markers rather than re-spelt here. The tag is
+# the parser's, and a second copy of it in this file is how the stripper and
+# the parser drift apart without either one looking wrong.
+_TOOL_BLOCK_RE = re.compile(
+    f"{re.escape(TOOL_OPEN)}.*?(?:{re.escape(TOOL_CLOSE)}|\\Z)", re.S)
 
-    The raw transport talks to /completion, which has no tool-call parser, so a
-    model that decides mid-answer to run `exec` emits the template's own
-    <tool_call> XML as plain text. It cannot be honoured — a resumed round is
-    past the point where tools can run — and showing the user raw markup is
-    worse than showing them nothing, so it comes out.
+
+def strip_tool_markup(text):
+    """Drop tool-call markup a resumed round wrote as prose.
+
+    A resume is offered no tools — there is no way to splice a result into the
+    middle of an unclosed thinking block — so a model that decides mid-thought
+    to run `exec` has no call to make and types the chat template's own
+    <tool_call> XML into its text instead.
+
+    Only the chat transport arrives here with that markup intact. On raw,
+    ToolMarkupFilter has already lifted whole blocks out of the text and
+    recovered them as real calls, and dropped any unterminated one, so raw
+    .text never carries the tag at all. On chat nothing parses it, so it lands
+    as written, and showing the user raw XML is worse than showing them
+    nothing. What is left afterwards is the narration around the call — which
+    wrote_whole_tool_call() is here to say is not an answer.
     """
-    if not text or "<tool_call>" not in text:
+    if not text or TOOL_OPEN not in text:
         return text
-    cleaned = re.sub(r"<tool_call>.*?(?:</tool_call>|\Z)", "", text, flags=re.S)
-    return cleaned.strip()
+    return _TOOL_BLOCK_RE.sub("", text).strip()
+
+
+def wrote_whole_tool_call(text):
+    """Did the round finish writing a tool call it could not make?
+
+    The closing tag is the whole test, because it is what separates a call the
+    model completed from one the lap cap cut in half: an unterminated block is
+    a round that ran out of budget mid-call, and resuming it is the pad's
+    ordinary business. A complete one is a decision — the thinking worked out
+    that the next step is an action — so whatever prose surrounds it is not an
+    answer, and the turn owes that round a closing round where the tools are
+    real. A stray closing tag with no opening one counts too: it is still
+    markup, and still not something to hand a reader as the answer.
+    """
+    return bool(text) and TOOL_CLOSE in text
 
 
 class Session:
@@ -2450,7 +2478,7 @@ class Session:
                 # the closing round write the answer under the answer budget.
                 text = strip_tool_markup(result.text)
                 if (text and result.finish_reason != "length"
-                        and "</tool_call>" not in result.text):
+                        and not wrote_whole_tool_call(result.text)):
                     return ChatResult(text)
                 # A resume is offered no tools, so a model that wants to act
                 # writes a complete call as markup instead. What is left after

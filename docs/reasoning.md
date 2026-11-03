@@ -255,14 +255,28 @@ Eight exits. The first is the only one that loses work.
 | 3 | context, compaction exhausted — `compactions >= max_pad_compactions`, which a **negative** setting switches off entirely | `thinking filled the context` | none |
 | 4 | context, pad too small to compact — `count_text(pad) <= PAD_TAIL_TOKENS * 2` (4,000); everything would survive as the verbatim tail anyway | `…too little to compact` | none |
 | 5 | a checkpoint failed **and** the pad's tail was no shorter than the pad — `_compact_pad()` returned `""` and `_pad_tail()` could not shrink it | — | none: *"concluding from a complete pad is the fallback, losing it is never"* |
-| 6 | the model answered — it closed the block itself and the text was complete | — | none |
+| 6 | the model answered — it closed the block itself, and what it wrote is a real answer: still non-empty after `strip_tool_markup()`, not cut off at the lap cap, and not carrying a closed `<tool_call>` block | — | none |
 | 7 | the model stopped without text and without being cut off | — | none |
 | 8 | no progress — cut off at the cap having written nothing, so the pad cannot grow and every further round would be identical | `reasoning stopped making progress` | none |
 
-**A turn never ends silent.** If it produces no answer — rare now that reasoning
-is resumed rather than discarded, but possible if even the closing round comes
-back empty — the turn says what it spent anyway. A failed turn should not also be
-an invisible one; the stats line is the only evidence such a turn ever happened.
+**A turn never ends silent.** Two guards in `_turn()`'s round loop stand behind
+that, and both send the round to `_think_pad()`. The first is the cut-off round
+everything above describes. The second is a round that stopped *cleanly* having
+said nothing — no tool call, and no text or only whitespace. `was_cut_off()`
+does not catch that one, because it tests for `finish_reason == "length"`, so
+the turn used to read the silence as "finished" and go straight to the
+digester with nothing to show. The pad always ends on a closing round, so
+handing it there is what buys one more chance to speak.
+
+The second guard holds only while the pad is available. **With `reasoning:
+false` the pad is off entirely** (§6) and a round that says nothing is
+deliberately the end — the same contract that sends a cut-off round straight
+to the `## Forced conclusion` directive. A padded round that comes back empty
+is also not padded again: it has had its closing round already.
+
+If a turn still produces no answer — possible if even that closing round comes
+back empty — it says what it spent anyway. A failed turn should not also be an
+invisible one; the stats line is the only evidence such a turn ever happened.
 
 Separately, the round loop in `_turn()` ends the turn's *work* independently
 of any of this, on the same rule the pad uses and for the same reason: when
@@ -285,6 +299,23 @@ the older reasoning is dropped mechanically instead of being distilled — but
 the tail is the resume point, which is the part that has to survive verbatim
 anyway. Only when even the tail cannot shrink the pad does the turn close,
 and it closes by concluding from a complete pad rather than by losing it.
+
+Exit 6 deserves one too, because it is the only exit that *skips* the closing
+round: what the model wrote mid-pad becomes the answer word for word, with no
+later round to correct it. That is why its test is the longest of the eight.
+Three things disqualify a resume's text,
+and each costs only a closing round to recover: text that strips to nothing
+was pure markup; text that stopped at `length` is half a sentence, because a
+resume runs under the small lap cap and not the answer reserve; and text
+carrying a closed `</tool_call>` is a model that wanted to **act**. A resume is
+offered no tools at all (§1), so a model that decides mid-thought to call one
+writes the chat template's own markup into its text instead. On the raw
+transport `ToolMarkupFilter` lifts that block out and the round returns as a
+tool call, which `_think_pad()` hands straight back; on the chat transport
+nothing parses it, so it reaches `.text` intact and what survives
+`strip_tool_markup()` is the narration around it — *"Now the client docs …"* —
+not an answer. Falling through is what gets that round to the closing round,
+which **is** offered the tools and can make the call for real.
 
 ## 5. Where the reasoning goes
 
@@ -392,7 +423,9 @@ llama.cpp's `--reasoning-format` decides which channel the server uses:
 **The splitter engages only on a stream that *opens* with the tag.** That is
 what a template emits, and the restriction is what lets an answer that merely
 writes about these tags — an ordinary thing to do in this repo — through
-untouched.
+untouched. The close side has the same guard: only a close tag that starts a
+line ends the block, because a tag inside a sentence is the thought quoting
+the markup rather than the template closing it.
 
 The startup probe (`LLMEngine.capabilities()`) acts on what it finds rather
 than only reporting it, and the useful verdict is the negative one. The

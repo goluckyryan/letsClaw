@@ -77,6 +77,12 @@ class InlineThinkSplitter:
     passed through untouched. Costs nothing on a correctly configured server:
     there is no opening tag, the first chunk decides that, and everything
     after is forwarded unexamined.
+
+    The close tag ends the block only when it starts a line, as the template
+    writes it. A thought that merely *writes about* the markup puts a
+    `</think>` inside a sentence — "so  thinking and  indicate the
+    boundary" — and that is prose, not the end of the block: taking it for the
+    tag cut the thought in half and sent the words after it on as the answer.
     """
 
     OPEN, CLOSE = "<think>", "</think>"
@@ -89,6 +95,11 @@ class InlineThinkSplitter:
         # The newline after an opening tag belongs to the tag. It may arrive
         # in a later chunk than the tag did, so this outlives one feed().
         self._eat_open_newlines = False
+        # Last character of the stream already forwarded as reasoning. A close
+        # tag at the front of `_buf` starts a line only if this is a newline;
+        # the hold-back below can leave a tag at index 0 after emitting the
+        # prose in front of it, and that space must not become a fresh line.
+        self._prev = "\n"
 
     def feed(self, chunk):
         """One chunk in; `(text, reasoning)` out, either possibly empty."""
@@ -128,8 +139,9 @@ class InlineThinkSplitter:
                 return "", ""
             self._eat_open_newlines = False
         self._buf += chunk
-        if self.CLOSE in self._buf:
-            head, _, tail = self._buf.partition(self.CLOSE)
+        i = self._find_close()
+        if i >= 0:
+            head, tail = self._buf[:i], self._buf[i + len(self.CLOSE):]
             self._buf = ""
             # The newlines around the tag are the tag's, not the thought's and
             # not the answer's. When the tail is empty they are still coming.
@@ -146,8 +158,25 @@ class InlineThinkSplitter:
                 cut -= 1
             if cut:
                 out, self._buf = self._buf[:cut], self._buf[cut:]
+                self._prev = out[-1]
                 return "", out
         return "", ""
+
+    def _find_close(self):
+        """Index of a close tag that starts a line, or -1.
+
+        The template puts the close tag on a line of its own. A tag inside a
+        sentence is the thought quoting the markup, so skip it and keep
+        looking: the real close, if any, is further on.
+        """
+        i = self._buf.find(self.CLOSE)
+        while i != -1:
+            line_start = (self._buf[i - 1] == "\n" if i
+                          else self._prev == "\n")
+            if line_start:
+                return i
+            i = self._buf.find(self.CLOSE, i + 1)
+        return -1
 
     def finish(self):
         """Flush whatever is held back. `(text, reasoning)`."""
