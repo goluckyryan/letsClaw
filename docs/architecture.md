@@ -91,14 +91,14 @@ a command and that suite names it; see
 
 | file | lines | owns |
 |---|---|---|
-| `source/core.py` | 4198 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
+| `source/core.py` | 4315 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
 | `source/session.py` | 829 | **the disk layer.** Live store, archives, the journal, the handoff summariser, the id registry |
 | `source/server.py` | 1223 | **the transport.** aiohttp routes, the WebSocket handler, the Host and Origin guards, auth, backpressure |
-| `source/llm_engine.py` | 984 | **the model.** Two transports (`chat` and `raw`), streaming, tool-call parsing, resume |
+| `source/llm_engine.py` | 1024 | **the model.** Two transports (`chat` and `raw`), streaming, tool-call parsing, resume |
 | `source/config.py` | 602 | **config.yaml → engines.** Loading, the webui presentation keys, number coercion, `build_all_engines` (which doubles as the validator), and the reload diff. Touches no `Session`, which is why it is not in `core` |
 | `source/behavior.py` | 339 | **the behavior layers.** `BehaviorStore`, the read-through cache behind a lock, and the two directives extracted out of `base.md` |
 | `source/config_edit.py` | 289 | rewriting the `webui:` block of `config.yaml` **as text**, so the file's comments survive a save |
-| `source/ssh_forward.py` | 571 | **model servers over ssh.** One supervised `ssh -N -L` child per model entry that names an `ssh_forward`, on a port the core picks itself |
+| `source/ssh_forward.py` | 732 | **model servers over ssh.** One supervised `ssh -N -L` child per model entry that names an `ssh_forward`, on a port the core picks itself |
 | `source/tools.py` | 823 | `exec`, `read_file`, `write_file`, `list_dir`, `show_image`, the search and edit tools, … and their JSON schemas |
 | `source/logging_setup.py` | 107 | one rotating log file **per writer** (`letclaw-core.log`, `letclaw-discord.log`), because two processes sharing one file cannot rotate it safely |
 | `source/token_counter.py` | 220 | counts with tiktoken's `cl100k_base`, cached under `state/tiktoken/` so it is fetched once ever rather than once per reboot; degrades loudly to 4-chars-per-token if the vocab cannot be loaded at all |

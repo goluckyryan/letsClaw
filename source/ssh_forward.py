@@ -30,9 +30,13 @@ notices the child died (the ssh path dropped) and brings it back.
 """
 
 import asyncio
+import ctypes
 import logging
+import signal
 import socket
 import subprocess
+import threading
+import time
 from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger("letclaw.ssh")
@@ -46,6 +50,64 @@ STARTUP_DELAY = 1.0
 # once, before the first spawn, against whatever already holds the port — which
 # may be something that never answers at all, so it has to be bounded.
 PROBE_TIMEOUT = 3
+# How long ssh may spend deciding the path is dead. Without it a jump host that
+# stops answering packets (rather than refusing) hangs in the kernel's TCP
+# timeout — about two minutes, once per hop — and neither STARTUP_TRIES nor any
+# timeout in this module bounds that wait, because ssh has not failed yet. Five
+# seconds is generous for a LAN hop and turns that two-minute hang into a
+# fifteen-second failure like every other one.
+CONNECT_TIMEOUT = 5
+# How long a failed ensure() is remembered as failed. Without it a down path
+# costs the full STARTUP_TRIES every single time somebody asks for that model:
+# restore() walks sessions one at a time, so two sessions saved on the same
+# unreachable model each paid 15 s at startup, and the core served nothing
+# until both had finished. The keepalive retries on HEALTH_INTERVAL, so a
+# cache that expires on that cadence cannot delay recovery by more than a
+# cycle. force=True bypasses it — that is what "try again" means.
+FAIL_COOLDOWN = HEALTH_INTERVAL
+
+
+# Resolved at import, not in the child: ctypes.CDLL(None) is a dlopen, and the
+# loader takes a lock another thread could be holding at fork time. Doing it
+# here leaves exactly one function call between fork and exec, which is what
+# makes preexec_fn tolerable — it is documented unsafe in threaded processes
+# for precisely that window, and the core does run to_thread workers.
+try:
+    _PRCTL = ctypes.CDLL(None).prctl
+except Exception:                 # no libc by that name, or not Linux
+    _PRCTL = None
+
+
+def _on_main_thread() -> bool:
+    """True when the calling thread is the process's main thread.
+
+    Decided in the parent, before the fork: PR_SET_PDEATHSIG is armed against
+    the thread that called fork, so it fires when *that thread* exits rather
+    than when the process dies. In a threaded parent that is the wrong promise
+    — a worker finishing would take a healthy tunnel down with it. The core is
+    single-threaded asyncio but does run to_thread workers, so this is checked
+    rather than assumed. It cannot be checked in the child: fork leaves the
+    child with one thread whatever the parent's were.
+    """
+    return threading.current_thread() is threading.main_thread()
+
+
+def _pdeathsig():
+    """Ask the kernel to kill this child if our process dies.
+
+    Runs between fork and exec in the child. The point is the case supervision
+    cannot reach: a core that is SIGKILLed — OOM killer, `pkill -9`, a
+    `systemd kill` — runs no `close()`, no shutdown hook, nothing, and its ssh
+    children are reparented to init and keep the tunnel open forever. Eighty-
+    five of those once sat on this machine, and no code in this module could
+    have prevented them, because prevention needs the kernel.
+
+    Only ever installed when _on_main_thread() said yes in the parent, which is
+    what makes the promise mean "when the core dies". SIGKILL because it is not
+    refusable: a child that caught SIGTERM would survive its own parent.
+    """
+    if _PRCTL is not None:
+        _PRCTL(1, int(signal.SIGKILL), 0, 0, 0)    # 1 = PR_SET_PDEATHSIG
 
 
 def pick_free_port():
@@ -90,11 +152,19 @@ class SSHForward:
         # pid of the exited child _healthy() has already complained about, so
         # ensure()'s fifteen retries do not print the same line fifteen times.
         self._warned_dead = None
+        # monotonic time of the last failed ensure(), and the message it
+        # raised. See FAIL_COOLDOWN: this is what stops a down path being paid
+        # for in full fifteen-second instalments by every session that wants it.
+        self._failed_at = None
+        self._failure = None
 
     # -- lifecycle -----------------------------------------------------------
 
-    def _spawn(self):
+    def _spawn_cmd(self):
+        """The ssh argv for this forward. Built separately from _spawn() so the
+        options can be read without starting a process."""
         cmd = ["ssh", "-o", "BatchMode=yes",
+               "-o", f"ConnectTimeout={CONNECT_TIMEOUT}",
                "-o", "ExitOnForwardFailure=yes",
                "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=6"]
         if self.jump:
@@ -110,6 +180,13 @@ class SSHForward:
             else:
                 juser, jhost = "", self.jump
             jcmd = ["ssh", "-o", "BatchMode=yes",
+                    # The hop that actually hangs. ssh ignores ConnectTimeout
+                    # once a ProxyCommand is in play — it simply waits for the
+                    # proxy to produce a connection — so the bound has to be
+                    # put on the inner ssh, which is the one dialling the jump
+                    # host. Without it a jump host that stops answering
+                    # packets parks this spawn in the kernel's TCP timeout.
+                    "-o", f"ConnectTimeout={CONNECT_TIMEOUT}",
                     "-o", "HostKeyAlgorithms=+ssh-rsa",
                     "-o", "PubKeyAcceptedAlgorithms=+ssh-rsa"]
             if juser:
@@ -119,14 +196,31 @@ class SSHForward:
         remote = f"127.0.0.1:{self.remote_port}"
         cmd += ["-N", "-L", f"127.0.0.1:{self.local_port}:{remote}",
                 self.target]
+        return cmd
+
+    def _spawn(self):
+        cmd = self._spawn_cmd()
+        remote = f"127.0.0.1:{self.remote_port}"
         via = f" (via {self.jump})" if self.jump else ""
         logger.info("ssh forward %s: %s -> %s (via %s)%s", self.name,
                     f"127.0.0.1:{self.local_port}", remote,
                     self.target, via)
+        # preexec_fn is only passed when we are on the main thread, so a fork
+        # from a worker never arms PDEATHSIG against that worker's lifetime.
+        # The alternative — always passing it — would kill a healthy tunnel the
+        # moment the worker that happened to spawn it finished.
+        kwargs = {}
+        if _on_main_thread():
+            kwargs["preexec_fn"] = _pdeathsig
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
         return self._proc
+
+    def _failure_recent(self) -> bool:
+        """True when the last failed ensure() is still inside FAIL_COOLDOWN."""
+        return (self._failure is not None and self._failed_at is not None and
+                (time.monotonic() - self._failed_at) < FAIL_COOLDOWN)
 
     async def _accepts(self) -> bool:
         """True when something accepts TCP on the local end of the forward.
@@ -231,7 +325,7 @@ class SSHForward:
             return False
         return True
 
-    async def ensure(self):
+    async def ensure(self, force=False):
         """Bring the forward up and wait until it answers. Idempotent: a
         healthy forward is a cheap no-op (one TCP connect).
 
@@ -240,32 +334,90 @@ class SSHForward:
         engine-build path (so the first engine for a model is never handed out
         before its forward is up). They serialize on the lock.
 
+        A failure is remembered for FAIL_COOLDOWN, so the second person to ask
+        for a down model is told so immediately instead of waiting out the
+        fifteen retries again. force=True skips that memory and the cached
+        error: it is what a person means by "try again", and honouring it is
+        the difference between a retry and a replay of a stale answer.
+
         Raises RuntimeError when the forward does not answer in time — the
         caller then keeps the old engine (if any) rather than handing out one
         that cannot reach its server.
         """
+        # Tested before the lock as well as after it. restore() walks sessions
+        # one at a time, so a check that only happened after acquiring the lock
+        # would still make the second session on a dead model wait out the
+        # fifteen seconds the first one just spent — which is the cost this
+        # cache exists to remove. Reading two attributes unlocked is safe: the
+        # worst outcome is one extra attempt on a path that just went down.
+        if not force and self._failure_recent():
+            raise RuntimeError(self._failure)
         async with self._lock:
             if self._closed:
                 return
+            if not force and self._failure_recent():
+                # Re-checked after waiting: whoever held the lock may have just
+                # failed, and this is what stops a second waiter paying the
+                # fifteen retries the first one already paid.
+                raise RuntimeError(self._failure)
             if await self._healthy():
                 self._started = True
+                self._failure = None
+                self._failed_at = None
                 return
             if self._proc is None or self._proc.poll() is not None:
                 self._spawn()
             for _ in range(STARTUP_TRIES):
                 if await self._healthy():
                     self._started = True
+                    self._failure = None
+                    self._failed_at = None
                     return
                 await asyncio.sleep(STARTUP_DELAY)
-            logger.error("ssh forward %s did not come up "
-                         "(127.0.0.1:%s -> %s via %s)", self.name,
-                         self.local_port, f"127.0.0.1:{self.remote_port}",
-                         self.target)
-            raise RuntimeError(
+            # Give up properly: kill what we started. Leaving it alive is worse
+            # than the failure it produced — the respawn guard above is "no
+            # child, or a dead one", so a live-but-useless ssh makes every
+            # later ensure() skip the spawn and re-time-out against a process
+            # that is never going to work. A tunnel that never came up is also
+            # exactly the thing nobody wants left running.
+            #
+            # Safe to kill unconditionally because _proc is only ever assigned
+            # by _spawn(). A port found already serving our far side is reused
+            # without a child at all, so nothing here can reach a process that
+            # belongs to somebody else.
+            if self._proc is not None and self._proc.poll() is None:
+                logger.info("ssh forward %s: giving up — closing the child we "
+                            "started (pid %s)", self.name, self._proc.pid)
+                self._proc.kill()
+                try:
+                    await asyncio.wait_for(self._wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    logger.warning("ssh forward %s: child did not die after "
+                                   "SIGKILL", self.name)
+            self._proc = None
+            # Logged once per failure, and only for a forward that has never
+            # been up: a path that came up and then dropped is the keepalive's
+            # business, and it will say so when it tries to revive it. The
+            # engine-build path is the one that reports to whoever needs the
+            # model, so this line is for the log, not for the user.
+            if self._started:
+                logger.warning("ssh forward %s is down "
+                               "(127.0.0.1:%s -> %s via %s) — retrying every "
+                               "%.0f s", self.name, self.local_port,
+                               f"127.0.0.1:{self.remote_port}", self.target,
+                               HEALTH_INTERVAL)
+            else:
+                logger.error("ssh forward %s did not come up "
+                             "(127.0.0.1:%s -> %s via %s)", self.name,
+                             self.local_port, f"127.0.0.1:{self.remote_port}",
+                             self.target)
+            self._failure = (
                 f"ssh forward {self.name} did not come up "
                 f"(127.0.0.1:{self.local_port} -> 127.0.0.1:{self.remote_port} via {self.target}) — "
                 "check the ssh binary is installed, the key for the target is "
                 "authorized there, and the path (jump host, network) is reachable")
+            self._failed_at = time.monotonic()
+            raise RuntimeError(self._failure)
 
     async def maintain(self):
         """Keepalive pass: make sure the forward is up.
@@ -275,9 +427,14 @@ class SSHForward:
         this swallows it so a persistently-down path does not spam every cycle
         — the engine-build path is the one that reports it to whoever needs
         the model.
+
+        force=True: this loop is the recovery mechanism, so it must not be
+        served from the failure cache. The cache exists to stop a *person*
+        paying for the retries repeatedly; the keepalive paying them is the
+        whole reason the path comes back on its own.
         """
         try:
-            await self.ensure()
+            await self.ensure(force=True)
         except Exception:
             pass
 
@@ -490,13 +647,17 @@ class SSHForwardManager:
     def forward(self, model_name):
         return self._forwards.get(model_name)
 
-    async def forward_for(self, model_name):
+    async def forward_for(self, model_name, force=False):
         """The model's forward, guaranteed up. None when the model has no
-        forward (the normal case)."""
+        forward (the normal case).
+
+        force=True is passed straight to ensure(): it means a person asked for
+        this model now, so the failure cache must not answer for the network.
+        """
         fwd = self._forwards.get(model_name)
         if fwd is None:
             return None
-        await fwd.ensure()
+        await fwd.ensure(force=force)
         return fwd
 
     def status(self):

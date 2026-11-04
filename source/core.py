@@ -724,6 +724,14 @@ class Session:
         self.lock = asyncio.Lock()
         self.subscribers = set()
         self.dead = False       # deleted; sockets still on it must be re-homed
+        # Set by restore() when the model this session was saved on could not
+        # be reached at startup and the session came up on the default instead.
+        # A silent substitution is the worst kind of surprise: the conversation
+        # looks normal and every answer comes from somewhere else. Delivered to
+        # the first client that attaches (see attach) rather than at startup,
+        # because at startup there is nobody to tell — and cleared then, so a
+        # /model correction is not followed by a stale warning forever.
+        self.startup_note = None
         self._seq = itertools.count(1)
         self.last_seq = 0
         self.turn_events = []   # current turn only; history serves fresh attaches
@@ -812,6 +820,20 @@ class Session:
 
     def attach(self, sub):
         self.subscribers.add(sub)
+        # The startup substitution note, if one is owed. Pushed straight to this
+        # subscriber's lane rather than emitted: emit() stamps a seq and appends
+        # to turn_events, and this is neither a turn event nor something a
+        # reconnecting client should replay. Cleared here so a session whose
+        # model was corrected since startup does not go on warning about it.
+        #
+        # The server sends the hello greeting before it starts the writer task,
+        # so this lands after it: the client learns which model it is on, then
+        # that the model it asked for was unreachable.
+        if self.startup_note:
+            note, self.startup_note = self.startup_note, None
+            sub.push(ev("notice", level="error", text=note,
+                        session=self.name, turn=self.turn_id,
+                        round=self.round_id))
 
     def detach(self, sub):
         self.subscribers.discard(sub)
@@ -3296,7 +3318,11 @@ class Session:
                 # a name here and this is a switch.
                 target = args.strip()
                 try:
-                    await self.use_model(target)
+                    # force=True: this is a person asking for the model now.
+                    # A failure cached seconds ago must not answer for the
+                    # network, or "/model x" after a path comes back would
+                    # keep reporting it down until the cooldown expired.
+                    await self.use_model(target, force=True)
                 except ValueError as e:
                     return {"ok": False, "error": str(e)}
                 self.emit(ev("session_state", what="model", model=self.model_name,
@@ -3333,13 +3359,22 @@ class Session:
                                  "(or bare /digest to report the mode)"}
         return {"ok": False, "error": f"unknown command: /{name}"}
 
-    async def use_model(self, model_name=None):
+    async def use_model(self, model_name=None, force=False):
         """Point this session at a model, keeping the conversation.
 
         The engine comes from the manager's cache and is never closed here —
         another session may be mid-stream on it.
+
+        force=True is a person asking for this model right now — /model. It
+        reaches ensure() through engine_for so a failure cached seconds ago
+        cannot answer for the network: "try again" has to mean try, not replay
+        the last answer. Session creation on attach deliberately does not force.
+        The keepalive's first pass is immediate at startup, so by the time
+        anybody attaches the path has already been tried once this process
+        lifetime, and a new session should hear that answer at once rather than
+        wait out the retries a second time.
         """
-        engine, name, entry = await self.manager.engine_for(model_name)
+        engine, name, entry = await self.manager.engine_for(model_name, force=force)
         # Logged before the assignment, so the line carries both ends of the
         # move. Without it the only record of which model a session is on is the
         # restore line at startup, which makes "why is this session on that
@@ -3440,26 +3475,37 @@ class SessionManager:
         self._schemas = [t.spec for t in self._tools]
         self._tools_tok = count_tools(self._schemas)
 
-    async def engine_for(self, model_name=None):
+    async def engine_for(self, model_name=None, force=False):
         name = model_name or self.config.get("models", {}).get("default_model")
+        # The ssh forward is ensured OUTSIDE the lock. It is the only slow part
+        # of building an engine, and holding the one lock every session shares
+        # while it runs meant a dead path to one model blocked sessions that
+        # wanted an entirely different, healthy one: a first helios attempt
+        # spends fifteen seconds in retries, and a session attaching to a
+        # direct-URL model during that window simply waited for it.
+        #
+        # Two sessions racing on the same new model may now both ensure the
+        # forward. That is harmless — ensure() on a healthy forward is one TCP
+        # connect, and SSHForward serializes itself on its own lock.
+        #
+        # ensure() raises RuntimeError when the ssh path does not come up.
+        # Convert it to ValueError at this seam: every caller of engine_for (ws
+        # attach, /model, restore) already turns a ValueError into a clean
+        # error event, and a dead helios path must read as "model unusable
+        # right now", not a 500. The keepalive keeps retrying in the
+        # background; a retry of the same command picks the model up when the
+        # path is back.
+        try:
+            fwd = await self.forwards.forward_for(name, force=force)
+        except RuntimeError as e:
+            raise ValueError(
+                f"model '{name}' is unreachable — {e} — the ssh path "
+                "is down (jump host or far side); the keepalive is "
+                "retrying, try again in a moment") from e
         # Under a lock: two sessions racing on the same uncached model would
         # otherwise each build an AsyncOpenAI and orphan one of them.
         async with self._engine_lock:
             if name not in self._engines:
-                # ensure() raises RuntimeError when the ssh path does not come
-                # up. Convert it to ValueError at this seam: every caller of
-                # engine_for (ws attach, /model, restore) already turns a
-                # ValueError into a clean error event, and a dead helios path
-                # must read as "model unusable right now", not a 500. The
-                # keepalive keeps retrying in the background; a retry of the
-                # same command picks the model up when the path is back.
-                try:
-                    fwd = await self.forwards.forward_for(name)
-                except RuntimeError as e:
-                    raise ValueError(
-                        f"model '{name}' is unreachable — {e} — the ssh path "
-                        "is down (jump host or far side); the keepalive is "
-                        "retrying, try again in a moment") from e
                 self._engines[name] = configlib.build_engine(self.config, name, forward=fwd)
             return self._engines[name]
 
@@ -4007,7 +4053,14 @@ class SessionManager:
         until each session was clicked — which is the thing being fixed.
 
         Cheap enough to do up front: engine_for() builds an AsyncOpenAI client
-        without touching the network, and behavior files are read once and cached.
+        without touching the network, and behavior files are read once and
+        cached. One exception, and it is the reason this loop is not simply
+        fast: a model behind ssh_forward pays a tunnel attempt, which is up to
+        STARTUP_TRIES seconds when the path is down. The failure cache in
+        ssh_forward is what keeps that a single cost per model rather than one
+        per session — before it, two sessions saved on the same unreachable
+        model each waited the full fifteen seconds, and the core served nothing
+        until both had.
         """
         for payload in reversed(await store.load_live(self.config)):
             name = payload["name"]
@@ -4027,6 +4080,16 @@ class SessionManager:
                 except Exception:
                     logger.exception("session %s: no usable model, skipping", name)
                     continue
+                # The substitution has to reach a person, not just the log.
+                # Before this, a session that went to sleep on helios woke up
+                # on the default model and every client drew it as if nothing
+                # had happened — the only trace was a warning line in a file
+                # nobody opens. Delivered on first attach; see startup_note.
+                s.startup_note = (
+                    f"this session was saved on model '{payload.get('model')}', "
+                    f"which was unreachable at startup — it is on "
+                    f"'{s.model_name}' instead. /model {payload.get('model')} "
+                    "to go back once the path is up")
             # After use_model, never before: it rebuilds history[0] from the
             # behavior file, so assigning first would throw away the
             # === CONTINUED SESSION === block a rollover left in the system
