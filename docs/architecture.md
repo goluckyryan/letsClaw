@@ -74,18 +74,33 @@ conversation state — see
 [principle 1](design-principles.md#1-the-core-owns-the-conversation-clients-are-windows-onto-it).
 `./serve.sh` starts the core and the bot together.
 
-### The command node is a listing, and it is policed
+### The command node is a listing, and the listings are many
 
 Two names in that node are not core commands: `/session` maps a *channel* to a
 session and lives only in the bot, and `/reasoning` is a display toggle local to
 whichever client drew it. (`/stop` and `/steering` are protocol messages of their
 own rather than commands, and `/help` is each client's.) All of them are in the
-diagram because a person types them, and all are excused by name in
-`tests/test_command_surface.py` — which checks every other word against
-`Session.command()`, this node and the [terminal command
-table](../README.md#commands-you-can-type) among them. Miss a listing when adding
-a command and that suite names it; see
-[extending.md](extending.md#add-a-command).
+diagram because a person types them.
+
+**Adding a command means editing every row below, and a word a client lists that
+the core does not implement is a bug in whichever direction it errs. Several rows
+carry more than one listing:**
+
+| | |
+|---|---|
+| `source/core.py` | the branch in `Session.command` — the only one that does anything |
+| `source/chat.py` | `COMMANDS` (the help line and tab completion both read it) |
+| `web/app.js` | `COMMANDS`, and a toolbar handler if it gets a button |
+| `web/index.html` | that button |
+| `source/discord_client.py` | `COMMAND_WORDS` — **miss this one and `!cmd` is sent to the model as chat** — `HELP`, and `_register_commands` for the native slash picker |
+| `README.md` | the terminal command table, and the Discord prose list of what the bot accepts |
+| `docs/architecture.md` | the Mermaid `Cmds` node above, and the prose beside it that excuses the non-core words |
+
+`app.js`'s `COMMANDS` is a **hard gate**, not a help table: `submit()` rejects any
+`/word` missing from it before the core ever sees it, while `chat.py` forwards
+anything. So a command absent from the web table is not under-documented there —
+it is unreachable there and reachable in the terminal at the same time. See
+[clients.md](clients.md#what-is-shared-and-what-is-not).
 
 ## Files
 
@@ -94,8 +109,8 @@ a command and that suite names it; see
 | `source/core.py` | 4315 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
 | `source/session.py` | 829 | **the disk layer.** Live store, archives, the journal, the handoff summariser, the id registry |
 | `source/server.py` | 1223 | **the transport.** aiohttp routes, the WebSocket handler, the Host and Origin guards, auth, backpressure |
-| `source/llm_engine.py` | 1024 | **the model.** Two transports (`chat` and `raw`), streaming, tool-call parsing, resume |
-| `source/config.py` | 602 | **config.yaml → engines.** Loading, the webui presentation keys, number coercion, `build_all_engines` (which doubles as the validator), and the reload diff. Touches no `Session`, which is why it is not in `core` |
+| `source/llm_engine.py` | 1170 | **the model.** Two transports (`chat` and `raw`), streaming, tool-call parsing, resume |
+| `source/config.py` | 602 | **config.yaml → engines.** Loading, the webui presentation keys, number coercion, `build_all_engines` (which doubles as the validator), and the reload diff. Touches no `Session`, which is why it is not in `core`. `build_engine()` passes the constructor the transport and the generation options it forwards (`base_url`, `api_key`, `provider_name`, `timeout`, `temperature`, `max_tokens`, `top_p`), then assigns the eight **policy** attributes onto the instance: `context_length`, `max_output`, `turn_timeout`, `reasoning`, `answer_time_reserve`, `max_pad_compactions`, `resume_mode`, `reasoning_effort`. The split is deliberate and easy to get wrong: `LLMEngine.__init__` takes `**kwargs` straight into `extra_params`, which `get_model_params()` forwards to `chat.completions.create()`, so a policy key handed to the constructor is sent to the server as a generation option instead of configuring the session — and is silently accepted. That is where a ninth belongs. Grepping `llm_engine.py` for `max_pad_compactions` finds nothing, because the name is only ever assigned from outside |
 | `source/behavior.py` | 339 | **the behavior layers.** `BehaviorStore`, the read-through cache behind a lock, and the two directives extracted out of `base.md` |
 | `source/config_edit.py` | 289 | rewriting the `webui:` block of `config.yaml` **as text**, so the file's comments survive a save |
 | `source/ssh_forward.py` | 732 | **model servers over ssh.** One supervised `ssh -N -L` child per model entry that names an `ssh_forward`, on a port the core picks itself |
@@ -108,13 +123,13 @@ a command and that suite names it; see
 | `source/chat.py` | 749 | the terminal client |
 | `source/ui.py` | 86 | the terminal client's spinner and TTFT line |
 | `source/discord_client.py` | 2555 | the Discord client |
-| `source/discord_probe.py` | 49 | **"should the bot be started?", answered once.** `serve.sh` and `install.sh` both run it and read the verdict off the exit code; they used to each carry their own copy of the question and the copies drifted |
-| `web/` | 2983 (`app.js`) | the browser client (`index.html`, `app.js`, `style.css`) — vanilla JS, no build step |
+| `source/discord_probe.py` | 49 | **"should the bot be started?", answered once.** `serve.sh` and `install.sh` both run it and read the verdict off the exit code, because the answer depends on the config, the token and the core's URL and one copy of that logic cannot disagree with itself |
+| `web/` | 2979 (`app.js`) | the browser client (`index.html`, `app.js`, `style.css`) — vanilla JS, no build step |
 
-These are `wc -l` as of this writing, not estimates. The column drifted past
-"useful" once before by carrying a `~` in front of every figure, which let it
-be wrong by a third without failing anything — so if you would rather not
-maintain it, drop the column rather than soften the numbers again.
+These are `wc -l`, not estimates. The column is only worth having while it is
+exact: a `~` in front of every figure lets it be wrong by a third without
+failing anything, so if you would rather not maintain it, drop the column rather
+than soften the numbers again.
 
 ### Around the modules: the rest of the tree
 
@@ -129,9 +144,6 @@ letsClaw/
   models/                  behavior Markdown: base.md + per-model
     sessions/                per-session layer; every file gitignored but its README
   web/                     browser client: index.html, app.js, style.css, vendor/
-  tests/                   every suite and helper; run_all.py runs them
-                             (gitignored — local to the machine it was written on,
-                              so a clone has none)
   source/                  all Python (the table above)
   state/                   live conversations, archives, journals, pictures, memory
                              (gitignored)
@@ -346,6 +358,33 @@ numbers for one quantity reads as a bug.
 
 ---
 
+## Tools
+
+`source/tools.py` is the whole layer. A tool is an `async def` handler wrapped
+in `Tool(name, description, parameters, handler, max_output)` inside
+`build_tools`, added to the dict at the bottom, and named in the default `allow`
+list if it should be on by default — the last line there is
+`return [tools[k] for k in tools if k in allow]`. A read-only tool, one that
+changes nothing a later call in the same round could observe, also goes in
+`PARALLEL_SAFE`; anything with an effect stays out and runs in issue order (see
+`run_tools` above for what that ordering buys).
+
+`Tool.run_full(arguments)` returns `(full, clipped)`: the core journals the full
+text and gives the model the clipped one. A handler returns a plain string —
+argument parsing, a `TypeError` from a bad signature, and any other exception are
+all caught and turned into a string the model can read, so a broken tool costs a
+round and not a turn. `Tool.run()` is the same call with the clipped half only,
+for a caller with nowhere to put the full text.
+
+Two costs a new tool pays silently. Blocking work must go off the event loop
+([principle 14](design-principles.md#14-the-core-is-shared-so-nothing-may-block-it)),
+and its schema is counted into the prompt budget once per core
+(`SessionManager.__init__`, not per session) but spent on every round of every
+session that has tools — `show_image`, one sentence and two parameters, is worth
+121 tokens per request ([tokens.md](tokens.md)).
+
+---
+
 ## The thinking pad
 
 `_headroom_check()` through `_think_pad()` and `_compact_pad()`. The most
@@ -415,7 +454,7 @@ Corollary: a session-behavior file containing the literal string
 `restore()` avoids the problem differently — by assigning history *after*
 `use_model`, which would otherwise destroy the carryover.
 
-`apply_config` used to be a fourth and no longer is: it leaves `history`
+`apply_config` is deliberately **not** a fourth: it leaves `history`
 alone on purpose, because the prefix it would rebuild is the one the server
 has already tokenised, and rebuilding it mid-conversation costs every live
 session its KV cache for a behavior edit it did not ask for. An edited file
@@ -507,11 +546,11 @@ everything from `# Directives` to the next `# ` heading out of the base layer
 before the prompt is assembled — every model, every turn. A standing copy of a
 directive is worse than redundant: a model that reads its whole prompt as
 instruction will simply obey it. Claude Opus 5 over Argo, told on every turn that
-"this is not the final answer", answers nothing at all. Stripping used to be
-opt-in per model (`strip_directives: true`); that key is gone, because no model
-benefited from the copy and the ones that merely ignored it were still paying for
-it in tokens. An old `config.yaml` carrying the key still loads — unknown model
-keys are ignored.
+"this is not the final answer", answers nothing at all. Stripping is **not**
+opt-in per model: a `strip_directives` key would mean a model that merely ignores
+the copy still pays for it in tokens, and no model benefits from the copy, so
+there is nothing for the choice to decide. An old `config.yaml` carrying the key
+still loads — unknown model keys are ignored.
 
 Stripping and extraction read the file **independently**, which is what lets both
 halves work at once: `extract_*_directive()` sees the base as written, so the
@@ -748,7 +787,7 @@ someone changing where it is read.
 ### `/restart` — for the keys reload cannot reach
 
 `/restart` restarts the core process itself, from any client, which is what the
-restart-only tier needs and used to mean a shell on the core's host.
+restart-only tier needs, so those keys never require a shell on the core's host.
 
 It is **the same process afterwards**: the core `execv`s over itself, so the PID
 does not change, `serve.sh`'s `wait` keeps waiting and systemd never sees a
@@ -808,7 +847,12 @@ name lives inside the file.
 **wrong `LIVE_SCHEMA`** — each with a log line, and **never deletes them**.
 
 > ⚠️ **Bumping `LIVE_SCHEMA` silently discards every user's live
-> conversation.** This is why `session_id` was added additively.
+> conversation.** `load_live` skips every file at a version other than the one
+> it knows, so a bump is a wipe that leaves the files on disk. A new field is
+> therefore added **additively**: write it in `persist()`, read it in
+> `load_state()` with a default for a file that predates it. `session_id` is in
+> the payload that way. Bump the version only when the old shape is genuinely
+> unreadable.
 > [Principle 12](design-principles.md#12-bookkeeping-must-never-cost-a-turn).
 
 ### The id registry

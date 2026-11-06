@@ -52,9 +52,9 @@ Neither shell script works that out for itself. Both run
 `2` disabled, `3` no token, `4` no config yet, and `1` meaning the probe itself
 raised and the traceback is on stderr. `install.sh` asks the same question to
 decide whether to install `discord.py`. If you change what "the bot is wanted"
-means, change it there and nowhere else: the two scripts used to hold two copies
-of this and the copies drifted, until `install.sh` was reporting every uncaught
-exception as "no token" and skipping `discord.py` on a fresh install.
+means, change it there and nowhere else: the answer depends on the config, the
+token and the core's URL, so a second copy is a second place to get that wrong,
+and the two can disagree without either script noticing.
 
 ## Verify it is up
 
@@ -67,33 +67,6 @@ curl -s http://127.0.0.1:8770/health
 engines are constructed without I/O, so a wrong `base_url` only bites on the first
 turn, not at boot. A green `/health` means the core is up, not that a model works.
 To confirm a model, open a client and send a message.
-
-The suites live in `tests/`, all of them, and `tests/run_all.py` runs them — but
-**`tests/` is gitignored and stays that way**, so the suite exists on the machine
-it was written on and nowhere else. If you are reading this in a clone and
-`tests/` is missing, that is why, and it is deliberate. The two gates below are a
-local discipline, not something a fresh checkout or a CI job can enforce.
-
-```bash
-.venv/bin/python tests/run_all.py          # fast tier — gate a refactor on this
-.venv/bin/python tests/run_all.py --full   # everything — gate a commit on this
-```
-
-Two consequences worth knowing before you change anything. A test you write is
-invisible to `git diff`, `git status` and review, so a source fix lands tracked
-while the test guarding it does not — write both, but do not expect the pair to
-travel together. And `run_all.py` with no flags skips the entire browser tier, so
-a green fast run says nothing at all about `web/app.js`; anything touching the
-WebUI has to be re-run with `--full` and `CORE=`, or by calling the suite
-directly with `LIVE_TESTS=1`.
-
-The fast tier is hermetic: no network, no ssh, no browser, no spawned core.
-`--full` adds the ones that need something from outside the process, and three
-of those (`test_browser.py`, `test_image.py`, `test_math_render.py`) stay skipped
-until you set `CORE=` as well — they create and delete sessions on whatever core
-`CORE` names, and they no longer default to the live one, which is your real
-conversations. The runner globs `tests/test_*.py` rather than keeping a list, so
-a new suite is picked up with no edit.
 
 ## Security (read before exposing it)
 
@@ -159,7 +132,6 @@ source/chunker.py        fence-aware answer chunking (one file, used by the
 source/version.py        `__version__` — the one place the release number lives
                          (**every commit bumps it**; see the docstring for why)
 web/                     the WebUI (vanilla JS, no build)
-tests/                   every suite and helper, whatever it tests (gitignored)
 models/base.md           the base behavior file (committed)
 models/sessions/*.md     per-session behavior + archived transcripts (gitignored)
 config.example.yaml      the documented config template (committed)

@@ -121,9 +121,9 @@ JSON, so at 1,552 local for ten tools expect roughly 2,350–2,450, but do not
 quote it until someone diffs `prompt_tokens` for real. Measured numbers and
 extrapolated ones do not go in the same table.
 
-`show_image` is the newest and the one worth watching, because it is the one
-whose schema was written after this page existed. It adds **121 tokens to every
-request of every tool-enabled session, forever** — measured by diffing
+`show_image` is the one worth watching, because it is the newest schema and the
+only one not covered by the four-tool and five-tool figures below. It adds
+**121 tokens to every request of every tool-enabled session, forever** — measured by diffing
 `prompt_tokens` for the same prompt with and without it. That is why its
 description is one sentence: four tools cost 594 at the server, five cost 715
 — both measured before `reason` existed — and the gap is paid on every round

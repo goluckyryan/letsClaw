@@ -6,8 +6,8 @@ over a WebSocket. Behavior is plain MD files — everything visible, nothing hid
 
 ## Contents
 
-<!-- Generated list, and pinned: tests/test_doc_pointers.py fails if a
-     heading is added, renamed or removed without its line here. -->
+<!-- Generated list. Every heading in this file needs its line here, and a
+     heading renamed or dropped without its line breaks the anchors below. -->
 
 - [Philosophy / features](#philosophy--features)
 - [Quick Start](#quick-start)
@@ -862,7 +862,6 @@ of it — is in [`docs/`](docs/README.md):
 | [protocol.md](docs/protocol.md) | every HTTP route, every event, the auth rules and the replay rules |
 | [clients.md](docs/clients.md) | the terminal, the browser and the bot, each in as much detail as changing one needs |
 | [design-principles.md](docs/design-principles.md) | the rules the codebase follows, each with its evidence — read this before proposing a change |
-| [extending.md](docs/extending.md) | how to add a tool, a command, a route or a client, and what to run before committing |
 
 [`config.example.yaml`](config.example.yaml) is the reference for every setting,
 and [`AGENT.md`](AGENT.md) is the short imperative path from a fresh clone to a

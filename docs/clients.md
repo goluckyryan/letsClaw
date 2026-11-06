@@ -90,8 +90,8 @@ A **Settings** panel (⚙️ at the bottom of the session sidebar, backed by
 with secrets never shown at all — `/config` replaces `core.token`,
 `discord.token` and every `models.*.api_key` with `********` before the response
 leaves the core, so the panel prints `•••••••• set — in config.yaml` where a
-secret lives (there used to be a reveal toggle; it could only ever reveal the
-placeholder, so it was removed) — and the restart-only keys
+secret lives, and there is nothing to reveal: a toggle on that field could only
+ever show the placeholder — and the restart-only keys
 (`core.bind`, `core.port`, `logging.file`, `discord.enabled`) badged.
 Only the `webui` section is
 editable — its Save button posts to `POST /config`, which rewrites just that
@@ -106,7 +106,7 @@ disk and still in this list. Clicking a tile opens the same lightbox an inline
 image does; a `this session` toggle narrows the grid to what the open transcript
 is showing — a scan of the log **when the panel opens**, not a list kept as the
 session runs, so it cannot go stale, and its one limit is that an image trimmed
-away by the log cap is no longer "on screen". 🗑 deletes the file itself, after
+away by the log cap drops out of "on screen". 🗑 deletes the file itself, after
 a confirm, through `DELETE /files/<name>`, unless `webui.files_delete` is false
 — which takes the button away entirely, for a `files_dir` whose contents are not
 disposable. It is a second overlay built from the Settings panel's own box and
@@ -207,8 +207,8 @@ Mode, then right-click yourself → Copy User ID).
 `serve.sh` starts the bot whenever `discord.enabled` is not false and
 `discord.token` is set, and says which of the two was missing when it does not —
 so it stays the right command either way. The question is answered by
-`source/discord_probe.py`, whose exit code both `serve.sh` and `install.sh` read:
-they used to each carry their own copy of it, and the copies drifted.
+`source/discord_probe.py`, whose exit code both `serve.sh` and `install.sh` read,
+so the answer cannot be worded two ways in two scripts.
 `discord.enabled: false` is the off switch — the bot does not start, and
 `./run_discord.sh` refuses to run while it is set, rather than failing
 mysteriously. `./serve.sh --no-discord` leaves it out for one run.
@@ -340,15 +340,15 @@ not a setting.
 
 **Answers are chunked** by `source/chunker.py` — 2000 characters, a soft 17-line
 cap, and fences closed and reopened so a code block never leaks into the next
-message. **Every chunk is posted, however many.** There was a cap, `max_messages`,
-which posted the opening and filed the rest as an `answer.md` attachment; it was
-removed, because filing the tail turned a readable thread into a download at
-exactly the length that most needed reading. The length is bounded anyway — an
-answer cannot exceed the model's `max_output_tokens`, about 65 messages on a 32k
+message. **Every chunk is posted, however many.** There is deliberately no cap on
+how many messages one answer may become: the length is bounded anyway — an answer
+cannot exceed the model's `max_output_tokens`, about 65 messages on a 32k
 model and 16 on an 8k one — and discord.py waits out a 429, so a long burst is
-slow rather than lost. Only a chunk Discord actually refuses falls back to the
-whole answer as an `answer.md` attachment (`_attach_answer()`), saying which
-message failed rather than dropping the rest in silence.
+slow rather than lost, while filing a tail away would turn a readable thread into
+a download at exactly the length that most needed reading. Only a chunk Discord
+actually refuses falls back to the whole answer as an `answer.md` attachment
+(`_attach_answer()`), saying which message failed rather than dropping the rest
+in silence.
 
 **The rollover question** is posted like any other, and `yes`/`no` answers it —
 addressed the normal way, so replying to the question works. Not answering within
@@ -422,11 +422,13 @@ independent renderers**.
 
 This is the codebase's real maintenance tax, and it is worth naming plainly:
 **adding a field to a command's reply means editing up to three renderers, and
-nothing will tell you if you miss one.** The *fields* are untested; the
-*command lists* are not. `tests/test_command_surface.py` checks every client's
-table against the core's own dispatch, after the three had drifted far enough
-that `/models` was reachable in the terminal and on Discord while the WebUI
-rejected it outright.
+nothing will tell you if you miss one.** The core returns one dict and no code
+checks that the three renderers agree about it. The *command lists* are the near
+neighbour of that bug — three separate listings of what a client accepts, which
+is how `/models` came to be reachable in the terminal and on Discord while the
+WebUI rejected it outright, `app.js`'s `COMMANDS` being a hard gate rather than a
+help table. See
+[architecture.md](architecture.md#the-command-node-is-a-listing-and-the-listings-are-many).
 
 Whether to fix it is a genuine trade. A shared renderer would have to abstract
 over ANSI, HTML and Discord markdown, which are not very alike; the duplication

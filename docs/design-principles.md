@@ -84,8 +84,9 @@ The corollary is that machinery must not *also* be prompt.
 base layer for every model, leaving extraction working — because a hosted
 assistant reads the whole prompt as standing instruction and obeys "this is not
 the final answer" every turn, and because a local thinking model that merely
-ignores the copy is still paying for it in tokens. It was once opt-in
-(`strip_directives` per model); the key is gone.
+ignores the copy is still paying for it in tokens. There is no per-model switch
+for it: the choice would only ever be made one way, since no model benefits from
+reading a directive as standing instruction.
 
 ## 3. No hidden token injection
 
@@ -458,7 +459,8 @@ Honest notes, not excuses:
   disambiguated with `-2`, because there a collision would silently append a
   new window to a closed segment.
 - **`/static/` serves the whole `web/` directory** — `app.js`, `index.html`,
-  `style.css` and the vendored KaTeX, nothing else. The test helpers that used to
-  sit in `web/` (`test_md.mjs`, `browser_test.py`, `shot.py`) live in `tests/`,
-  which the core does not serve. Harmless while loopback-bound; worth knowing
-  before exposing the port.
+  `style.css` and the vendored KaTeX, and anything else dropped in there. Every
+  file the browser client needs is meant to be public, which is why the route
+  takes the directory rather than a list; a file that should not be readable
+  does not belong in `web/`. Harmless while loopback-bound; worth knowing before
+  exposing the port.

@@ -174,8 +174,12 @@ Two things about `used_now()` matter here:
 - It prefers the **server-measured** prompt size (`_last_used`) and only falls
   back to the local estimate. Which one is in force is reported at startup, so
   an estimate is never mistaken for a measurement. The estimate is calibrated
-  rather than padded — a flat `×1.6` here used to make a half-full window read
-  as full, which rolled sessions over to relieve pressure that was not there.
+  against a live server rather than padded with a multiplier: the error between
+  a local count and the server's has **three parts of three different shapes**
+  (a per-message overhead that grows with message count, a per-prompt schema
+  cost that never grows, and a prose scaling term), and one ratio cannot correct
+  errors that are not ratios. Getting this wrong moves the rollover point, which
+  is the one thing the figure exists to find. See [tokens.md](tokens.md).
 - `tally` publishes `_last_used` **mid-turn**, on every round whose prompt was
   exactly the current history (`history_shaped=True`, in `tally()`). A tool
   result landing between two pad rounds therefore moves the wall immediately.
@@ -264,8 +268,9 @@ that, and both send the round to `_think_pad()`. The first is the cut-off round
 everything above describes. The second is a round that stopped *cleanly* having
 said nothing — no tool call, and no text or only whitespace. `was_cut_off()`
 does not catch that one, because it tests for `finish_reason == "length"`, so
-the turn used to read the silence as "finished" and go straight to the
-digester with nothing to show. The pad always ends on a closing round, so
+nothing else in the loop distinguishes a silent round from a finished turn — and
+a silent round handed to the digester leaves nothing to summarise. The pad always
+ends on a closing round, so
 handing it there is what buys one more chance to speak.
 
 The second guard holds only while the pad is available. **With `reasoning:
@@ -287,13 +292,13 @@ answer`. That figure is **4,400 at the shipped `tools.max_output_chars: 8000`**
 `MIN_TOOL_ROUND_ROOM` (4,000) is only the floor under it: the method derives
 the rest from a configurable clip length, so raise the clip and the room check
 rises with it. It reads `_pad_headroom()` rather than a figure of its own, which is
-invariant 1 in §7: a third name for one number is how the gate and the wall
-drifted apart before.
+invariant 1 in §7: give one number a third name and the gate and the wall become
+two things that can disagree.
 
-Exit 5 deserves a note, because it used to be the worst of them. A checkpoint
-that came back empty ended the turn's thinking outright — with
-`max_pad_compactions: 10`, one bad note on the first cycle cost the other
-nine. It now falls back to keeping the pad's tail (`_pad_tail()`,
+Exit 5 is the one worth understanding, because the fallback is not obvious. A
+checkpoint that comes back empty must **not** end the turn's thinking: with
+`max_pad_compactions: 10`, one bad note on the first cycle would otherwise cost
+the other nine. It falls back to keeping the pad's tail (`_pad_tail()`,
 `PAD_TAIL_TOKENS`) and thinking on. That is lossier than a real checkpoint —
 the older reasoning is dropped mechanically instead of being distilled — but
 the tail is the resume point, which is the part that has to survive verbatim

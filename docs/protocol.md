@@ -51,9 +51,9 @@ native client do) or come from the same origin.
 `/` is unauthenticated on purpose — the page holds no secrets and is the thing
 that *asks* for the token.
 
-> `/static/` serves the whole `web/` directory. The test helpers that used to
-> sit there — `test_md.mjs`, `browser_test.py`, `shot.py` — now live in `tests/`,
-> which is not served, so the route exposes only the page and the vendored KaTeX.
+> `/static/` serves the whole `web/` directory, so it exposes the page, the
+> client and the vendored KaTeX — everything the browser needs, and nothing that
+> is not in `web/`.
 
 ---
 
@@ -114,8 +114,8 @@ filed under the first:
 - **read-only**, reply to the asker: `info`, `behavior`, and the bare forms of
   `model` (the listing) and `digest` (the state) — answered above the busy
   guard, because the moment you want to know is while a turn is running.
-  (`models` used to be a command of its own returning the first of those; it
-  was a second spelling of bare `/model` and is gone.)
+  There is no separate `/models`: the listing is bare `/model`, and a second
+  spelling of it would be a second command to keep in sync for no new answer.
 - **manager-level**, above the busy guard and outside the turn lock: `reload`,
   `restart`. They act on the whole core rather than one session, and taking the
   turn lock here would deadlock — `reload` defers busy sessions, including the
@@ -148,7 +148,7 @@ Every event carries `seq` and `session`, stamped by `Session.emit`
 | `tool_result` | `id, name, size` | |
 | `stats` | token and timing figures | the `⚡` line |
 | `turn_end` | `turn_id` | |
-| `notice` | `level` (`info`/`warn`/`error`), `text` | the general "say this to the human" event; 40+ emit sites. `error` is rare and means the opposite of "informational": the thing that failed will keep failing every turn until a person acts. All three clients now separate the levels — `ChatClient.handle()` marks `error` with ❌ and `warn` with ⚠️, the WebUI maps it to the styled `.notice.err`, and `DiscordBridge.handle()` posts `warn` and `error` and stays quiet on `info`. (This row used to say no client distinguished `error`; that was true before the three were fixed, and the line outlived it.) |
+| `notice` | `level` (`info`/`warn`/`error`), `text` | the general "say this to the human" event; 40+ emit sites. `error` is rare and means the opposite of "informational": the thing that failed will keep failing every turn until a person acts. All three clients separate the levels — `ChatClient.handle()` marks `error` with ❌ and `warn` with ⚠️, the WebUI maps it to the styled `.notice.err`, and `DiscordBridge.handle()` posts `warn` and `error` and stays quiet on `info`. A client that flattened the three would make a persistent failure look like chatter |
 | `digest_done` | `turn_id, tokens, digest_text` | `conversation.digest_turns` collapsed the turn that just ended, and this is the digest that replaced it — the summary itself, as `rollover_done` carries `handoff_text`, and for the same reason: it is what the model is shown from here on, so a reader who cannot see it finds out about a lossy one only when the model acts on the gap. Emitted **inside** the turn, so it arrives *before* that turn's `turn_end`; a client that buffers its output until `turn_end` has to hold it back or it prints the summary above the answer it summarises (`DiscordBridge._post_digest()`). The digest's own last line is the `grep` that reaches the journal block it stands in for, so the full working-out is one command away |
 | `error` | `msg`, `fatal` | |
 | `busy` | `reason` | |
@@ -220,3 +220,17 @@ Things worth copying from the existing three:
 - set `reasoning=0` if you will never draw the thinking; the token count still
   arrives as `reasoning_stat`
 - send `origin` if your session is shared by several people
+
+**Do not teach the core about your client.** If you need per-client behavior,
+encode it into the session name — that is what the Discord bot does, and it is
+why `models/sessions/` works for all three
+([principle 4](design-principles.md#4-key-on-the-session-name-not-on-the-clients-identity)).
+
+A new event type costs nothing to add: `handle()` in each client is a `switch`
+with no `default`, and `ChatClient.handle()` an `elif` chain with no `else`, so
+an event a client has never heard of is skipped rather than fatal. Changing the
+shape of an **existing** event is the expensive move — three renderers read
+those fields and none of them is checked against the others. If a command
+mutates session state that other attached clients should see, emit a
+`session_state` event as well as returning the reply: the reply reaches the
+asking client only.
