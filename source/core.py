@@ -1688,8 +1688,8 @@ class Session:
                 reasoning_parts.append(result.reasoning)
                 # Re-sync the live count on the round boundary: counting the
                 # whole thing at once settles any drift the slices left, and
-                # picks up a round whose reasoning arrived on the result instead
-                # of through on_reasoning (the non-streaming path).
+                # picks up a round whose reasoning arrived on the result without
+                # passing through on_reasoning.
                 # Never downwards, though — a counter that ticks back a few
                 # tokens mid-think reads as a bug, and the ⚡ line quotes this
                 # same figure, so the two still cannot disagree.

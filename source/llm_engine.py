@@ -1,6 +1,7 @@
 """LLM engine — OpenAI-compatible wrapper for chat completions.
 
-Supports vllm (localhost) and any OpenAI-compatible API.
+Talks to any OpenAI-compatible server — SGLang and llama.cpp in practice —
+and to llama.cpp's own /apply-template and /completion for raw resumes.
 Config-driven: base_url, api_key and sampling parameters come from the
 model's own entry under models: in config.yaml.
 """
@@ -18,18 +19,21 @@ from token_counter import corrected_messages
 
 logger = logging.getLogger("letclaw.engine")
 
-# Tool-call markup, for the raw transport only. /completion has no tool-call
-# parser — it hands back the chat template's own XML as plain text — so the
-# parsing the chat endpoint would have done is done here instead. Two shapes are
-# in the wild and which one appears is the template's choice, not ours:
+# Tool-call markup. /completion has no tool-call parser — it hands back the
+# chat template's own XML as plain text — so the parsing the chat endpoint
+# would have done is done here instead. Two shapes are in the wild and which
+# one appears is the template's choice, not ours:
 #
 #   <tool_call><function=exec><parameter=command>ls</parameter></function></tool_call>
 #   <tool_call>{"name": "exec", "arguments": {"command": "ls"}}</tool_call>
 #
-# Deliberately confined to this transport. On the chat endpoint the server
-# parses tool calls properly, so markup arriving as text there is the model
-# *writing about* a tool call — prose, in an answer explaining itself — and
-# executing that would be a real hazard.
+# The chat endpoint parses these itself, but not always: llama.cpp's parser
+# sometimes gives up on a well-formed call and returns it as message.content
+# with no tool_calls, and the turn then ended on it as if it were the answer.
+# `_recover_chat_tool_calls` takes those back, under the same rule the raw
+# transport uses — nothing but whitespace may follow the block — because markup
+# with prose after it is the model writing about a call, and running it would
+# act on an example.
 TOOL_OPEN, TOOL_CLOSE = "<tool_call>", "</tool_call>"
 _FUNC_RE = re.compile(r"<function=([^>\s]+)\s*>(.*)</function>", re.S)
 _PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.S)
@@ -40,6 +44,56 @@ _PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)</parameter>", re.S)
 # makes the answer's budget separate — past the tag the model cannot reason.
 THINK_OPEN = "<think>\n"
 THINK_CLOSE = "\n</think>\n\n"
+
+# A fenced code block is the one place a template tag is quoted rather than
+# written. Same CommonMark rule chunker.py uses: up to three spaces, then three
+# or more backticks or tildes.
+_FENCE_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
+_FENCE_LINE_CAP = 512
+
+
+class _FenceState:
+    """Which fenced block, if any, a running thought is inside.
+
+    The close tag is only real outside a fence, so the splitter has to know
+    that across chunks. Only complete lines can open or close a fence, so the
+    current partial line is carried until its newline arrives.
+    """
+
+    __slots__ = ("fence", "line", "overlong")
+
+    def __init__(self, fence=None, line="", overlong=False):
+        self.fence = fence          # (char, length) or None
+        self.line = line            # current line, not yet ended
+        self.overlong = overlong
+
+    def copy(self):
+        return _FenceState(self.fence, self.line, self.overlong)
+
+    def feed(self, text):
+        for ch in text:
+            if ch == "\n":
+                self._end_line()
+            elif not self.overlong:
+                self.line += ch
+                if len(self.line) > _FENCE_LINE_CAP:
+                    # shortcut: a line this long is an info string, not a
+                    # closing fence; stop growing the buffer for it.
+                    self.overlong = True
+
+    def _end_line(self):
+        if not self.overlong:
+            m = _FENCE_RE.match(self.line)
+            if m:
+                marker = m.group(2)
+                if self.fence is None:
+                    self.fence = (marker[0], len(marker))
+                elif (marker[0] == self.fence[0]
+                      and len(marker) >= self.fence[1]
+                      and not m.group(3).strip()):
+                    self.fence = None
+        self.line = ""
+        self.overlong = False
 
 
 class InlineThinkSplitter:
@@ -79,10 +133,11 @@ class InlineThinkSplitter:
 
     The close tag ends the block only when the template's blank line follows
     it, as `THINK_CLOSE` writes it (`\n</think>\n\n`). A thought that merely
-    *writes about* the markup — inline, or on a line of its own inside a code
-    fence, where it has no blank line after it — is prose, not the end of the
-    block: taking it for the tag cut the thought in half and sent the words
-    after it on as the answer.
+    *writes about* the markup — inline, or on its own line — is prose, not the
+    end of the block: taking it for the tag cut the thought in half and sent
+    the words after it on as the answer. A fenced code block is the other way
+    to quote it, and there the blank line can be present, because a real
+    example of the template shows it; the tag counts only outside a fence.
     """
 
     OPEN, CLOSE = "<think>", "</think>"
@@ -95,6 +150,9 @@ class InlineThinkSplitter:
         # The newline after an opening tag belongs to the tag. It may arrive
         # in a later chunk than the tag did, so this outlives one feed().
         self._eat_open_newlines = False
+        # Fence state at the start of _buf. Emitted reasoning is folded in as
+        # it leaves, so the whole thought is never kept to answer this.
+        self._fence = _FenceState()
 
     def feed(self, chunk):
         """One chunk in; `(text, reasoning)` out, either possibly empty."""
@@ -155,6 +213,7 @@ class InlineThinkSplitter:
                 cut -= 1
             if cut:
                 out, self._buf = self._buf[:cut], self._buf[cut:]
+                self._fence.feed(out)
                 return "", out
         return "", ""
 
@@ -162,17 +221,46 @@ class InlineThinkSplitter:
         """Index of a close tag followed by the template's blank line, or -1.
 
         The template writes `\n</think>\n\n`. Requiring the blank line is what
-        tells the real close from a thought that quotes the tag: written inline
-        it has a space after it, and written on its own line in a code fence it
-        has one newline, not two. The tag may be inline in the real close too —
-        the model is not obliged to put it on its own line — so line start is
-        not part of the test.
+        tells the real close from a thought that quotes the tag inline. The tag
+        may be inline in the real close too — the model is not obliged to put
+        it on its own line — so line start is not part of the test.
+
+        A code fence is the other way to quote it, and there the blank line can
+        be present: an example of the whole template inside ``` has the
+        template's own blank line. The tag only counts outside a fence.
         """
-        i = self._buf.find(self.CLOSE)
+        return self._close_in(
+            self._buf, lambda after: after.startswith("\n\n"))
+
+    def _find_trailing_close(self, buf):
+        """The first close tag with only whitespace after it, or -1.
+
+        Same fence rule as `_find_close`; the blank line is gone because the
+        stream ended, so only the whitespace tail is left to test.
+        """
+        return self._close_in(buf, lambda after: not after.strip())
+
+    def _close_in(self, buf, follows):
+        """First close tag outside a fence where `follows(rest)` holds, or -1.
+
+        The fence state starts from `self._fence` — where `buf` begins — and
+        is carried forward tag by tag. The tag's leading newline ends the line
+        before it, which may be the fence's closing ``` — so the tag is fed
+        before the test, not after it. The tag itself has no fence marker and
+        cannot lie.
+        """
+        i = buf.find(self.CLOSE)
+        if i < 0:
+            return -1
+        state = self._fence.copy()
+        pos = 0
         while i != -1:
-            if self._buf.startswith("\n\n", i + len(self.CLOSE)):
+            end = i + len(self.CLOSE)
+            state.feed(buf[pos:end])
+            if state.fence is None and follows(buf[end:]):
                 return i
-            i = self._buf.find(self.CLOSE, i + 1)
+            pos = end
+            i = buf.find(self.CLOSE, pos)
         return -1
 
     def finish(self):
@@ -182,23 +270,13 @@ class InlineThinkSplitter:
             # A close tag at the very end of the stream has no blank line left
             # after it to prove itself. If only whitespace follows, it is still
             # the template's close and belongs to the tag, not the thought.
-            i = buf.find(self.CLOSE)
-            while i != -1:
-                if not buf[i + len(self.CLOSE):].strip():
-                    return "", buf[:i].rstrip("\n")
-                i = buf.find(self.CLOSE, i + 1)
+            i = self._find_trailing_close(buf)
+            if i >= 0:
+                return "", buf[:i].rstrip("\n")
             return "", buf        # ended mid-thought; the remainder is thinking
         if self._state == "after_close":
             return "", ""         # only the tag's own trailing newlines left
         return buf, ""            # never saw an opening tag; it was always text
-
-
-def _split_inline_think(content):
-    """`InlineThinkSplitter` over one complete string. `(text, reasoning)`."""
-    s = InlineThinkSplitter()
-    t1, r1 = s.feed(content)
-    t2, r2 = s.finish()
-    return t1 + t2, r1 + r2
 
 
 class RoundInterrupted(Exception):
@@ -332,6 +410,63 @@ class ToolMarkupFilter:
             return []
         calls = [parse_tool_block(b) for b in self.blocks]
         return [c for c in calls if c]
+
+
+def _usable_server_calls(calls):
+    """The server's tool calls, minus the ones that are not calls at all.
+
+    SGLang's parser takes a tool-call tag the model merely *quotes* in its
+    reasoning as the start of a real call, and what it streams for that can
+    carry no function name and no id. Kept, such a call is stored in history
+    as `name: None`, and every later request then dies in the server's own
+    chat template — `can only concatenate str (not "NoneType") to str` — until
+    the turn is rolled back. Seen twice in session b9aec0f9, turn 17.
+
+    A call without a name has nothing to run, so it is dropped. A named call
+    without an id is real, and gets one: the tool result has to echo some id
+    back, and None is the value the template cannot render.
+    """
+    kept = []
+    for tc in calls:
+        if not tc.get("name"):
+            logger.warning("dropping a tool call the server sent with no "
+                           "name (arguments %.80r)", tc.get("arguments"))
+            continue
+        if not tc.get("id"):
+            tc = {**tc, "id": secrets.token_hex(12)}
+        kept.append(tc)
+    return kept
+
+
+def _recover_chat_tool_calls(text, tool_calls, finish, tools):
+    """Tool calls the chat endpoint left in `text` unparsed. `(text, calls)`.
+
+    Recovers only when all of these hold, and otherwise returns its input:
+
+    - tools were offered this round — a round with none has no call to make,
+      and a resume that writes markup anyway is core's to handle;
+    - the server returned no tool calls of its own;
+    - the round did not stop at `length` — a call cut off at the cap is
+      incomplete, and core already tells the model to issue it again;
+    - the text holds a complete block with only whitespace after it, which is
+      `ToolMarkupFilter`'s rule: prose after the markup means it was an
+      example, not a call.
+
+    On recovery the blocks leave the text, so history holds the call once, as
+    a call, and not a second time as prose.
+    """
+    if (not tools or tool_calls or finish == "length"
+            or not text or TOOL_CLOSE not in text):
+        return text, tool_calls
+    f = ToolMarkupFilter()
+    visible = f.feed(text) + f.finish()
+    calls = f.tool_calls()
+    if not calls:
+        return text, tool_calls
+    logger.warning("recovered %d tool call(s) the server left in the text "
+                   "unparsed: %s", len(calls),
+                   ", ".join(c["name"] for c in calls))
+    return visible, calls
 
 
 def _dig(obj, *names):
@@ -617,7 +752,7 @@ class LLMEngine:
         # content from here on is the answer's own and must be left alone —
         # which matters most in a session about software that writes about
         # these tags. "unknown" and "silent" keep the guard: neither is proof.
-        if caps["reasoning_channel"] in ("separate",):
+        if caps["reasoning_channel"] == "separate":
             self.split_inline_think = False
         if caps["reasoning_channel"] in ("inline", "both"):
             caps["warnings"].append(
@@ -714,8 +849,8 @@ class LLMEngine:
                               prefill: str | None = None) -> ChatResult:
         """Chat completion with optional tool calling.
 
-        on_text: if given (and streaming is used), called with each text
-        chunk as it arrives; tool-call deltas are accumulated silently.
+        on_text: called with each text chunk as it arrives; tool-call deltas
+        are accumulated silently. The round streams either way.
         on_reasoning: same, but for reasoning/thinking chunks (thinking models).
         overrides: request parameters for this one call only (e.g. a raised
         max_tokens for a forced-conclusion round); the engine's defaults are
@@ -736,41 +871,10 @@ class LLMEngine:
             extra = dict(params.get("extra_body") or {})
             extra.update(continue_final_message=True, add_generation_prompt=False)
             params["extra_body"] = extra
-        use_stream = on_text is not None
+        # Always streamed: every round in core passes on_text.
+        if on_text is None:
+            on_text = lambda _chunk: None  # noqa: E731
         try:
-            if not use_stream:
-                response = await self.client.chat.completions.create(
-                    messages=messages, **params)
-                choice = response.choices[0]
-                msg = choice.message
-                tool_calls = []
-                for tc in (msg.tool_calls or []):
-                    tool_calls.append({
-                        "id": tc.id,
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments or "",
-                    })
-                usage = getattr(response, "usage", None)
-                self.note_schema_cost(messages, params.get("tools"),
-                                      getattr(usage, "prompt_tokens", None))
-                reasoning = (getattr(msg, "reasoning_content", None)
-                             or getattr(msg, "reasoning", None) or "")
-                # Defensive: a server configured to inline its thinking sends
-                # the whole trace here, and letsClaw would append it to history
-                # as the answer. No-op when the content has no opening tag, and
-                # off entirely once capabilities() has seen a dedicated channel.
-                text = msg.content or ""
-                if self.split_inline_think:
-                    text, inline = _split_inline_think(text)
-                    if inline:
-                        reasoning = f"{reasoning}{inline}" if reasoning else inline
-                cached, reason_tok = _usage_extras(usage)
-                return ChatResult(text, tool_calls, choice.finish_reason,
-                                  reasoning=reasoning,
-                                  prompt_tokens=getattr(usage, "prompt_tokens", None),
-                                  completion_tokens=getattr(usage, "completion_tokens", None),
-                                  cached_tokens=cached, reasoning_tokens=reason_tok)
-
             create_kw = dict(messages=messages, stream=True, **params)
             if self._usage_opt:
                 # Asks for a final usage-only chunk; vLLM and llama.cpp both honour it.
@@ -789,10 +893,15 @@ class LLMEngine:
             pending = {}  # index -> accumulated tool call
             finish = None
             usage = None
-            # Same guard as the non-streaming path above, applied per delta so
-            # a close tag split across two chunks is still found. None once the
-            # probe has proved the server has a channel of its own for this.
+            # A server configured to inline its thinking sends the whole trace
+            # as content, and letsClaw would append it to history as the
+            # answer. Applied per delta so a close tag split across two chunks
+            # is still found. None once the probe has proved the server has a
+            # channel of its own for this.
             splitter = InlineThinkSplitter() if self.split_inline_think else None
+            # Prose after a tool-call delta: the server parsed calls out of
+            # text that went on talking, i.e. examples. See below.
+            prose_after_call = False
             try:
                 async for chunk in response:
                     if getattr(chunk, "usage", None):
@@ -810,6 +919,8 @@ class LLMEngine:
                         if on_reasoning:
                             on_reasoning(rchunk)
                     if delta.content:
+                        if pending and delta.content.strip():
+                            prose_after_call = True
                         dtext, dreason = (splitter.feed(delta.content)
                                           if splitter else (delta.content, ""))
                         if dreason:
@@ -844,11 +955,31 @@ class LLMEngine:
             if ftext:
                 text_parts.append(ftext)
                 on_text(ftext)
-            tool_calls = [pending[i] for i in sorted(pending)]
+            tool_calls = _usable_server_calls(
+                [pending[i] for i in sorted(pending, key=lambda k: (k is None, k or 0))])
+            if tool_calls and prose_after_call:
+                # SGLang parses a tool-call tag the model only quotes — in its
+                # reasoning or in an answer explaining the markup — into a real
+                # call, and would have letsClaw run the example. A real call
+                # ends the round while the model waits for its result; text
+                # after it means it was not one. Measured on spark0: real calls
+                # stream reasoning, whitespace, call, end; quoted markup
+                # streamed call, text, call, text in all six runs. Same rule as
+                # ToolMarkupFilter applies to the raw transport.
+                logger.warning(
+                    "dropping %d tool call(s) the server parsed out of text "
+                    "that continues after them — quoted markup, not calls: %s",
+                    len(tool_calls), ", ".join(c["name"] for c in tool_calls))
+                tool_calls = []
+            # The markup has already streamed to on_text by now; this only
+            # decides what the round *is* — a call, not an answer — and keeps
+            # it out of the text history stores.
+            text, tool_calls = _recover_chat_tool_calls(
+                "".join(text_parts), tool_calls, finish, params.get("tools"))
             self.note_schema_cost(messages, params.get("tools"),
                                   getattr(usage, "prompt_tokens", None))
             cached, reason_tok = _usage_extras(usage)
-            return ChatResult("".join(text_parts), tool_calls, finish,
+            return ChatResult(text, tool_calls, finish,
                               reasoning="".join(reason_parts),
                               prompt_tokens=getattr(usage, "prompt_tokens", None),
                               completion_tokens=getattr(usage, "completion_tokens", None),
@@ -916,40 +1047,55 @@ class LLMEngine:
             if on_reasoning:
                 on_reasoning(part)
 
+        def handle(line):
+            nonlocal finish, usage
+            line = line.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                return
+            try:
+                d = json.loads(line[5:].strip())
+            except json.JSONDecodeError:
+                return
+            if d.get("stop"):
+                # stop_type is "limit" | "eos" | "word" | "none" on current
+                # builds; stopped_limit is the older spelling.
+                hit_cap = (d.get("stop_type") == "limit") or d.get("stopped_limit")
+                finish = "length" if hit_cap else "stop"
+                usage = {"prompt_tokens": d.get("tokens_evaluated"),
+                         "completion_tokens": d.get("tokens_predicted"),
+                         # timings.cache_n, and NOT the tokens_cached
+                         # sitting right beside the two above. Measured on
+                         # the same prompt twice: tokens_cached read 2706
+                         # both times — it is how full the KV cache is
+                         # *after* the request, so it never moves and a
+                         # reader would see a permanent 100% hit rate.
+                         # cache_n read 0 then 2700, which is the reuse.
+                         "cached_tokens": (d.get("timings") or {}).get("cache_n")}
+            chunk = d.get("content") or ""
+            if not chunk:
+                return
+            dtext, dreason = splitter.feed(chunk)
+            if dreason:
+                emit_reasoning(dreason)
+            if dtext:
+                emit_text(dtext)
+
+        # Lines are split here rather than by `async for line in r.content`:
+        # aiohttp's reader refuses a line over 512 KiB, and llama.cpp's final
+        # chunk echoes the whole prompt back on one line. A resume near a full
+        # window can cross that (100k tokens of code is ~400 KB, CJK more), and
+        # the round then died with LineTooLong after its answer had streamed.
         async with session.post(f"{self.base_url.removesuffix('/v1')}/completion",
                                 json=body) as r:
             r.raise_for_status()
-            async for line in r.content:
-                line = line.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                try:
-                    d = json.loads(line[5:].strip())
-                except json.JSONDecodeError:
-                    continue
-                if d.get("stop"):
-                    # stop_type is "limit" | "eos" | "word" | "none" on current
-                    # builds; stopped_limit is the older spelling.
-                    hit_cap = (d.get("stop_type") == "limit") or d.get("stopped_limit")
-                    finish = "length" if hit_cap else "stop"
-                    usage = {"prompt_tokens": d.get("tokens_evaluated"),
-                             "completion_tokens": d.get("tokens_predicted"),
-                             # timings.cache_n, and NOT the tokens_cached
-                             # sitting right beside the two above. Measured on
-                             # the same prompt twice: tokens_cached read 2706
-                             # both times — it is how full the KV cache is
-                             # *after* the request, so it never moves and a
-                             # reader would see a permanent 100% hit rate.
-                             # cache_n read 0 then 2700, which is the reuse.
-                             "cached_tokens": (d.get("timings") or {}).get("cache_n")}
-                chunk = d.get("content") or ""
-                if not chunk:
-                    continue
-                dtext, dreason = splitter.feed(chunk)
-                if dreason:
-                    emit_reasoning(dreason)
-                if dtext:
-                    emit_text(dtext)
+            pending = bytearray()
+            async for data in r.content.iter_any():
+                pending += data
+                while (nl := pending.find(b"\n")) >= 0:
+                    handle(bytes(pending[:nl]))
+                    del pending[:nl + 1]
+            if pending:
+                handle(bytes(pending))
         # Flush what was held back against a close tag that never arrived. The
         # splitter decides which side it falls on: mid-thought it is reasoning.
         ftext, freason = splitter.finish()
@@ -993,7 +1139,6 @@ class LLMEngine:
         built — and it writes them as the template's own markup in the text,
         which ToolMarkupFilter takes back out. So raw no longer drops them.
         """
-        prefill = THINK_OPEN + pad + (THINK_CLOSE if closing else "")
         mode = await self.resume_transport()
         if mode == "raw":
             prompt = await self._apply_template(messages) + pad + (
@@ -1001,6 +1146,7 @@ class LLMEngine:
             return await self._raw_complete(prompt, max_tokens,
                                             on_text=on_text, on_reasoning=on_reasoning,
                                             in_reasoning=not closing)
+        prefill = THINK_OPEN + pad + (THINK_CLOSE if closing else "")
         return await self.chat_with_tools(
             messages, tools=tools, on_text=on_text, on_reasoning=on_reasoning,
             overrides={"max_tokens": max_tokens} if max_tokens else None,

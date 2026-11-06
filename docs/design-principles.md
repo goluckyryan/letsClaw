@@ -203,13 +203,18 @@ Every default and every parse failure resolves to the more restrictive option:
 - **A tool call that was cut off is never run.** `rm -rf /tmp/scratch`
   truncated to `rm -rf /` is the accident this prevents. The call is recorded
   empty and the model is told.
-- Tool-markup parsing is **confined to the raw transport** (`ToolMarkupFilter`).
-  On the chat endpoint the server parses tool calls properly, so the same
-  markup arriving as text is the model *writing about* a tool call — prose in
-  an answer — and executing that would be a real hazard. On the raw transport
-  a recovered block is only run when no prose follows it: a real call ends the
-  round while the model waits for its result, whereas prose after the markup
-  means the block was an example.
+- Tool markup written as text is **only run when no prose follows it**
+  (`ToolMarkupFilter`). A real call ends the round while the model waits for
+  its result, whereas prose after the markup means the block was an example,
+  and executing that would be a real hazard. The raw transport needs this on
+  every round, since /completion parses nothing. The chat endpoint parses
+  calls itself, but llama.cpp sometimes returns a well-formed one as text with
+  no `tool_calls`; `_recover_chat_tool_calls()` applies the same rule there,
+  and only on a round that was offered tools and did not stop at `length`.
+  The rule also runs the other way: SGLang parses a tag the model only quotes
+  into a real call, so server-parsed calls followed by streamed text are
+  dropped too, and a call with no name is never stored
+  (`_usable_server_calls()`).
 - A bad `rollover_mode` logs and uses `auto` (`Session.__init__()`).
 
 ## 10. The reflexive keystroke is the safe one

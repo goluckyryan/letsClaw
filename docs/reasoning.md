@@ -424,9 +424,9 @@ llama.cpp's `--reasoning-format` decides which channel the server uses:
 what a template emits, and the restriction is what lets an answer that merely
 writes about these tags — an ordinary thing to do in this repo — through
 untouched. The close side has the same guard: only a close tag followed by the
-template's blank line ends the block, because a tag inside a sentence — or on
-its own line in a code fence, with only one newline after it — is the thought
-quoting the markup rather than the template closing it.
+template's blank line ends the block, because a tag inside a sentence, or
+anywhere inside a fenced code block, is the thought quoting the markup rather
+than the template closing it.
 
 The startup probe (`LLMEngine.capabilities()`) acts on what it finds rather
 than only reporting it, and the useful verdict is the negative one. The
