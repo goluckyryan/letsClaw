@@ -106,12 +106,12 @@ it is unreachable there and reachable in the terminal at the same time. See
 
 | file | lines | owns |
 |---|---|---|
-| `source/core.py` | 4315 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
+| `source/core.py` | 4441 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
 | `source/session.py` | 829 | **the disk layer.** Live store, archives, the journal, the handoff summariser, the id registry |
 | `source/server.py` | 1223 | **the transport.** aiohttp routes, the WebSocket handler, the Host and Origin guards, auth, backpressure |
 | `source/llm_engine.py` | 1170 | **the model.** Two transports (`chat` and `raw`), streaming, tool-call parsing, resume |
 | `source/config.py` | 602 | **config.yaml → engines.** Loading, the webui presentation keys, number coercion, `build_all_engines` (which doubles as the validator), and the reload diff. Touches no `Session`, which is why it is not in `core`. `build_engine()` passes the constructor the transport and the generation options it forwards (`base_url`, `api_key`, `provider_name`, `timeout`, `temperature`, `max_tokens`, `top_p`), then assigns the eight **policy** attributes onto the instance: `context_length`, `max_output`, `turn_timeout`, `reasoning`, `answer_time_reserve`, `max_pad_compactions`, `resume_mode`, `reasoning_effort`. The split is deliberate and easy to get wrong: `LLMEngine.__init__` takes `**kwargs` straight into `extra_params`, which `get_model_params()` forwards to `chat.completions.create()`, so a policy key handed to the constructor is sent to the server as a generation option instead of configuring the session — and is silently accepted. That is where a ninth belongs. Grepping `llm_engine.py` for `max_pad_compactions` finds nothing, because the name is only ever assigned from outside |
-| `source/behavior.py` | 339 | **the behavior layers.** `BehaviorStore`, the read-through cache behind a lock, and the two directives extracted out of `base.md` |
+| `source/behavior.py` | 359 | **the behavior layers.** `BehaviorStore`, the read-through cache behind a lock, and the three directives extracted out of `base.md` |
 | `source/config_edit.py` | 289 | rewriting the `webui:` block of `config.yaml` **as text**, so the file's comments survive a save |
 | `source/ssh_forward.py` | 732 | **model servers over ssh.** One supervised `ssh -N -L` child per model entry that names an `ssh_forward`, on a port the core picks itself |
 | `source/tools.py` | 823 | `exec`, `read_file`, `write_file`, `list_dir`, `show_image`, the search and edit tools, … and their JSON schemas |
@@ -520,7 +520,7 @@ that rule lives; replicate it if you add another.
 ### What `base.md` commits the model to
 
 `models/base.md` is not just an identity blurb — several of its rules are
-load-bearing, and two directives in it are lifted out and used as machinery.
+load-bearing, and three directives in it are lifted out and used as machinery.
 
 | section | what it does |
 |---|---|
@@ -529,6 +529,7 @@ load-bearing, and two directives in it are lifted out and used as machinery.
 | **The record on disk** | search the previous window's [journal](#the-journal), and the `grep` line a turn digest ends with, before re-investigating anything |
 | **Directives → `## Checkpoint`** | the text sent when a full notepad is about to be compacted — extracted by `extract_checkpoint_directive` |
 | **Directives → `## Forced conclusion`** | the text sent when a server cannot resume a cut-off thought — extracted by `extract_conclude_directive` |
+| **Directives → `## Partial answer`** | the text sent when a turn has no room left for another tool round: a progress note, then rollover and a continuation turn — extracted by `extract_partial_directive` |
 
 The last section, `# Directives`, is machinery rather than behavior. `behavior.py`
 matches each `## ` heading under it **literally** — the level and the spelling are

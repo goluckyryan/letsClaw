@@ -273,10 +273,10 @@ from the outside:
   in the prompt prefix the server has already tokenised, so rewriting them
   mid-conversation costs that session its cache. `/reload` stages the change and
   says so; `/clear` or a rollover applies it.
-- **Two sections of `base.md` are machinery, not prose.** `## Checkpoint` and
-  `## Forced conclusion` are lifted out and sent as a user message at the one
-  moment each applies — and both are cut from the system prompt, every model,
-  every turn. Their headings are matched literally, so the level and the spelling
+- **Three sections of `base.md` are machinery, not prose.** `## Checkpoint`,
+  `## Forced conclusion` and `## Partial answer` are lifted out and sent as a
+  user message at the one moment each applies — and all three are cut from the
+  system prompt, every model, every turn. Their headings are matched literally, so the level and the spelling
   are load-bearing.
 
 The one rule in the file that changes how the agent behaves with you: it is told
@@ -338,7 +338,12 @@ eliminated. Losing a fact costs a re-derivation; losing a rejection costs a loop
 happens on its own. There is an earlier trigger: a window that is nearly full
 still has room for one more exchange but none to *think* in, so with
 `rollover_before_think` a thinking model's turn rolls first rather than arriving
-already degraded. The percentage is the server's own figure where the server
+already degraded. And a turn whose work outgrows the window mid-task does not
+just stop: once there is no room for another tool round the model writes a
+progress note, the session rolls over without asking (whatever
+`rollover_mode` says), and a continuation turn picks the task
+up from the handoff (up to `conversation.max_continuations` in a row, default
+10). The percentage is the server's own figure where the server
 reports one; where it does not, a calibrated local estimate stands in, and a `~`
 beside the number is what tells you so.
 

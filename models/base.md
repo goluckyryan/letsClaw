@@ -82,11 +82,13 @@ reaches the system prompt**: `strip_directive_sections()` in
 What the core does instead is lift the paragraph under each `## ` heading out
 of this file and send it as a *user* message at the one moment it applies — the
 checkpoint when a thinking pad has filled the context and is about to be
-condensed, the forced conclusion when a cut-off round cannot be resumed. They
+condensed, the forced conclusion when a cut-off round cannot be resumed, the
+partial answer when the context has no room left for another tool round and
+the turn is about to roll over and continue. They
 live here rather than in source so the wording can be changed with `/reload`,
 no code change and no restart.
 
-Notes for editing them. The two `## ` headings are matched literally, so the
+Notes for editing them. The `## ` headings are matched literally, so the
 level and the spelling are load-bearing; a heading left with nothing under it
 falls back, silently, to a built-in sentence in `behavior.py`. HTML comments
 are dropped on extraction, so they are notes to you and never reach the model.
@@ -114,3 +116,15 @@ have worked out so far. No tool is available for this reply: do not call one,
 and do not write out a command or a tool invocation for someone else to run —
 finish the arithmetic yourself and state the result. If you truly cannot
 conclude, say in one sentence what single fact is missing.
+
+## Partial answer
+<!-- Sent when the context has no room left for another tool round. The turn
+     ends on this note, the session always rolls over (no prompt, whatever
+     rollover_mode says), and a continuation turn resumes the task from the handoff — so the note is
+     what the fresh window knows about the work in progress. -->
+The context window is nearly full, so this turn has to stop here — the task is
+not over. Do not call a tool, and do not write out a tool invocation. Write a
+progress note instead: what the task is, what you have done and found so far
+(exact values, file paths and command results), what is left to do, and the
+exact next step you were about to take. The session will roll over to a fresh
+window and you will continue the task from this note.

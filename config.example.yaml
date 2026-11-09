@@ -325,6 +325,13 @@ conversation:
   # it resumes the work, it does not re-ask the question. `0` is the old
   # behaviour: the turn ends and you re-ask by hand.
   turn_retries: 5
+  # When a turn runs out of room for another tool round, the model writes a
+  # progress note, the session rolls over — always, without asking: this
+  # ignores rollover_mode and rollover_at_percent, like /rollover — and a
+  # continuation turn resumes the task from the handoff. This caps how many such turns the core starts in a row
+  # on its own; any message you send resets the count. 0 = never continue:
+  # the turn ends on its partial answer and you say "continue" by hand.
+  max_continuations: 10
 
 # Memory settings
 memory:

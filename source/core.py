@@ -139,6 +139,13 @@ CONV_SCALARS = (
             # re-asked by hand. Each retry repairs the history first, so the
             # failure cannot poison the re-run — see the retry branch in _turn.
             note="re-runs of a turn after a model server error; 0 = never"),
+    _Scalar("max_continuations", "max_continuations", 10, _as_int,
+            # How many turns in a row the core may start on its own after a
+            # turn ran out of room for tools: partial answer, rollover, then a
+            # continuation turn picks the task up from the handoff. A brake on
+            # autonomy, not on context — each continuation starts in a fresh
+            # window. 0 = never: the turn ends on its partial answer.
+            note="auto-continuations after an out-of-room rollover; 0 = never"),
 )
 
 # digest_turns is deliberately absent, and has to be: it is resolved per session
@@ -216,6 +223,12 @@ TOOL_ROUND_OVERHEAD = 400
 # the server will actually emit.
 ANSWER_RESERVE_SHARE = 0.10
 MIN_ANSWER_ROOM = 4096
+# The user message a continuation turn opens with. A real user message — it
+# lands in history and on every client like any other — so the record shows
+# that the core, not the person, asked for the next step.
+CONTINUE_PROMPT = ("[auto-continue] The previous turn ran out of context and the "
+                   "session rolled over. Continue the task from the handoff and "
+                   "your progress note above; do not redo work already recorded.")
 # What is asked for when even the room clamp has run out. Past this point the
 # window is full and the request will be refused whatever we send — which,
 # with context shift off, is the loud failure we want rather than a silent
@@ -662,6 +675,12 @@ class Session:
         # Said once per window when the pre-turn gate declines to act on a
         # window with no thinking room left. See _headroom_check.
         self._no_room_warned = False
+        # Set by _turn when it ended on a partial answer and the window rolled
+        # over after it; run_turn reads it and starts the continuation turn.
+        # Reset at the top of every turn, so a turn that dies cannot leave it set.
+        self._continue_turn = False
+        # Continuation turns started in a row; reset by any turn a person sent.
+        self._continuations = 0
         # Whether this session has already said what the server probe found.
         # Once is the point: the findings are about the engine, not the turn,
         # and repeating them every turn is how a warning becomes wallpaper.
@@ -1461,75 +1480,90 @@ class Session:
             self.emit(ev("busy", reason="a turn is already running in this session"))
             return
         async with self.lock:
-            self.turn_id += 1
-            self.round_id = 0      # the question is under no round yet
-            self.turn_events.clear()
-            # One stamp for the turn: the event and the history message that
-            # draw the same question must agree, or a replay across a second
-            # boundary would read a different time than the live turn.
-            turn_at = now_stamp()
-            self._turn_at = turn_at
-            self.emit(ev("turn_start", turn_id=self.turn_id, text=text, origin=origin,
-                         at=turn_at))
-            try:
-                if self.engine and self.engine.turn_timeout:
-                    # The turn's hard wall (models.<name>.turn_timeout). A wall
-                    # hit mid-round cancels the turn; the cleanup below is the
-                    # same as a /stop, and the finally persists and announces.
-                    await asyncio.wait_for(self._turn(text),
-                                           timeout=self.engine.turn_timeout)
-                else:
-                    await self._turn(text)
-            except asyncio.TimeoutError:
-                wall = self.engine.turn_timeout
-                self.repair_history()
-                self.emit(ev("notice", level="warn",
-                             text=(f"turn hit the {wall // 3600} h wall — cancelled"
-                                   if wall >= 3600 else
-                                   f"turn hit the {wall} s wall — cancelled")))
-            except asyncio.CancelledError:
-                self.repair_history()
-                self.emit(ev("notice", level="warn", text="turn cancelled"))
-                raise
-            except Exception as e:                     # never kill the session
-                logger.exception("session %s: turn failed", self.name)
-                self.repair_history()
-                self.emit(ev("error", msg=f"{type(e).__name__}: {e}", fatal=False))
-            finally:
-                # Saved before the turn is announced over, so turn_end means the
-                # conversation is on disk and not merely in memory — anything
-                # that acts on turn_end (a client, a test, a shutdown script)
-                # would otherwise be racing the write. Still inside the lock, so
-                # the history cannot move underneath it, and in its own finally
-                # so a failing save can never swallow the event.
+            # A turn a person sent resets the continuation brake; the turns the
+            # core starts after it (see _may_continue) count against it.
+            self._continuations = 0
+            while True:
+                self._continue_turn = False
+                self.turn_id += 1
+                self.round_id = 0      # the question is under no round yet
+                self.turn_events.clear()
+                # One stamp for the turn: the event and the history message that
+                # draw the same question must agree, or a replay across a second
+                # boundary would read a different time than the live turn.
+                turn_at = now_stamp()
+                self._turn_at = turn_at
+                self.emit(ev("turn_start", turn_id=self.turn_id, text=text, origin=origin,
+                             at=turn_at))
                 try:
-                    await self.persist()
-                finally:
-                    self.emit(ev("turn_end", turn_id=self.turn_id))
-                # Nothing after this belongs to a round — a rollover, a trim or
-                # a reload applied below would otherwise be stamped with
-                # whatever the last round happened to be.
-                self.round_id = 0
-                # A /steering that landed in the last instant — after _turn finished
-                # but before the turn was announced over: nothing is running any
-                # more, so say so rather than let it queue into the next turn.
-                if self._steering:
-                    self._steering = []
+                    if self.engine and self.engine.turn_timeout:
+                        # The turn's hard wall (models.<name>.turn_timeout). A wall
+                        # hit mid-round cancels the turn; the cleanup below is the
+                        # same as a /stop, and the finally persists and announces.
+                        await asyncio.wait_for(self._turn(text),
+                                               timeout=self.engine.turn_timeout)
+                    else:
+                        await self._turn(text)
+                except asyncio.TimeoutError:
+                    wall = self.engine.turn_timeout
+                    self.repair_history()
                     self.emit(ev("notice", level="warn",
-                                 text="no turn is running — just send a message"))
-                # A reload that landed mid-turn. Applied here rather than made to
-                # wait for the lock, so a session that is never idle still picks
-                # it up. Still inside the lock, so nothing moves underneath it;
-                # its own try, so a bad apply cannot kill the session; and it runs
-                # on the cancellation path too, since run_turn re-raises after
-                # this finally.
-                if self._pending_config is not None:
-                    blob, self._pending_config = self._pending_config, None
+                                 text=(f"turn hit the {wall // 3600} h wall — cancelled"
+                                       if wall >= 3600 else
+                                       f"turn hit the {wall} s wall — cancelled")))
+                except asyncio.CancelledError:
+                    self.repair_history()
+                    self.emit(ev("notice", level="warn", text="turn cancelled"))
+                    raise
+                except Exception as e:                     # never kill the session
+                    logger.exception("session %s: turn failed", self.name)
+                    self.repair_history()
+                    self.emit(ev("error", msg=f"{type(e).__name__}: {e}", fatal=False))
+                finally:
+                    # Saved before the turn is announced over, so turn_end means the
+                    # conversation is on disk and not merely in memory — anything
+                    # that acts on turn_end (a client, a test, a shutdown script)
+                    # would otherwise be racing the write. Still inside the lock, so
+                    # the history cannot move underneath it, and in its own finally
+                    # so a failing save can never swallow the event.
                     try:
-                        self.apply_config(blob)
-                    except Exception:
-                        logger.exception("session %s: deferred config reload failed",
-                                         self.name)
+                        await self.persist()
+                    finally:
+                        self.emit(ev("turn_end", turn_id=self.turn_id))
+                    # Nothing after this belongs to a round — a rollover, a trim or
+                    # a reload applied below would otherwise be stamped with
+                    # whatever the last round happened to be.
+                    self.round_id = 0
+                    # A /steering that landed in the last instant — after _turn finished
+                    # but before the turn was announced over: nothing is running any
+                    # more, so say so rather than let it queue into the next turn.
+                    if self._steering:
+                        self._steering = []
+                        self.emit(ev("notice", level="warn",
+                                     text="no turn is running — just send a message"))
+                    # A reload that landed mid-turn. Applied here rather than made to
+                    # wait for the lock, so a session that is never idle still picks
+                    # it up. Still inside the lock, so nothing moves underneath it;
+                    # its own try, so a bad apply cannot kill the session; and it runs
+                    # on the cancellation path too, since run_turn re-raises after
+                    # this finally.
+                    if self._pending_config is not None:
+                        blob, self._pending_config = self._pending_config, None
+                        try:
+                            self.apply_config(blob)
+                        except Exception:
+                            logger.exception("session %s: deferred config reload failed",
+                                             self.name)
+                # Partial answer → rollover → continue. The next turn runs
+                # under the same lock and the same task, so /stop cancels it
+                # like any other, and a cancelled or failed turn never set the
+                # flag (it is set only at the very end of _turn).
+                if not self._continue_turn:
+                    break
+                text, origin = CONTINUE_PROMPT, "continuation"
+                self.emit(ev("notice", level="info",
+                             text=f"continuing the task in the fresh window "
+                                  f"({self._continuations}/{self.max_continuations})"))
 
     async def _turn(self, text):
         await self._warn_about_server()
@@ -1570,6 +1604,9 @@ class Session:
         # correction is the user's word and must ride on every re-run, so this
         # is not cleared.
         steering_drained = []
+        # The turn stopped working because the window had no room for another
+        # tool round — its answer is a progress note, not a conclusion.
+        out_of_room = False
         # The live thinking-token figure the clients count up with. Produced here
         # rather than in the browser so it is the same tiktoken count the ⚡ line
         # ends the turn on — a chars/4 guess lands 10-20% away on Qwen, and two
@@ -1972,17 +2009,46 @@ class Session:
                     # for one number is how the gate and the wall drifted apart
                     # before (see docs/reasoning.md, invariant 1).
                     if self._pad_headroom() < self._min_tool_round_room():
+                        # With tools on, the work is not over, only this
+                        # window. Ask for a progress note rather than a
+                        # conclusion: the turn ends on it, _after_turn rolls the
+                        # window over, and run_turn starts a continuation turn
+                        # that resumes from the handoff (see _continue_turn).
+                        # The directive rides on this round only — it never
+                        # enters history. A session with no tools has no tool
+                        # round to run out of room for and no task that outgrew
+                        # its window, so it answers as before.
+                        out_of_room = bool(self.schemas)
+                        partial = ([{"role": "user",
+                                     "content": self.manager.partial_directive}]
+                                   if out_of_room else None)
                         self.emit(ev("notice", level="warn",
                                      text="no room left for another tool round — "
-                                          "asking for a final answer"))
-                        result = await call_round()
+                                          + ("asking for a partial answer, then "
+                                             "rolling over to continue"
+                                             if out_of_room else
+                                             "asking for a final answer")))
+                        result = await call_round(extra_messages=partial)
                         if was_cut_off(result):
-                            # No room for another tool round, so this conclusion
+                            # No room for another tool round, so this answer
                             # must be words.
                             result = await self._think_pad(call_round, turn_t0,
                                                            result.reasoning,
-                                                           allow_tools=False)
-                        full_response = result.text
+                                                           allow_tools=False,
+                                                           directive=partial)
+                        # Nothing can run here: there is no room for its
+                        # result. A call the model wrote anyway (markup on the
+                        # raw transport, or a call recovered from the pad) is
+                        # not executed — it is said, so it is not silently
+                        # lost, and the continuation turn can make it for real.
+                        note = strip_tool_markup(result.text or "")
+                        if out_of_room and (result.wants_tool
+                                            or note != (result.text or "").strip()):
+                            self.emit(ev("notice", level="info",
+                                         text="the partial answer asked for a tool — "
+                                              "not run here; the continuation "
+                                              "turn can run it"))
+                        full_response = note if out_of_room else result.text
                         break
                     # A /steering that landed while the previous tool ran (or before any
                     # round) is drained here, before the model is asked again — the
@@ -2228,7 +2294,14 @@ class Session:
             # evaluated, so digesting afterwards would roll the un-collapsed
             # window away and leave this doing nothing at all.
             await self._digest_turn(user_msg, "".join(reasoning_parts), blocks_before)
-            await self._after_turn()
+            rolled = await self._after_turn(out_of_room=out_of_room)
+            # Partial answer → rollover → continue: the design for a turn whose
+            # work outgrew its window. Only when the roll really happened (mode
+            # and archive permitting) and the fresh window has room to work in;
+            # otherwise the next turn would be out of room on its first round
+            # and the loop would be partial answers with no work between them.
+            if out_of_room:
+                self._continue_turn = self._may_continue(rolled)
 
     def _answer_reserve(self):
         """Context tokens held back so the closing round can still be written.
@@ -2386,7 +2459,8 @@ class Session:
                      text=f"{head} and this session will not roll over by itself "
                           "— /rollover, or set rollover_mode: auto"))
 
-    async def _think_pad(self, call_round, turn_t0, seed, allow_tools=True):
+    async def _think_pad(self, call_round, turn_t0, seed, allow_tools=True,
+                         directive=None):
         """Resume a cut-off round instead of re-asking the question.
 
         The model's reasoning and its answer come out of one budget, so a round
@@ -2399,6 +2473,10 @@ class Session:
 
         The pad lives here and nowhere else: it never enters history, so it costs
         nothing after the turn and cannot move the rollover point.
+
+        `directive` replaces the forced-conclusion message on a tool-free
+        closing round — the out-of-room path passes the partial-answer one, so
+        the pad closes on a progress note rather than a final answer.
         """
         pad = seed or ""
         lap_cap = self.engine.extra_params.get("max_tokens") or None
@@ -2408,9 +2486,12 @@ class Session:
         reserve = getattr(self.engine, "answer_time_reserve", configlib.DEFAULT_ANSWER_TIME_RESERVE)
         think_deadline = (turn_t0 + max(0, wall - reserve)) if wall else None
 
+        conclude = directive or [{"role": "user",
+                                  "content": self.manager.conclude_directive}]
         transport = await self.engine.resume_transport()
         if transport == "off":
-            return await self._forced_conclusion(call_round, self._answer_reserve())
+            return await self._forced_conclusion(call_round, self._answer_reserve(),
+                                                 directive=conclude[0]["content"])
         # Only the chat transport parses tool calls; see the answer phase below.
         tools_ok = allow_tools and transport == "chat"
 
@@ -2549,8 +2630,7 @@ class Session:
         result = await call_round(
             overrides={"max_tokens": answer_cap}, pad=pad, closing=True,
             tools=tools,
-            extra_messages=None if tools else
-            [{"role": "user", "content": self.manager.conclude_directive}])
+            extra_messages=None if tools else conclude)
         if result.wants_tool and not truncated_tool_calls(result):
             self.emit(ev("notice", level="info",
                          text="the conclusion is an action — running it and "
@@ -2564,8 +2644,7 @@ class Session:
                               "asking for words instead"))
             result = await call_round(
                 overrides={"max_tokens": answer_cap}, pad=pad, closing=True,
-                extra_messages=[{"role": "user",
-                                 "content": self.manager.conclude_directive}])
+                extra_messages=conclude)
         text = strip_tool_markup(result.text)
         if not text:
             self.emit(ev("notice", level="warn",
@@ -2633,7 +2712,7 @@ class Session:
                           f"(kept the last ~{PAD_TAIL_TOKENS} tok verbatim)"))
         return new_pad
 
-    async def _forced_conclusion(self, call_round, cap):
+    async def _forced_conclusion(self, call_round, cap, directive=None):
         """Fallback when the server cannot resume a cut-off round.
 
         No prefill means the reasoning cannot be handed back, so the only lever
@@ -2645,7 +2724,7 @@ class Session:
         # the retry smaller than the round that just failed.
         configured = self.engine.extra_params.get("max_tokens") or 0
         cap = max(cap or 0, configured) or None
-        directive = self.manager.conclude_directive
+        directive = directive or self.manager.conclude_directive
         for _ in range(FORCED_CONCLUSION_TRIES):
             self.emit(ev("notice", level="warn",
                          text=f"reasoning was cut off and this server cannot resume it "
@@ -2891,10 +2970,26 @@ class Session:
                                          "messages": restored,
                                          "skipped": skipped}}
 
-    async def _after_turn(self):
+    async def _after_turn(self, out_of_room=False):
+        """Roll over or trim after a turn. Returns True if the window rolled.
+
+        `out_of_room` is a turn that stopped because there was no room for
+        another tool round, mid-task. It always rolls over, without asking:
+        the headroom that matters is already gone, and the continuation turn
+        needs a fresh window. So it bypasses rollover_mode (ask / off) and the
+        trip point (including rollover_at_percent: 0) the same way /rollover
+        does — those govern *when a full window is retired*, and this window
+        is not being retired by policy, the task outgrew it. The one gate kept
+        is rollover_blocked: a window that could not be archived must not be
+        replaced, or the conversation is lost.
+        """
         trip = self.trip
         rolled = False
-        if trip:
+        if out_of_room:
+            if not self.rollover_blocked:
+                rolled = await self.roll_over("no room for another tool round",
+                                              self.used_now(), trip)
+        elif trip:
             # used_now(), not a measurement passed in: the one caller handed us
             # `self._last_used` and this line then re-derived used_now() from
             # it, character for character. Nothing can change it in between —
@@ -2926,6 +3021,35 @@ class Session:
             # be, and roll over — archiving and dropping a window to relieve
             # pressure that the trim had already relieved.
             self._last_used = None
+        return rolled
+
+    def _may_continue(self, rolled):
+        """Whether a turn that ran out of room gets a continuation turn.
+
+        Says why not whenever the answer is no, because the alternative is a
+        task that silently stops halfway — the exact symptom this exists to
+        remove. Counts the continuation when the answer is yes.
+        """
+        def stop(why):
+            self.emit(ev("notice", level="warn",
+                         text=f"the turn ended on a partial answer and will not "
+                              f"continue by itself: {why}"))
+            return False
+
+        if not rolled:
+            # The only way an out-of-room turn does not roll: the archive.
+            return stop(f"the window could not be archived "
+                        f"({self.rollover_blocked or 'unknown error'}) — fix "
+                        "that, /rollover, then say 'continue'")
+        if self.max_continuations <= 0:
+            return stop("max_continuations is 0 — say 'continue' to carry on")
+        if self._continuations >= self.max_continuations:
+            return stop(f"{self._continuations} continuation(s) in a row reached "
+                        f"max_continuations — say 'continue' to carry on")
+        if self._pad_headroom() < self._min_tool_round_room():
+            return stop("even the fresh window has no room for a tool round")
+        self._continuations += 1
+        return True
 
     async def _maybe_roll(self, used, trip):
         pct = used * 100 // self.budget if self.budget else 0
@@ -3452,6 +3576,7 @@ class SessionManager:
             config.get("behavior", {}).get("base_file") or behavior.DEFAULT_BASE_FILE)
         self.conclude_directive = behavior.extract_conclude_directive(self.base_behavior)
         self.checkpoint_directive = behavior.extract_checkpoint_directive(self.base_behavior)
+        self.partial_directive = behavior.extract_partial_directive(self.base_behavior)
         self._engine_lock = asyncio.Lock()
         # Serialises session creation in get(). Creation spans three awaits
         # between the "is it there?" test and the insert, which is long enough
@@ -3882,6 +4007,7 @@ class SessionManager:
         self.conclude_directive = behavior.extract_conclude_directive(self.base_behavior)
         self.checkpoint_directive = behavior.extract_checkpoint_directive(
             self.base_behavior)
+        self.partial_directive = behavior.extract_partial_directive(self.base_behavior)
         self._tools = new_tools_list
         self._schemas = new_schemas
         self._tools_tok = new_tools_tok

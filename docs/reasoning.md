@@ -286,8 +286,25 @@ invisible one; the stats line is the only evidence such a turn ever happened.
 Separately, the round loop in `_turn()` ends the turn's *work* independently
 of any of this, on the same rule the pad uses and for the same reason: when
 `_pad_headroom()` drops below `_min_tool_round_room()`, it stops asking for work
-and asks for words: `no room left for another tool round — asking for a final
-answer`. That figure is **4,400 at the shipped `tools.max_output_chars: 8000`**
+and asks for a progress note: `no room left for another tool round — asking
+for a partial answer, then rolling over to continue`. This applies when the session
+offers tools; one with none has no tool round to run out of room for, and
+still asks for a final answer. The round carries the
+`## Partial answer` directive from `base.md` (riding on that round only, never
+entering history) and offers no tools; a call the model writes anyway is not
+run, and the notice says so. The turn then ends on that note, `_after_turn()`
+rolls the window over **always and without asking** — below the trip point,
+in `ask` and `off` mode, and with `rollover_at_percent: 0`, the way `/rollover`
+does — because the headroom that matters is already gone and those settings
+decide when a full window is *retired*, not whether a task may outgrow one.
+Then `run_turn()` starts a continuation turn opening
+with `CONTINUE_PROMPT`, which resumes the task from the handoff.
+`Session._may_continue()` decides whether that happens and names the reason
+whenever it does not: a window that could not be archived (`rollover_blocked`
+— the one gate kept, since replacing it would lose the conversation),
+`conversation.max_continuations`
+reached (default 10, reset by any message a person sends; 0 = never), or a
+fresh window that still has no room for a tool round. That figure is **4,400 at the shipped `tools.max_output_chars: 8000`**
 — one clipped tool result plus the message and arguments carrying it — and
 `MIN_TOOL_ROUND_ROOM` (4,000) is only the floor under it: the method derives
 the rest from a configurable clip length, so raise the clip and the room check

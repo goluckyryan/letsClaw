@@ -67,13 +67,14 @@ models/sessions/<session>.md      per session
 <the rollover handoff>            after a rollover
 ```
 
-Two sections of `models/base.md` are not prompt text at all — they are
+Three sections of `models/base.md` are not prompt text at all — they are
 templates the core lifts out and sends at the moment each applies:
 
 | section | extracted by | sent when |
 |---|---|---|
 | `## Checkpoint` | `extract_checkpoint_directive()` | a full notepad is about to be compacted |
 | `## Forced conclusion` | `extract_conclude_directive()` | the server cannot resume a cut-off thought |
+| `## Partial answer` | `extract_partial_directive()` | a turn has no room left for another tool round and is about to roll over and continue |
 
 So the wording of the machinery is tunable without touching code. That is the
 principle: **anything that is really a prompt should live in a file the user
@@ -407,8 +408,15 @@ call sites, and every one sits at a turn boundary:
 | call site | when | gated on |
 |---|---|---|
 | `_headroom_check()` | **before** a turn starts | `rollover_before_think`, `mode == auto`, `rollover_pct`, `rollover_blocked` |
-| `_after_turn()` | after the tool loop has fully drained | the trip point, and `rollover_mode` via `_maybe_roll()` |
+| `_after_turn()` | after the tool loop has fully drained | the trip point, and `rollover_mode` via `_maybe_roll()` — except a turn that ran out of room for tools, which rolls regardless and is gated only on `rollover_blocked` |
 | `command()` — `/rollover` | when a person asks | **`self.busy` only** |
+
+A turn that runs out of room for tools does not break this rule — it is how
+the rule is kept. The turn ends on a progress note, `_after_turn()` rolls over
+at the boundary like any other, and `run_turn()` then starts a *new* turn (the
+continuation, `origin: "continuation"`) under the same lock. The work spans a
+rollover; no turn does. See [reasoning.md](reasoning.md) on
+`_min_tool_round_room()`.
 
 The boundary is not a convenience, it is a correctness requirement: rolling
 over mid-loop would archive a `tool_call` whose `tool_result` had not been
@@ -428,6 +436,13 @@ passes its own `trip` rather than consulting the threshold, and it *clears*
 `rollover_blocked` first, because someone who just freed the disk has said so by
 typing the word. A person asking is the one event that overrides a policy
 setting, and that is the point of having both.
+
+**The out-of-room rollover sits between the two.** A turn that ran out of room
+for another tool round rolls over regardless of `rollover_mode` and the
+percentage, like a manual one: those settings decide when a full window is
+retired, and this window is not being retired by policy — the task outgrew it
+and has to continue (see the continuation note above). Unlike a manual one it
+keeps the `rollover_blocked` guard, since nobody has said the disk is fixed.
 
 **What "any time" means, precisely.** Manual means any time *between* turns, in
 any mode, at any window size. It does not mean during a turn: the `self.busy`

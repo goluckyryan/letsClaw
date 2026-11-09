@@ -1,7 +1,7 @@
 """The behavior layers: the Markdown that becomes the system prompt.
 
 Three files stack into every system prompt — a shared base, one per model, and
-one named for the session — plus the two directives the core sends on its own
+one named for the session — plus the three directives the core sends on its own
 initiative at the moment they apply. All of it is plain Markdown so it can be
 tuned with /reload rather than a code change.
 
@@ -20,7 +20,7 @@ import paths
 
 logger = logging.getLogger("letclaw.behavior")
 
-# The heading base.md gathers the two directives under. Everything from here to
+# The heading base.md gathers the directives under. Everything from here to
 # the next "# " heading is machinery, not behavior, and never reaches the system
 # prompt — see strip_directive_sections.
 DIRECTIVES_MARKER = "# Directives"
@@ -42,6 +42,18 @@ CHECKPOINT_FALLBACK = ("Your reasoning has filled the available room. Write "
                        "note replaces the reasoning it summarises, so whatever "
                        "you leave out is lost. This is not the final answer.")
 
+# Sent when the context has no room left for another tool round. The work is
+# not finished: the model writes where it got to, the core rolls the window
+# over at the turn boundary, and a continuation turn picks the task back up
+# from the handoff. Opposite of the forced conclusion — that one ends the work.
+PARTIAL_MARKER = "## Partial answer"
+PARTIAL_FALLBACK = ("The context window is nearly full, so this turn has to "
+                    "stop here. Do not call a tool. Write a progress note: "
+                    "what the task is, what you have done and found so far "
+                    "(exact values, paths and results), what is left, and the "
+                    "exact next step. The session will roll over to a fresh "
+                    "window and you will continue the task from this note.")
+
 # The base behavior — identity, working style and the tool notes — lives in
 # plain Markdown (behavior.base_file) so it can be tuned without a code change.
 # It is read once per core and shared by every session, and it is always in the
@@ -49,12 +61,15 @@ CHECKPOINT_FALLBACK = ("Your reasoning has filled the available room. Write "
 # same behavior as a missing per-model behavior file.
 DEFAULT_BASE_FILE = "models/base.md"
 
+DIRECTIVE_MARKERS = (CHECKPOINT_MARKER, CONCLUDE_MARKER, PARTIAL_MARKER)
+
 
 def strip_directive_sections(base_behavior):
     """The base behavior minus the blocks the core sends on its own.
 
-    "## Checkpoint" and "## Forced conclusion" are templates, not behavior: each
-    is extracted and sent as a *user* message at the one moment it applies. They
+    "## Checkpoint", "## Forced conclusion" and "## Partial answer" are
+    templates, not behavior: each is extracted and sent as a *user* message at
+    the one moment it applies. They
     live in base.md so they can be tuned without a code change, but a copy in
     the system prompt is at best redundant and at worst obeyed — a model that
     reads its whole prompt as standing instruction simply follows them. Claude
@@ -70,7 +85,7 @@ def strip_directive_sections(base_behavior):
     Two shapes are recognised. A "# Directives" group runs to the next "# "
     heading, which in practice is the end of the file; that is what base.md
     uses, and it takes the group's own preamble out of the prompt along with the
-    two sections. A bare "## Checkpoint" or "## Forced conclusion" with no group
+    sections. A bare directive section (see DIRECTIVE_MARKERS) with no group
     around it runs to the next heading of either level, which is how the file
     was laid out before the group existed.
     """
@@ -82,7 +97,7 @@ def strip_directive_sections(base_behavior):
         elif line.startswith("## ") and not in_group:
             # Inside the group these are already being skipped, and letting them
             # reset `skipping` would end the group at its own first subsection.
-            skipping = line.strip() in (CHECKPOINT_MARKER, CONCLUDE_MARKER)
+            skipping = line.strip() in DIRECTIVE_MARKERS
         if skipping:
             cut = True
         else:
@@ -100,6 +115,11 @@ def strip_directive_sections(base_behavior):
 def extract_conclude_directive(base_behavior):
     """The paragraph that forces a cut-off round to conclude. See extract_directive."""
     return extract_directive(base_behavior, CONCLUDE_MARKER, CONCLUDE_FALLBACK)
+
+
+def extract_partial_directive(base_behavior):
+    """The paragraph that asks for a progress note before a continuation rollover."""
+    return extract_directive(base_behavior, PARTIAL_MARKER, PARTIAL_FALLBACK)
 
 
 def extract_checkpoint_directive(base_behavior):
@@ -132,7 +152,7 @@ def extract_directive(base_behavior, marker, fallback):
             continue
         para.append(line)
     text = "\n".join(para).strip()
-    # `fallback`, not CONCLUDE_FALLBACK: this function serves both directives,
+    # `fallback`, not CONCLUDE_FALLBACK: this function serves every directive,
     # and the hard-coded name sent the *conclusion* text whenever the heading
     # was present with an empty section under it. The two are opposites at
     # opposite moments — "stop and answer" where "write down what you have and

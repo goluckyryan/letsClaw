@@ -89,9 +89,10 @@ the SSE read loop, so blocking there stalls every session at once.
   these pages points into it. The checks that keep this documentation honest
   live there, which means they do not travel with a clone: a fork inherits the
   prose and none of the gates.
-- **[webcam-voice-plan.md](webcam-voice-plan.md)** — a plan, not a description of
-  shipped code, and so not in the reading order above. It names functions,
+- **[voice-output-plan.md](voice-output-plan.md)** and
+  **[webcam-voice-plan.md](webcam-voice-plan.md)** — plans, not descriptions of
+  shipped code, and so not in the reading order above. They name functions,
   devices and files that do not exist yet, which is what a plan is for; the
-  pages above describe only what exists. It becomes a doc section when the code
-  it describes ships. Shorter items wait in `models/todo.md`.
+  pages above describe only what exists. They become a doc section when the code
+  they describe ships. Shorter items wait in `models/todo.md`.
 - **Open work** — `models/todo.md`.

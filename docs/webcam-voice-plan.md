@@ -147,10 +147,17 @@ socket:
    non-empty text with `origin: "voice"`.
 4. PTT (optional, config-gated): hold Pause/Break records, release transcribes
    and submits — same tail, no wake word.
-5. On `turn_end` of a turn the client started (voice or cam), speak the
-   answer with piper: strip markdown/emoji/code, cap length, sentence-chunk
-   the WAV playback. A turn whose text is the NO-RESPONSE marker (below) is
-   not spoken.
+5. On `turn_end` of a turn the client started (voice or cam), have the
+   answer spoken — which since 2026-11-06 is not this client's job: it turns
+   `/voice on` for its own session and the voice module does the speaking. A
+   turn whose text is the NO-RESPONSE marker (below) is not spoken — the
+   module's `voice.skip_markers` is what implements that.
+   *(Update 2026-11-06: this step, and the markdown-stripping, length-capping
+   and sentence-chunking named in it — measurement showed the chunking is
+   unnecessary: piper synthesizes a whole answer at RTF ≈ 0.05 — is superseded
+   by the cleaner and speaker thread in
+   [voice-output-plan.md](voice-output-plan.md). Nothing here re-writes any of
+   it.)*
 
 ### Camera loop
 
@@ -208,7 +215,7 @@ cam:
   motion:
     enabled: true
     greet_cooldown_min: 10
-  voice:
+  mic:
     wake: true                 # "Hey Dudu" loop
     wake_threshold: 0.7
     wake_model: "~/wakeword_data/hey_dudu_model/hey_dudu.onnx"
@@ -216,15 +223,17 @@ cam:
     listen_sec: 6
     whisper: "large-v3"
     mic_source: "alsa_input.usb-046d_Brio_100_2551APP031R8-02.mono-fallback"
-  tts:
-    enabled: true
-    voice: "voices/en_US-lessac-medium.onnx"
-    speed: 1.0
-    gain: 1.0
-    device: "default"          # aplay device; e.g. "plughw:0,3" for HDMI
 ```
 
 Restart-only like the Discord section: read at client start, no hot reload.
+
+> Renamed since this section was written: `voice:` below `cam:` is now `mic:`
+> (input only), and the `tts:` block is gone. A top-level `voice:` section now
+> belongs to the [voice output module](voice-output-plan.md), which is the only
+> thing that synthesizes and plays audio; `cam_client.py` asks for speech by
+> turning `/voice on` for its session instead of carrying a second copy of the
+> piper settings. Two sections named `voice:` saying different things about
+> audio, in one file, is the kind of near-collision that gets read wrong.
 
 ### Dependencies
 
@@ -237,13 +246,19 @@ array-input workaround — pinning `av<15` fails to build on Python 3.14.)
 | phase | deliverable | test |
 |---|---|---|
 | 1 | core multimodal submit + token counter | unit + scratch-core test (no camera, no network) |
-| 2 | `cam_client.py` skeleton: attach, TTS on turn_end | speak a canned turn_end |
+| 2 | `cam_client.py` skeleton: attach, `/voice on` for the office session | speak a canned turn_end (the voice module does the speaking) |
 | 3 | voice: wake loop + PTT → whisper → submit | TTS→mic→whisper round trip; wake on a recorded "Hey Dudu" |
 | 4 | camera: CamControl lifecycle + frame poller → vision turn | synthetic frame dropped in `frames/` triggers a turn (vision model = live SGLang, so this phase needs a reachable server — it is gated as a live check, not a hermetic one) |
 | 5 | config, `run_cam.sh`, README section | full pass: steering/browser/settings baselines unchanged |
 
 Phase 1 is independently shippable (the WebUI could grow an image-attach
-button on the same seam) — but nothing else does until it lands.
+button on the same seam) — but nothing **camera-side** does until it lands.
+Speaking answers does not need it: that was split out first as
+[voice-output-plan.md](voice-output-plan.md), which rides the existing text
+events. It does touch core code — a per-session `/voice` switch, since which
+sessions want to be heard is a fact about the session and not about the
+speaker — and that switch is where a future camera or wake-word client will
+find its own "should this be heard" answer too.
 
 ## Risks and open edges
 
