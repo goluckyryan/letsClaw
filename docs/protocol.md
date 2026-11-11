@@ -1,13 +1,8 @@
 # The core protocol
 
-Everything a client needs. The core is `source/server.py` (transport) over
-`source/core.py` (state); a client is anything that can hold a WebSocket and
-parse JSON. There are three today — see [clients.md](clients.md) — and the
-protocol is the only thing they share.
+Everything a client needs. The core is `source/server.py` (transport) over `source/core.py` (state); a client is anything that can hold a WebSocket and parse JSON. There are three today — see [clients.md](clients.md) — and the protocol is the only thing they share.
 
-**Protocol version** is `core.PROTOCOL_VERSION`, currently `1`.
-`chat.py` and `discord_client.py` import it; **`web/app.js` hard-codes
-it** and must be kept in sync by hand. Bumping it means editing two places.
+**Protocol version** is `core.PROTOCOL_VERSION`, currently `1`. `chat.py` and `discord_client.py` import it; **`web/app.js` hard-codes it** and must be kept in sync by hand. Bumping it means editing two places.
 
 ---
 
@@ -33,27 +28,13 @@ Routes registered in `build_app()`.
 | `GET /` , `GET /static/*` | **no** | the WebUI from `web/` — registered only if `web/index.html` exists |
 | `GET /theme.css` | **no** | generated CSS from `webui.pin` in config.yaml — the style of the pinned prompt; `/reload` re-themes it |
 
-**Auth** (`_authorised()`): the token is `core.token`; empty
-means everything is open. Accepts `Authorization: Bearer <tok>` **or**
-`?token=<tok>`. Rejection is a 401.
+**Auth** (`_authorised()`): the token is `core.token`; empty means everything is open. Accepts `Authorization: Bearer <tok>` **or** `?token=<tok>`. Rejection is a 401.
 
-The **Auth** column above says `yes` for the token and understates the writes.
-Every route that changes state — `DELETE /sessions/{name}`, `POST
-/sessions/{name}/rename`, `POST /reload`, `POST /config`, `DELETE /files/{name}`
-— **and `GET /ws`** call `_guard`, which additionally rejects a cross-origin
-`Origin`; the read-only GETs call `_read_guard`, which checks the token only.
-The WebSocket is the one worth the words: a socket is exempt from the browser's
-same-origin policy by nature, which is exactly why the core checks its `Origin`
-by hand. A fourth client that sends an `Origin` header from another port gets a
-403 that the token alone will not explain — omit the header (as `curl` and a
-native client do) or come from the same origin.
+The **Auth** column above says `yes` for the token and understates the writes. Every route that changes state — `DELETE /sessions/{name}`, `POST /sessions/{name}/rename`, `POST /reload`, `POST /config`, `DELETE /files/{name}` — **and `GET /ws`** call `_guard`, which additionally rejects a cross-origin `Origin`; the read-only GETs call `_read_guard`, which checks the token only. The WebSocket is the one worth the words: a socket is exempt from the browser's same-origin policy by nature, which is exactly why the core checks its `Origin` by hand. A fourth client that sends an `Origin` header from another port gets a 403 that the token alone will not explain — omit the header (as `curl` and a native client do) or come from the same origin.
 
-`/` is unauthenticated on purpose — the page holds no secrets and is the thing
-that *asks* for the token.
+`/` is unauthenticated on purpose — the page holds no secrets and is the thing that *asks* for the token.
 
-> `/static/` serves the whole `web/` directory, so it exposes the page, the
-> client and the vendored KaTeX — everything the browser needs, and nothing that
-> is not in `web/`.
+> `/static/` serves the whole `web/` directory, so it exposes the page, the client and the vendored KaTeX — everything the browser needs, and nothing that is not in `web/`.
 
 ---
 
@@ -69,19 +50,13 @@ that *asks* for the token.
 | `model` | — | **only applies when this attach creates the session** |
 | `token` | — | auth fallback for browsers, which cannot set WS headers |
 
-`?model=` not switching a live session is deliberate: it would move the
-conversation out from under anyone else attached to it. Switching is `/model`'s
-job.
+`?model=` not switching a live session is deliberate: it would move the conversation out from under anyone else attached to it. Switching is `/model`'s job.
 
-`?session=` is **not validated** — a session named `../../etc/passwd` can
-exist. The guard is at the point the name becomes a path that is read
-(`Session.roll_over()`).
+`?session=` is **not validated** — a session named `../../etc/passwd` can exist. The guard is at the point the name becomes a path that is read (`Session.roll_over()`).
 
 ### Attaching is a connection, not a handshake
 
-There is no attach message. The name is a query parameter and `hello` — the
-first event on every connection — carries the snapshot back. **So reconnecting
-is the same operation as connecting.**
+There is no attach message. The name is a query parameter and `hello` — the first event on every connection — carries the snapshot back. **So reconnecting is the same operation as connecting.**
 
 The order in `ws_handler()` is load-bearing:
 
@@ -91,8 +66,7 @@ The order in `ws_handler()` is load-bearing:
 
 ### Client → core
 
-Six verbs, all JSON text frames keyed on `"t"`. Malformed JSON gets a
-non-fatal `error`; non-text frames are ignored.
+Six verbs, all JSON text frames keyed on `"t"`. Malformed JSON gets a non-fatal `error`; non-text frames are ignored.
 
 | `t` | fields | notes |
 |---|---|---|
@@ -103,38 +77,19 @@ non-fatal `error`; non-text frames are ignored.
 | `steering` | `text` | a correction for the turn in flight: queued as a user message, interrupts the streaming round, and is answered by the next round. With no turn running the core answers with a `notice` |
 | `ping` | — | → `pong` |
 
-`submit` runs as `asyncio.create_task(session.run_turn(...))` and is **never
-awaited inline**, so the reader stays live for `stop` and `rollover_reply`
-during a long turn.
+`submit` runs as `asyncio.create_task(session.run_turn(...))` and is **never awaited inline**, so the reader stays live for `stop` and `rollover_reply` during a long turn.
 
-**Commands** (`Session.command()`), name lowercased and a leading
-`/` stripped. Three groups, not two, and the third is the one that was being
-filed under the first:
+**Commands** (`Session.command()`), name lowercased and a leading `/` stripped. Three groups, not two, and the third is the one that was being filed under the first:
 
-- **read-only**, reply to the asker: `info`, `behavior`, and the bare forms of
-  `model` (the listing) and `digest` (the state) — answered above the busy
-  guard, because the moment you want to know is while a turn is running.
-  There is no separate `/models`: the listing is bare `/model`, and a second
-  spelling of it would be a second command to keep in sync for no new answer.
-- **manager-level**, above the busy guard and outside the turn lock: `reload`,
-  `restart`. They act on the whole core rather than one session, and taking the
-  turn lock here would deadlock — `reload` defers busy sessions, including the
-  one that asked. Each does its own refusing instead: `reload` defers, `restart`
-  reports every busy session by name and takes `force` to override
-- **turn-lock-taking**: `clear`, `rollover`, `new`, `model`, `digest` — these
-  return `{"ok": false, "error": "a turn is running…"}` when busy. The last
-  two are the pair that splits across the guard: their bare form reports and
-  sits in the read-only group above, their argument form mutates and sits here.
+- **read-only**, reply to the asker: `info`, `behavior`, and the bare forms of `model` (the listing) and `digest` (the state) — answered above the busy guard, because the moment you want to know is while a turn is running. There is no separate `/models`: the listing is bare `/model`, and a second spelling of it would be a second command to keep in sync for no new answer.
+- **manager-level**, above the busy guard and outside the turn lock: `reload`, `restart`. They act on the whole core rather than one session, and taking the turn lock here would deadlock — `reload` defers busy sessions, including the one that asked. Each does its own refusing instead: `reload` defers, `restart` reports every busy session by name and takes `force` to override
+- **turn-lock-taking**: `clear`, `rollover`, `new`, `model`, `digest` — these return `{"ok": false, "error": "a turn is running…"}` when busy. The last two are the pair that splits across the guard: their bare form reports and sits in the read-only group above, their argument form mutates and sits here.
 
-`restart` has to sit above the busy guard for a second reason of its own: the
-whole content of its refusal is *which* sessions are busy, and below the guard a
-`/restart` typed into a busy session would never get past "a turn is running in
-this session".
+`restart` has to sit above the busy guard for a second reason of its own: the whole content of its refusal is *which* sessions are busy, and below the guard a `/restart` typed into a busy session would never get past "a turn is running in this session".
 
 ### Core → client
 
-Every event carries `seq` and `session`, stamped by `Session.emit`
-(`Session.emit()`).
+Every event carries `seq` and `session`, stamped by `Session.emit` (`Session.emit()`).
 
 | `t` | payload | |
 |---|---|---|
@@ -159,11 +114,9 @@ Every event carries `seq` and `session`, stamped by `Session.emit`
 
 ### Replay semantics
 
-`Session.emit()` buffers into `turn_events` for the current
-turn:
+`Session.emit()` buffers into `turn_events` for the current turn:
 
-- consecutive `text` deltas are **coalesced** (append-only, so lossless — and
-  it keeps a 2000-delta turn from replaying token by token)
+- consecutive `text` deltas are **coalesced** (append-only, so lossless — and it keeps a 2000-delta turn from replaying token by token)
 - `reasoning` and `reasoning_stat` are **excluded entirely**
 - everything else is buffered verbatim
 
@@ -171,23 +124,13 @@ A fresh attach is served from history; `missed` covers a reconnect.
 
 ### Backpressure
 
-The writer task (`_writer()`) is the **sole owner of the socket for
-outbound traffic** — the turn never touches it, so a stalled peer cannot stall
-generation.
+The writer task (`_writer()`) is the **sole owner of the socket for outbound traffic** — the turn never touches it, so a stalled peer cannot stall generation.
 
-A subscriber's queue has `maxlen=2000` (`Subscriber`). On overflow the client
-is **dropped**: close code `TRY_AGAIN_LATER` (1013) with
-`b"too slow; reconnect and replay"`. A client that sees 1013 should reconnect
-with its `last_seq`.
+A subscriber's queue has `maxlen=2000` (`Subscriber`). On overflow the client is **dropped**: close code `TRY_AGAIN_LATER` (1013) with `b"too slow; reconnect and replay"`. A client that sees 1013 should reconnect with its `last_seq`.
 
 ### Session re-homing
 
-If a session is deleted while you are attached (`session.dead`, handled in `ws_handler()`), your
-socket stays open. You get a notice, and your next `submit` or `command`
-transparently lands on a **fresh, empty session of the same name** — the
-handler detaches, calls `mgr.get(session.name)`, re-attaches and sends a new
-snapshot. It uses `session.name`, not the name captured at attach, so a rename
-follows the client rather than resurrecting the old name.
+If a session is deleted while you are attached (`session.dead`, handled in `ws_handler()`), your socket stays open. You get a notice, and your next `submit` or `command` transparently lands on a **fresh, empty session of the same name** — the handler detaches, calls `mgr.get(session.name)`, re-attaches and sends a new snapshot. It uses `session.name`, not the name captured at attach, so a rename follows the client rather than resurrecting the old name.
 
 ---
 
@@ -199,38 +142,19 @@ The minimum is smaller than it looks:
 2. Read `hello`, note `proto` and `budget`.
 3. Send `{"t":"submit","text":"…"}`.
 4. Accumulate `text` deltas; the turn is over at `turn_end`.
-5. Answer `rollover_ask` with `rollover_reply`, or let it time out
-   (`prompt_timeout`, which keeps the session).
+5. Answer `rollover_ask` with `rollover_reply`, or let it time out (`prompt_timeout`, which keeps the session).
 
-Everything else — `reasoning`, `tool_call`, `stats`, the sidebar — is
-presentation you can skip. The Discord bot ignores `stats` and all reasoning,
-and is a complete client.
+Everything else — `reasoning`, `tool_call`, `stats`, the sidebar — is presentation you can skip. The Discord bot ignores `stats` and all reasoning, and is a complete client.
 
-It does read `tool_call` and `tool_result`, but not to render them live: it
-posts a turn once, at `turn_end`, so a tool round would otherwise be a blank
-gap in the answer — the `<tool_call>` block is lifted out of the text stream
-but the newlines around it are not. A client that buffers a turn has to
-handle the two events for that reason alone, even if it shows nothing.
+It does read `tool_call` and `tool_result`, but not to render them live: it posts a turn once, at `turn_end`, so a tool round would otherwise be a blank gap in the answer — the `<tool_call>` block is lifted out of the text stream but the newlines around it are not. A client that buffers a turn has to handle the two events for that reason alone, even if it shows nothing.
 
 Things worth copying from the existing three:
 
 - **reconnect with `last_seq`**, and treat close code 1013 as "reconnect now"
-- **do not render optimistically** — draw your own message when `turn_start`
-  echoes it, so every attached client shows the same transcript
-- set `reasoning=0` if you will never draw the thinking; the token count still
-  arrives as `reasoning_stat`
+- **do not render optimistically** — draw your own message when `turn_start` echoes it, so every attached client shows the same transcript
+- set `reasoning=0` if you will never draw the thinking; the token count still arrives as `reasoning_stat`
 - send `origin` if your session is shared by several people
 
-**Do not teach the core about your client.** If you need per-client behavior,
-encode it into the session name — that is what the Discord bot does, and it is
-why `models/sessions/` works for all three
-([principle 4](design-principles.md#4-key-on-the-session-name-not-on-the-clients-identity)).
+**Do not teach the core about your client.** If you need per-client behavior, encode it into the session name — that is what the Discord bot does, and it is why `models/sessions/` works for all three ([principle 4](design-principles.md#4-key-on-the-session-name-not-on-the-clients-identity)).
 
-A new event type costs nothing to add: `handle()` in each client is a `switch`
-with no `default`, and `ChatClient.handle()` an `elif` chain with no `else`, so
-an event a client has never heard of is skipped rather than fatal. Changing the
-shape of an **existing** event is the expensive move — three renderers read
-those fields and none of them is checked against the others. If a command
-mutates session state that other attached clients should see, emit a
-`session_state` event as well as returning the reply: the reply reaches the
-asking client only.
+A new event type costs nothing to add: `handle()` in each client is a `switch` with no `default`, and `ChatClient.handle()` an `elif` chain with no `else`, so an event a client has never heard of is skipped rather than fatal. Changing the shape of an **existing** event is the expensive move — three renderers read those fields and none of them is checked against the others. If a command mutates session state that other attached clients should see, emit a `session_state` event as well as returning the reply: the reply reaches the asking client only.
