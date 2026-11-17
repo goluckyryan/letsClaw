@@ -343,7 +343,9 @@ It refuses in two cases — **a turn is running anywhere** (not only where you t
 
 ## Security
 
-Tools are unconfined by design: `exec` runs shell commands and `read_file` / `write_file` reach any path this process can. **Anyone who can open a WebSocket to the core can therefore run commands on this machine.** That is what makes an agent useful, and it is not sandboxed, because a sandbox around a tool that exists to work on your real files would remove the point.
+Tools are unconfined by design: `exec` runs shell commands and `read_file` reaches any path this process can. **Anyone who can open a WebSocket to the core can therefore run commands on this machine.** That is what makes an agent useful, and it is not sandboxed, because a sandbox around a tool that exists to work on your real files would remove the point.
+
+Two optional guardrails catch the model's own mistakes: `tools.allow_paths` limits where `write_file` and `edit_file` may write and where `show_image` may copy from, and `tools.deny_commands` makes `exec` and `run_and_capture` refuse lines that start a listed program (`sudo`, `chmod`, ...). Neither is a wall — `exec` can still write anywhere and run anything once the command is built at run time — so they change nothing about who may safely reach the core. What each one checks is spelled out in [`config.example.yaml`](config.example.yaml).
 
 So the boundary is the network, and there are two knobs:
 
@@ -374,9 +376,9 @@ Every client understands these, except where a row says otherwise; four are hand
 | `/steering <text>` | send a correction *into* the turn in progress — the model picks it up at the next round, and it enters the history as the ordinary user message it is. Refused when nothing is running, rather than held over for the next turn |
 | `/reload` | re-read `config.yaml` into the running core |
 | `/restart` | restart the core process, in place and keeping its PID — the only way to apply the restart-only keys. Refused while a turn is running anywhere; `/restart force` goes ahead and loses those turns. The terminal has no reconnect, so it says so and exits |
+| `/session` , `/session <name>` | terminal and Discord: show which session this window talks to, or move it to another — an unknown name creates one. The session left behind keeps running, turn included |
 | `/quit` , `/exit` | leave — the core keeps running, and so does the turn |
 
-| `/session` , `/session <name>` | terminal and Discord: show which session this window talks to, or move it to another — an unknown name creates one. The session left behind keeps running, turn included |
 `/session` is handled by the window, not the core, and so it means what that window can do: the terminal re-dials the core on the new name, Discord points the *channel* at it (and remembers that across restarts), and the browser has none, because its sidebar already switches. `/steering` is terminal and browser only.
 
 **Three ways to end a window**, and the difference is how much of the past goes with it. `/clear` forgets the conversation and leaves every archive alone. `/rollover` archives it, has the model write a handoff, and starts the next window holding that summary — this is also what the context threshold triggers automatically. `/new` is the destructive one: it wipes the conversation *and* deletes every transcript and journal this session has written, matched on its session id so no other session's files can be caught. There is no undo, which is why it is `/new` and not `/clear` — the reflexive keystroke is the safe one.

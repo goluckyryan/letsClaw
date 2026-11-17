@@ -266,6 +266,26 @@ tools:
                               # can still read and plot, it just cannot show you.
   exec_timeout: 120           # seconds
   max_output_chars: 8000      # tool output truncation
+  # Two guardrails against the model's own mistakes. Neither is a sandbox:
+  # `exec` is still a shell that can write anywhere and run anything this user
+  # can, so they do not change who you can safely let reach the core.
+  #
+  # allow_paths — the directories write_file and edit_file may write under, and
+  # show_image may copy from. A path counts as under a root when, after `~`,
+  # `..` and symlinks are resolved, it is the root or inside it (~/a does not
+  # admit ~/ab). Relative entries are taken against workdir. Reads are not
+  # limited. Omitted or [] = anywhere.
+  # allow_paths: ["~/project", "/tmp"]
+  #
+  # deny_commands — programs exec and run_and_capture refuse to start. Checked
+  # on the word in command position of every piece of the line (after ; && ||
+  # | & ( $( and backticks, past env/nice/timeout/xargs/... and VAR=x), by
+  # basename and with quoting removed: `/usr/bin/sudo x`, `s''udo x` and
+  # `ls && chmod +x a` are refused; `grep chmod *.py` and `echo "use sudo"` are
+  # not. A command assembled at run time — `$(echo sudo)`, python's os.system,
+  # or `sh -c` when sh is not listed — is not caught. Omitted or [] = none.
+  # deny_commands: [sudo, su, chmod, chown, chgrp, setfacl, bash]
+  #
   # workdir: "/home/you/project"  # base dir for exec and relative paths.
                                 # Defaults to the letsClaw directory — the core is a
                                 # daemon, so its own cwd is not the shell you started in.

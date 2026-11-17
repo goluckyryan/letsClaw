@@ -168,7 +168,7 @@ Related: `session_id` was added to the live-file payload **without** bumping `LI
 
 - The three file tools do their reading and writing **off the event loop** — in a shared core one slow read would otherwise stall every session's stream.
 - Each `exec` gets **its own process group**, so a timeout, a `/stop` or a core shutdown kills the children too instead of leaving a detached shell behind.
-- `exec` runs in `tools.workdir` (default: the letsClaw directory) because the core is a daemon — its cwd is wherever `./serve.sh` was launched from, which is not the shell you were sitting in.
+- `exec` runs in `tools.workdir` (default: the letsClaw directory) because the core is a daemon — its cwd is wherever `./serve.sh` was launched from, which is not the shell you were sitting in. A relative path given to any file tool is taken against the same directory, for the same reason.
 - One turn at a time per session: a second submit is refused with `busy` rather than silently queued behind a context its sender never saw.
 
 ## 15. One definition of where the repo is
@@ -250,7 +250,7 @@ The boundary is not a convenience, it is a correctness requirement: rolling over
 
 Honest notes, not excuses:
 
-- **Tools are unconfined by design.** `exec` runs shell commands and the file tools reach any path the process can. Anyone who can open a WebSocket to the core can run commands on the machine. The mitigations are `core.bind` on loopback, `core.token`, and — for the bot, which bridges past both — `discord.users`.
+- **Tools are unconfined by design.** `exec` runs shell commands and the file tools reach any path the process can. Anyone who can open a WebSocket to the core can run commands on the machine. The mitigations are `core.bind` on loopback, `core.token`, and — for the bot, which bridges past both — `discord.users`. `tools.allow_paths` and `tools.deny_commands` are guardrails against the model's mistakes, not mitigations: `exec` gets past both the moment a command is assembled at run time.
 - **`?session=` is not validated on attach**, so a session named `../../etc/passwd` can exist. The guard is at the point where a name becomes a path that is *read*: `session_behavior_path()` slugs the name and refuses anything that does not land directly in `session_dir`.
 - **Archive filenames are not disambiguated.** Two rollovers of one session inside the same second overwrite. That needs a rollover whose handoff never runs, and is accepted rather than guarded. The *journal* name is disambiguated with `-2`, because there a collision would silently append a new window to a closed segment.
 - **`/static/` serves the whole `web/` directory** — `app.js`, `index.html`, `style.css` and the vendored KaTeX, and anything else dropped in there. Every file the browser client needs is meant to be public, which is why the route takes the directory rather than a list; a file that should not be readable does not belong in `web/`. Harmless while loopback-bound; worth knowing before exposing the port.

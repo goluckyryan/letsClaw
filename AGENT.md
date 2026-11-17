@@ -91,7 +91,8 @@ To confirm a model, open a client and send a message.
   something in front of the core forwards a `Host` the core has never heard of —
   a reverse proxy. It is read per request, so `/reload` is enough.
 - The agent tools are **unconfined**: anyone who can reach the port gets a shell on
-  this host. So if you change `bind` to anything non-loopback (e.g. `0.0.0.0` for a
+  this host. `tools.allow_paths` / `tools.deny_commands` are guardrails against the
+  model's mistakes, not a sandbox — `exec` gets past both. So if you change `bind` to anything non-loopback (e.g. `0.0.0.0` for a
   LAN), you **must** set a `core.token` too — the core now refuses to start in that
   combination rather than warning about it. Its banner line shows the LAN address to
   type into a browser (e.g. `http://192.168.203.75:8770/`) instead of the untypeable

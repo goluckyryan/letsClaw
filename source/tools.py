@@ -284,6 +284,110 @@ def _line_count(s: str) -> int:
     return s.count("\n") + (0 if s.endswith("\n") else 1)
 
 
+def _as_list(value) -> list:
+    """A config list that may have been written as one bare string.
+
+    `deny_commands: sudo` is the natural way to write a one-item list and YAML
+    hands it back as a string, which iterating would spell out letter by letter.
+    """
+    if not value:
+        return []
+    return [value] if isinstance(value, str) else list(value)
+
+
+def _abs(path: str, base: str) -> Path:
+    """A tool's path argument as an absolute path: `~` expanded, a relative
+    path taken against workdir. The core is a daemon, so its own cwd is not
+    the place a model means by `notes.txt` — workdir is."""
+    p = Path(path).expanduser()
+    return p if p.is_absolute() else Path(base).expanduser() / p
+
+
+def write_roots(entries, base: str) -> list:
+    """tools.allow_paths, resolved: the directories write_file, edit_file and
+    show_image may touch. Empty means no restriction."""
+    roots = []
+    for e in _as_list(entries):
+        try:
+            roots.append(_abs(str(e), base).resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue          # a root that cannot be resolved admits nothing
+    return roots
+
+
+def outside_roots(p: Path, roots: list) -> bool:
+    """Whether p — already absolute — is outside every root.
+
+    p is resolved first, so `..` and symlinks are judged by where they land,
+    not by how they are spelled: `root/../.ssh` and a link inside root that
+    points at /etc are both outside. is_relative_to compares whole path parts,
+    so a root of ~/letsClaw does not admit ~/letsClawX.
+    """
+    if not roots:
+        return False
+    try:
+        r = p.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return True
+    return not any(r == root or r.is_relative_to(root) for root in roots)
+
+
+# Words that may stand in front of a command without being the command, so the
+# deny check looks past them: `env FOO=1 sudo x` runs sudo, not env.
+_CMD_PREFIXES = frozenset({"env", "nice", "nohup", "time", "command", "exec",
+                           "builtin", "xargs", "stdbuf", "timeout", "ionice",
+                           "setsid", "chrt", "taskset", "doas"})
+# What ends one command and starts the next, as shlex(punctuation_chars=True)
+# hands it back: every run of ();<>|& characters is one token.
+_CMD_BREAK = re.compile(r"^[();|&]+$")
+_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def denied_command(command: str, deny) -> str | None:
+    """The first word of `command` that names a denied program, or None.
+
+    A guardrail against the model's own habits, not a wall: it looks at the
+    word in command position of every piece of the line — after ; && || | &
+    ( $( and backticks, past the _CMD_PREFIXES and VAR=x assignments — by its
+    basename, with shell quoting removed, so `/usr/bin/sudo`, `s''udo` and
+    `ls && chmod +x a` are all caught while `grep chmod *.py` and
+    `echo "use sudo"` are not. A command built at run time (`$(echo sudo)`,
+    python's os.system) is not caught, and is not meant to be.
+
+    Newlines are command breaks, so a heredoc line that starts with a denied
+    word is refused too — write the file with write_file instead.
+    """
+    deny = set(_as_list(deny))
+    if not deny:
+        return None
+    import shlex
+    text = command.replace("`", " ; ").replace("\n", " ; ")
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        # Unbalanced quotes: the shell will refuse the line itself, so there is
+        # nothing for this check to stop.
+        return None
+    at_start = True
+    for tok in tokens:
+        if _CMD_BREAK.match(tok):
+            at_start = True
+            continue
+        if not at_start:
+            continue
+        if _ASSIGN.match(tok) or tok.startswith("-") or tok.isdigit() or tok == "$":
+            continue          # VAR=x, a prefix's flag or number, the $ of $(
+        name = os.path.basename(tok)
+        if name in deny:
+            return name
+        if name in _CMD_PREFIXES:
+            continue          # still in command position: look at the next word
+        at_start = False
+    return None
+
+
 def build_tools(cfg: dict | None = None, workdir: str | None = None,
                 files_dir=None) -> list:
     """Create the enabled tools from the config's tools: section.
@@ -311,8 +415,27 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
     max_out = config_lib.int_or(cfg.get("max_output_chars", DEFAULT_MAX_OUTPUT),
                                 DEFAULT_MAX_OUTPUT)
     exec_timeout = config_lib.int_or(cfg.get("exec_timeout", 120), 120)
+    roots = write_roots(cfg.get("allow_paths"), base)
+    deny = set(_as_list(cfg.get("deny_commands")))
+
+    def _refused(command: str) -> str | None:
+        name = denied_command(command, deny)
+        if name is None:
+            return None
+        return (f"error: refused — `{name}` is in tools.deny_commands, a "
+                "guardrail set in config.yaml. Do it another way, or ask the "
+                "user to run it themselves.")
+
+    def _outside(p: Path, path: str) -> str | None:
+        if not outside_roots(p, roots):
+            return None
+        return (f"error: refused — {path} is outside tools.allow_paths "
+                f"({', '.join(str(r) for r in roots)}), a guardrail set in "
+                "config.yaml. Write somewhere under those, or ask the user.")
 
     async def exec_(command: str, workdir: str | None = None, timeout: int | None = None) -> str:
+        if (no := _refused(command)):
+            return no
         workdir = workdir or base
         timeout = _coerce_timeout(timeout, exec_timeout)
         timed_out, code, out_s, err_s = await _run_shell(command, workdir, timeout)
@@ -330,7 +453,7 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
     # These three touch the disk. In the shared core one slow read would stall every
     # session's token stream, so the blocking part runs off the event loop.
     def _read_file(path: str) -> str:
-        p = Path(path).expanduser()
+        p = _abs(path, base)
         if not p.is_file():
             return f"error: not a file: {path}"
         return p.read_text(encoding="utf-8", errors="replace")
@@ -339,7 +462,9 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
         return await asyncio.to_thread(_read_file, path)
 
     def _write_file(path: str, content: str) -> str:
-        p = Path(path).expanduser()
+        p = _abs(path, base)
+        if (no := _outside(p, path)):
+            return no
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return f"wrote {len(content)} chars to {p}"
@@ -348,7 +473,7 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
         return await asyncio.to_thread(_write_file, path, content)
 
     def _list_dir(path: str = ".") -> str:
-        p = Path(path).expanduser()
+        p = _abs(path, base)
         if not p.is_dir():
             return f"error: not a directory: {path}"
         lines = []
@@ -371,12 +496,17 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
         core.token. That is the whole reason it copies rather than, say,
         registering a path: what is servable stays exactly "what is in one
         directory", which is the invariant /files is built on.
+
+        The source is held to tools.allow_paths like a write is, because
+        publishing a file over HTTP is a bigger step than reading it.
         """
-        src = Path(path).expanduser()
+        src = _abs(path, base)
         try:
             src = src.resolve()
         except (OSError, ValueError):
             return f"error: cannot resolve {path}"
+        if (no := _outside(src, path)):
+            return no
         if not src.is_file():
             return f"error: not a file: {path}"
         ext = src.suffix.lower()
@@ -405,9 +535,9 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
         if dest.exists():
             if dest.stat().st_size == size and dest.read_bytes() == src.read_bytes():
                 return f"{dest.name} (already there) — now write ![…]({dest.name}) to show it"
-            base, n = dest.stem, 2
+            first, n = dest.stem, 2
             while dest.exists():
-                dest = pics / f"{base}-{n}{ext}"
+                dest = pics / f"{first}-{n}{ext}"
                 n += 1
         shutil.copyfile(src, dest)
         return f"{dest.name} — now write ![a caption]({dest.name}) to show it"
@@ -427,7 +557,7 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
             context = max(0, int(context))
         except (TypeError, ValueError):
             return "error: max_matches, inspect and context must be integers"
-        root_p = Path(root).expanduser()
+        root_p = _abs(root, base)
         if not root_p.is_dir():
             return f"error: not a directory: {root}"
         files, files_stopped = _collect_files(root_p)
@@ -499,7 +629,7 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
 
     def _inspect_file(path: str, lines: str | None = None,
                       pattern: str | None = None, context: int = 2) -> str:
-        p = Path(path).expanduser()
+        p = _abs(path, base)
         if not p.is_file():
             return f"error: not a file: {path}"
         try:
@@ -564,7 +694,9 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
 
     def _edit_file(path: str, old_string: str, new_string: str,
                    replace_all: bool = False) -> str:
-        p = Path(path).expanduser()
+        p = _abs(path, base)
+        if (no := _outside(p, path)):
+            return no
         if not p.is_file():
             return f"error: not a file: {path}"
         if not old_string:
@@ -605,7 +737,7 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
             max_refs = max(1, int(max_refs))
         except (TypeError, ValueError):
             return "error: max_refs must be an integer"
-        root_p = Path(root).expanduser()
+        root_p = _abs(root, base)
         if not root_p.is_dir():
             return f"error: not a directory: {root}"
         files, files_stopped = _collect_files(root_p)
@@ -656,6 +788,8 @@ def build_tools(cfg: dict | None = None, workdir: str | None = None,
 
     async def run_and_capture(command: str, workdir: str | None = None,
                               timeout: int | None = None) -> str:
+        if (no := _refused(command)):
+            return no
         workdir = workdir or base
         timeout = _coerce_timeout(timeout, exec_timeout)
         t0 = time.monotonic()
