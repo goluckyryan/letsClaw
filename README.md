@@ -358,7 +358,7 @@ Binding to a non-loopback address with no token is refused at startup for exactl
 
 ## Commands you can type
 
-Every client understands these; three are handled by the window itself rather than sent to the core (`/quit`, `/exit`, `/reasoning`).
+Every client understands these, except where a row says otherwise; four are handled by the window itself rather than sent to the core (`/quit`, `/exit`, `/reasoning`, `/session`).
 
 | command | |
 |---|---|
@@ -376,7 +376,8 @@ Every client understands these; three are handled by the window itself rather th
 | `/restart` | restart the core process, in place and keeping its PID — the only way to apply the restart-only keys. Refused while a turn is running anywhere; `/restart force` goes ahead and loses those turns. The terminal has no reconnect, so it says so and exits |
 | `/quit` , `/exit` | leave — the core keeps running, and so does the turn |
 
-Discord adds `/session [name]`, which points a channel at a different session; the terminal and the browser pick their session when they attach, so they have no use for it. `/steering` is the other way round — terminal and browser only.
+| `/session` , `/session <name>` | terminal and Discord: show which session this window talks to, or move it to another — an unknown name creates one. The session left behind keeps running, turn included |
+`/session` is handled by the window, not the core, and so it means what that window can do: the terminal re-dials the core on the new name, Discord points the *channel* at it (and remembers that across restarts), and the browser has none, because its sidebar already switches. `/steering` is terminal and browser only.
 
 **Three ways to end a window**, and the difference is how much of the past goes with it. `/clear` forgets the conversation and leaves every archive alone. `/rollover` archives it, has the model write a handoff, and starts the next window holding that summary — this is also what the context threshold triggers automatically. `/new` is the destructive one: it wipes the conversation *and* deletes every transcript and journal this session has written, matched on its session id so no other session's files can be caught. There is no undo, which is why it is `/new` and not `/clear` — the reflexive keystroke is the safe one.
 
@@ -392,7 +393,7 @@ A command's reply goes back **to the client that asked**, never broadcast: a rea
 ./terminalUI.sh --url http://lab-box:8770    # a core on another machine
 ```
 
-`-s/--session` picks the name, `--url` points somewhere other than the address in the config, and `--token` passes the shared secret (or set `CLAW_TOKEN`). A client on the same machine as the core reads the token out of the local `config.yaml` by itself, so you usually need none of these. Tab completes commands, and model names after `/model `.
+`-s/--session` picks the name to start on (`/session <name>` moves to another later), `--url` points somewhere other than the address in the config, and `--token` passes the shared secret (or set `CLAW_TOKEN`). A client on the same machine as the core reads the token out of the local `config.yaml` by itself, so you usually need none of these. Tab completes commands, and model names after `/model `.
 
 **Ctrl-C stops the turn in flight** rather than closing the window — the same as typing `/stop` — and leaves whatever you had half-typed still on the line. At an idle prompt it leaves the way `Ctrl-D` does, core still running. Closing the terminal *window* is the different thing: that drops the connection and the turn goes on without you.
 

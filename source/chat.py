@@ -39,6 +39,11 @@ try:
 except ImportError:
     readline = None
 
+try:
+    import termios
+except ImportError:  # Windows
+    termios = None
+
 import aiohttp
 
 from config import core_url, known_models, load_config
@@ -62,6 +67,7 @@ COMMANDS = {
     "/steering": "send a correction to the turn in progress",
     "/reload": "re-read config.yaml into the running core",
     "/restart": "restart the core process (/restart force cancels running turns)",
+    "/session": "show the sessions, or /session <name> to switch this window",
 }
 
 # What counts as an answer to the rollover question, and nothing else does —
@@ -148,6 +154,20 @@ class Renderer:
         self.prompt_shown = False
         self.pending_ask = None   # an unanswered rollover question's request_id
         self.pending_until = 0.0  # ...and the monotonic deadline it dies at
+
+    def reset_session(self):
+        """Forget what belonged to the session this window just left.
+
+        A turn running there keeps running in the core; this window simply
+        stops drawing it, so its spinner, half-printed stream, busy flags and
+        any unanswered rollover question must not leak into the next session.
+        """
+        self._stop_spinner()
+        self._close_stream()
+        self.in_turn = self.busy = False
+        self.thought = self.thought_base = 0
+        self.pending_ask = None
+        self.pending_until = 0.0
 
     # ---- low-level -------------------------------------------------------
 
@@ -488,33 +508,70 @@ def install_ctrl_c(loop, queue, render):
     return lambda: loop.remove_signal_handler(signal.SIGINT)
 
 
-async def run_client(url, session_name, render, token=""):
-    lines = asyncio.Queue()
-    loop = asyncio.get_running_loop()
+def session_name_problem(name):
+    """Why the core would refuse this session name, or None if it would not.
+
+    The core's own rule, the one the WebUI and Discord's /session check too —
+    checked here so a bad name is refused before the current session is left.
+    """
+    if not name or len(name) > 64 or "/" in name:
+        return "session names are 1–64 characters with no `/`"
+    return None
+
+
+async def dial(http, url, session_name, token, say):
+    """Open the websocket to one session; None (having said why) on failure."""
     query = f"session={quote(session_name)}"
     if token:
         query += f"&token={quote(token)}"
+    try:
+        return await http.ws_connect(f"{url}/ws?{query}", heartbeat=20)
+    except aiohttp.WSServerHandshakeError as e:
+        if e.status == 401:
+            say("❌ The core refused the connection: core.token is set and no\n"
+                "   matching one was offered. Pass it with\n"
+                "     ./terminalUI.sh --token <secret>\n"
+                "   or  CLAW_TOKEN=<secret> ./terminalUI.sh\n"
+                "   (a core on this machine: its token in config.yaml is\n"
+                "   picked up automatically)")
+        else:
+            say(f"❌ The core refused the handshake ({e.status}).")
+    except aiohttp.ClientError as e:
+        say(f"❌ Cannot reach the core at {url} ({e}).")
+        say("   Start it first:  ./serve.sh")
+    return None
+
+
+async def show_sessions(http, url, token, current, render):
+    """Bare /session: where this window is, and what else the core holds."""
+    render.line(f"\n🆔 This window talks to '{current}'.")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        async with http.get(f"{url}/sessions", headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=5)) as r:
+            r.raise_for_status()
+            sessions = (await r.json()).get("sessions") or []
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+        render.line(f"   (could not list the core's sessions: {exc})")
+        sessions = []
+    for s in sorted(sessions, key=lambda s: s.get("name") or ""):
+        mark = "→" if s.get("name") == current else " "
+        busy = " · turn running" if s.get("busy") else ""
+        render.line(f"   {mark} {s.get('name')}  ({s.get('model')}, "
+                    f"{s.get('messages', 0)} messages{busy})")
+    render.line("   /session <name> switches — a new name starts a new session.")
+
+
+async def run_client(url, session_name, render, token=""):
+    lines = asyncio.Queue()
+    loop = asyncio.get_running_loop()
 
     async with aiohttp.ClientSession() as http:
-        try:
-            ws = await http.ws_connect(f"{url}/ws?{query}", heartbeat=20)
-        except aiohttp.WSServerHandshakeError as e:
-            if e.status == 401:
-                print("❌ The core refused the connection: core.token is set and no\n"
-                      "   matching one was offered. Pass it with\n"
-                      "     ./terminalUI.sh --token <secret>\n"
-                      "   or  CLAW_TOKEN=<secret> ./terminalUI.sh\n"
-                      "   (a core on this machine: its token in config.yaml is\n"
-                      "   picked up automatically)")
-            else:
-                print(f"❌ The core refused the handshake ({e.status}).")
-            return 1
-        except aiohttp.ClientError as e:
-            print(f"❌ Cannot reach the core at {url} ({e}).")
-            print("   Start it first:  ./serve.sh")
+        ws = await dial(http, url, session_name, token, print)
+        if ws is None:
             return 1
 
-        async def pump():
+        async def pump(ws, ready):
             """Core → terminal."""
             async for msg in ws:
                 if msg.type is not aiohttp.WSMsgType.TEXT:
@@ -531,7 +588,7 @@ async def run_client(url, session_name, render, token=""):
                                 f"({type(exc).__name__})")
                     continue
                 try:
-                    _dispatch(e, render, ws)
+                    _dispatch(e, render, ready)
                 except Exception as exc:
                     # One unrenderable event must not silently kill the stream —
                     # which is exactly what a bare create_task() would do.
@@ -550,7 +607,7 @@ async def run_client(url, session_name, render, token=""):
                 render.line("\n⚠️  The core closed the connection.")
             await lines.put(None)
 
-        def _dispatch(e, render, ws):
+        def _dispatch(e, render, ready):
                 if e.get("t") == "response":
                     if "info" in e:
                         render.show_info(e)
@@ -613,14 +670,30 @@ async def run_client(url, session_name, render, token=""):
                     if e.get("t") == "hello":
                         ready.set()
 
-        ready = asyncio.Event()
-        pumping = asyncio.create_task(pump())
-        # Don't put a prompt on screen until the greeting has been drawn, or the
-        # first redraw lands on a prompt readline has already printed.
-        try:
-            await asyncio.wait_for(ready.wait(), timeout=10)
-        except asyncio.TimeoutError:
-            render.line("⚠️  the core accepted the socket but sent no greeting")
+        async def attach(ws):
+            """Start rendering a freshly dialled socket; return its pump task."""
+            ready = asyncio.Event()
+            task = asyncio.create_task(pump(ws, ready))
+            # Don't put a prompt on screen until the greeting has been drawn, or
+            # the first redraw lands on a prompt readline has already printed.
+            try:
+                await asyncio.wait_for(ready.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                render.line("⚠️  the core accepted the socket but sent no greeting")
+            return task
+
+        async def detach(ws, task):
+            """Stop rendering a socket and close it. Cancelled first, so the
+            pump's own "core closed the connection" ending — which also ends
+            the input loop — never runs for a close we asked for."""
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            await ws.close()
+
+        pumping = await attach(ws)
         start_reader(loop, lines)
         render.prompt_shown = True
         unarm_ctrl_c = install_ctrl_c(loop, lines, render)
@@ -655,6 +728,31 @@ async def run_client(url, session_name, render, token=""):
 
             if text in ("/quit", "/exit"):
                 break
+            if text == "/session" or text.startswith("/session "):
+                name = text[len("/session"):].strip()
+                if not name:
+                    await show_sessions(http, url, token, session_name, render)
+                    continue
+                if problem := session_name_problem(name):
+                    render.line(f"   ❌ {problem}")
+                    continue
+                if name == session_name:
+                    render.line(f"   already on '{name}'")
+                    continue
+                # Dial before leaving: a refused switch keeps this window
+                # where it was instead of stranding it on no session at all.
+                new_ws = await dial(http, url, name, token, render.line)
+                if new_ws is None:
+                    render.line(f"   still on '{session_name}'")
+                    continue
+                await detach(ws, pumping)
+                # What belonged to the session just left. Its turn, if one is
+                # running, carries on in the core — it just stops being drawn.
+                render.reset_session()
+                render.line(f"\n↪️  Left '{session_name}' — it keeps running in the core.")
+                ws, session_name = new_ws, name
+                pumping = await attach(ws)
+                continue
             if text == "/reasoning":
                 render.show_reasoning = not render.show_reasoning
                 render.line(f"\n🧠 Reasoning display: "
@@ -677,7 +775,6 @@ async def run_client(url, session_name, render, token=""):
                 continue
             await ws.send_json({"t": "submit", "text": text})
 
-        pumping.cancel()
         # Hand Ctrl-C back now that nothing reads the queue: a handler left
         # armed fires into a dead queue, and removing it outright would leave
         # SIGINT at the OS default — a Ctrl-C in the moment before os._exit
@@ -686,8 +783,35 @@ async def run_client(url, session_name, render, token=""):
         if unarm_ctrl_c:
             unarm_ctrl_c()
             signal.signal(signal.SIGINT, signal.default_int_handler)
-        await ws.close()
+        await detach(ws, pumping)
     return 0
+
+
+def save_tty():
+    """Snapshot the terminal settings, or None when stdin is not a tty.
+
+    readline switches echo and line mode off while it waits in `input()` and
+    switches them back on only when `input()` returns. The reader thread is
+    always back inside `input()` by the time we leave, and `os._exit` runs no
+    cleanup — so without this the shell inherits a terminal that no longer
+    echoes what you type (Enter still works). Ctrl-D was the one exit that
+    escaped it, because there the thread returns instead of reading again.
+    """
+    if termios is None:
+        return None
+    try:
+        return termios.tcgetattr(sys.stdin.fileno())
+    except (termios.error, OSError, ValueError):
+        return None
+
+
+def restore_tty(saved):
+    if saved is None:
+        return
+    try:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved)
+    except (termios.error, OSError, ValueError):
+        pass
 
 
 def main():
@@ -714,6 +838,7 @@ def main():
     token = args.token or os.environ.get("CLAW_TOKEN") \
         or str(core_cfg.get("token") or "").strip()
 
+    saved_tty = save_tty()
     install_completer(known_models(config))
     render = Renderer()
 
@@ -741,6 +866,7 @@ def main():
         print("\n\nBye! 👋  (the core keeps running)" if not code
               else "\n\nExiting after an error.")
         sys.stdout.flush()
+        restore_tty(saved_tty)
         # The stdin thread is parked in a blocking tty read and cannot be joined.
         os._exit(code)
 

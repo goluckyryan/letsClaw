@@ -64,7 +64,7 @@ One long-lived core process. Clients are separate processes holding no conversat
 
 ### The command node is a listing, and the listings are many
 
-Two names in that node are not core commands: `/session` maps a *channel* to a session and lives only in the bot, and `/reasoning` is a display toggle local to whichever client drew it. (`/stop` and `/steering` are protocol messages of their own rather than commands, and `/help` is each client's.) All of them are in the diagram because a person types them.
+Two names in that node are not core commands: `/session` lives in the clients — the bot maps a *channel* to a session, the terminal re-dials its one window — and `/reasoning` is a display toggle local to whichever client drew it. (`/stop` and `/steering` are protocol messages of their own rather than commands, and `/help` is each client's.) All of them are in the diagram because a person types them.
 
 **Adding a command means editing every row below, and a word a client lists that the core does not implement is a bug in whichever direction it errs. Several rows carry more than one listing:**
 
