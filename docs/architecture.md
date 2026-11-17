@@ -216,6 +216,8 @@ while True:
     if not result.wants_tool:
         if was_cut_off(result):
             result = await _think_pad(...)       # ← the notepad, below
+            if _pad_out_of_room:                 # pad hit the wall, closed on a
+                answer = note; out_of_room; break    # partial answer → roll, continue
             if result.wants_tool:
                 await run_tools(result); continue
         if self._steering:                       # answer finished as a correction landed
@@ -282,7 +284,7 @@ Two costs a new tool pays silently. Blocking work must go off the event loop ([p
 | `_compact_pad(...)` | replaces the pad with `<checkpoint note> + tail`. Off by default; compaction is lossy |
 | `_forced_conclusion(...)` | the fallback when `resume_mode` resolves to `off` |
 
-**The resume loop is deliberately unbounded** (`_think_pad()`) — no round budget, because a count is not a limit the machine actually has. It exits on: the time deadline, the context wall, a finished answer, a non-`length` stop, or **the no-progress guard** — cut off at the cap having written *nothing* means the pad cannot grow, the wall will never move, and every further round is identical. That guard is the sole replacement for the round counter.
+**The resume loop is deliberately unbounded** (`_think_pad()`) — no round budget, because a count is not a limit the machine actually has. It exits on: the time deadline, the context wall, a finished answer, a non-`length` stop, or **the no-progress guard** — cut off at the cap having written *nothing* means the pad cannot grow, the wall will never move, and every further round is identical. That guard is the sole replacement for the round counter. A pad that reached the context wall at any point closes, in a session with tools, on the partial answer rather than the forced conclusion and sets `_pad_out_of_room`, so the turn rolls over and continues like the gate's out-of-room path ([reasoning.md §4](reasoning.md#4-every-way-thinking-stops)).
 
 **Tools during the pad:** `tools_ok = allow_tools and transport == "chat"`, because only the chat transport parses tool calls. A resume that produces an untruncated tool call returns immediately and the main loop runs it. In the **answer phase** tools are offered once and only once — a resume must not call one, because there is no way to splice a tool result into an unclosed thinking block without forfeiting the pad.
 

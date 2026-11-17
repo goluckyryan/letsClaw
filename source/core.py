@@ -681,6 +681,10 @@ class Session:
         self._continue_turn = False
         # Continuation turns started in a row; reset by any turn a person sent.
         self._continuations = 0
+        # Set by _think_pad when the pad hit the context wall and closed on a
+        # partial answer; read by _turn straight after the call. Reset at the
+        # top of every _think_pad.
+        self._pad_out_of_room = False
         # Whether this session has already said what the server probe found.
         # Once is the point: the findings are about the engine, not the turn,
         # and repeating them every turn is how a warning becomes wallpaper.
@@ -1838,6 +1842,23 @@ class Session:
             last_reasoning = result.reasoning or ""
             return result
 
+        def partial_note(result):
+            """The words of a partial answer, with any tool call said, not run.
+
+            Nothing can run once the turn is out of room: there is no room for
+            its result. A call the model wrote anyway (markup on the raw
+            transport, or a call recovered from the pad) is not executed — it
+            is said, so it is not silently lost, and the continuation turn can
+            make it for real.
+            """
+            note = strip_tool_markup(result.text or "")
+            if result.wants_tool or note != (result.text or "").strip():
+                self.emit(ev("notice", level="info",
+                             text="the partial answer asked for a tool — "
+                                  "not run here; the continuation "
+                                  "turn can run it"))
+            return note
+
         async def run_tools(result):
             """Record one round's tool calls and execute them.
 
@@ -2036,19 +2057,8 @@ class Session:
                                                            result.reasoning,
                                                            allow_tools=False,
                                                            directive=partial)
-                        # Nothing can run here: there is no room for its
-                        # result. A call the model wrote anyway (markup on the
-                        # raw transport, or a call recovered from the pad) is
-                        # not executed — it is said, so it is not silently
-                        # lost, and the continuation turn can make it for real.
-                        note = strip_tool_markup(result.text or "")
-                        if out_of_room and (result.wants_tool
-                                            or note != (result.text or "").strip()):
-                            self.emit(ev("notice", level="info",
-                                         text="the partial answer asked for a tool — "
-                                              "not run here; the continuation "
-                                              "turn can run it"))
-                        full_response = note if out_of_room else result.text
+                        full_response = (partial_note(result) if out_of_room
+                                         else result.text)
                         break
                     # A /steering that landed while the previous tool ran (or before any
                     # round) is drained here, before the model is asked again — the
@@ -2074,6 +2084,13 @@ class Session:
                         if cut_off:
                             result = await self._think_pad(call_round, turn_t0,
                                                            result.reasoning)
+                            if self._pad_out_of_room:
+                                # The thinking filled the window: same ending
+                                # as the gate above — a progress note, then
+                                # rollover and a continuation turn.
+                                out_of_room = True
+                                full_response = partial_note(result)
+                                break
                             if result.wants_tool:
                                 await run_tools(result)
                                 continue
@@ -2103,6 +2120,10 @@ class Session:
                             # pad-disabled contract).
                             result = await self._think_pad(call_round, turn_t0,
                                                            result.reasoning)
+                            if self._pad_out_of_room:
+                                out_of_room = True
+                                full_response = partial_note(result)
+                                break
                             if result.wants_tool:
                                 await run_tools(result)
                                 continue
@@ -2477,7 +2498,19 @@ class Session:
         `directive` replaces the forced-conclusion message on a tool-free
         closing round — the out-of-room path passes the partial-answer one, so
         the pad closes on a progress note rather than a final answer.
+
+        A pad that reached the context wall at any point — it had to be
+        checkpointed, or stopped because it no longer fit — is the same
+        out-of-room condition one level down: the history still had room for a
+        tool round, but not for the thinking the next step needs. With tools on
+        it closes the same way, on the partial-answer directive with no tools
+        offered, and sets `_pad_out_of_room` so _turn ends the turn on that note
+        and rolls over into a continuation turn. Before this, it closed on the
+        forced conclusion: the turn ended as if finished, the window sat under
+        the rollover trip, and the task simply stopped.
         """
+        self._pad_out_of_room = False
+        hit_wall = False
         pad = seed or ""
         lap_cap = self.engine.extra_params.get("max_tokens") or None
         # Thinking must stop early enough that the closing round still fits
@@ -2516,6 +2549,7 @@ class Session:
             # raw on purpose: they size a tail against PAD_TAIL_TOKENS, which
             # is a local target, not the server's budget.
             if self._pad_headroom() - corrected_text(pad) <= 0:
+                hit_wall = True
                 # Negative is "no limit" — see config.py. The loop still cannot
                 # spin: every cycle has to shrink the pad or it breaks below.
                 if (self.engine.max_pad_compactions >= 0
@@ -2623,6 +2657,17 @@ class Session:
         # There the directive from base.md rides along instead (without joining
         # the conversation) to ask for words rather than an action.
         tools = self.schemas if (self.schemas and tools_ok) else None
+        room_out = hit_wall and bool(self.schemas)
+        if room_out:
+            # Out of room to think is out of room to work: no tools, and a
+            # progress note rather than a conclusion. See the docstring.
+            tools = None
+            if directive is None:     # the gate's own path already said so
+                conclude = [{"role": "user",
+                             "content": self.manager.partial_directive}]
+                self.emit(ev("notice", level="warn",
+                             text="thinking filled the window — asking for a "
+                                  "partial answer, then rolling over to continue"))
         self.emit(ev("notice", level="info",
                      text=f"closing thinking (~{count_text(pad)} tok) and writing the "
                           f"answer under {answer_cap or 'the model default'} tok"
@@ -2631,6 +2676,15 @@ class Session:
             overrides={"max_tokens": answer_cap}, pad=pad, closing=True,
             tools=tools,
             extra_messages=None if tools else conclude)
+        if room_out:
+            # Handed back whole, tool calls included: the caller says them
+            # rather than runs them (see partial_note in _turn).
+            self._pad_out_of_room = True
+            if not strip_tool_markup(result.text):
+                self.emit(ev("notice", level="warn",
+                             text="the partial answer came back empty — the "
+                                  "continuation turn starts from the handoff alone"))
+            return result
         if result.wants_tool and not truncated_tool_calls(result):
             self.emit(ev("notice", level="info",
                          text="the conclusion is an action — running it and "

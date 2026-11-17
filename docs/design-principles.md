@@ -54,7 +54,7 @@ Three sections of `models/base.md` are not prompt text at all — they are templ
 |---|---|---|
 | `## Checkpoint` | `extract_checkpoint_directive()` | a full notepad is about to be compacted |
 | `## Forced conclusion` | `extract_conclude_directive()` | the server cannot resume a cut-off thought |
-| `## Partial answer` | `extract_partial_directive()` | a turn has no room left for another tool round and is about to roll over and continue |
+| `## Partial answer` | `extract_partial_directive()` | a turn has no room left for another tool round, or its thinking pad filled the window, and is about to roll over and continue |
 
 So the wording of the machinery is tunable without touching code. That is the principle: **anything that is really a prompt should live in a file the user can edit and `/reload`, not in the source.**
 
@@ -231,7 +231,7 @@ Nothing rolls over while a turn is in flight. `roll_over()` has exactly three ca
 | call site | when | gated on |
 |---|---|---|
 | `_headroom_check()` | **before** a turn starts | `rollover_before_think`, `mode == auto`, `rollover_pct`, `rollover_blocked` |
-| `_after_turn()` | after the tool loop has fully drained | the trip point, and `rollover_mode` via `_maybe_roll()` — except a turn that ran out of room for tools, which rolls regardless and is gated only on `rollover_blocked` |
+| `_after_turn()` | after the tool loop has fully drained | the trip point, and `rollover_mode` via `_maybe_roll()` — except a turn that ran out of room for tools (the round gate, or a pad that hit the wall), which rolls regardless and is gated only on `rollover_blocked` |
 | `command()` — `/rollover` | when a person asks | **`self.busy` only** |
 
 A turn that runs out of room for tools does not break this rule — it is how the rule is kept. The turn ends on a progress note, `_after_turn()` rolls over at the boundary like any other, and `run_turn()` then starts a *new* turn (the continuation, `origin: "continuation"`) under the same lock. The work spans a rollover; no turn does. See [reasoning.md](reasoning.md) on `_min_tool_round_room()`.
