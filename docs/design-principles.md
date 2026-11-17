@@ -14,7 +14,7 @@ Four words below are used as if they were defined, and three of them name differ
 |---|---|---|
 | `history` | the message list sent to the model each round — **this is the context** | memory; `history[0]` is the system message |
 | transcript | the message list archived at rollover | `state/sessions/*.json` |
-| journal | reasoning, every tool call, every **full** tool result, written as the turn runs | `state/sessions/*.md` |
+| journal | reasoning, every tool call, every **full** tool result, written as the turn runs; and what the WebUI's voice said | `state/sessions/*.md` |
 | live file | the session, so a restart does not lose it | `state/live/*.json` |
 
 **`history` is not a disk record.** It is the prompt. Shrinking it costs the model what it can see, not what was kept — principle 7 is about the journal, which is why reasoning can be absent from one and complete in the other.

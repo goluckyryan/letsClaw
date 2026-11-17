@@ -13,10 +13,10 @@ Two rules set the shape of everything below:
 |---|---|
 | `source/voice.py` | the `voice:` config section, read and floored on every request (`settings`); whether the core can speak and why not (`status`, `info`); piper synthesis (`synthesize`); the cap on a script's length (`cap_script`) |
 | `source/session.py` | `build_spoken_script` and its prompt `_SPOKEN_SYSTEM`, beside `build_turn_digest` |
-| `source/server.py` | `POST /speak` (`speak`) and `POST /narrate` (`narrate`, engine choice in `_narrate_engine`) |
-| `source/core.py` | the `voice` field of `/info` |
+| `source/server.py` | `POST /speak` (`speak`), `POST /narrate` (`narrate`, engine choice in `_narrate_engine`), `POST /sessions/{name}/spoken` (`spoken`) |
+| `source/core.py` | the `voice` field of `/info`; `Session.record_spoken`, the journal block |
 | `web/app.js`, section `voice: text` | `cleanForSpeech`, `spokenChunks`, `wantsNarration` — pure functions, no DOM |
-| `web/app.js`, section `voice: playback` | the switch, the button, the queue, `stopSpeech` |
+| `web/app.js`, section `voice: playback` | the switch, the button, the queue, `stopSpeech`, `showSpoken`, `recordSpoken` |
 | `web/index.html` | `#btn-voice`, beside `#btn-digest` |
 | `config.example.yaml` | every `voice.*` key, commented |
 | `voices/` | the piper voice file (gitignored) |
@@ -38,14 +38,42 @@ Two rules set the shape of everything below:
 5. **Chunk it.** `spokenChunks` splits the text into parts of at most `max_chars` (400): at the last sentence end that fits, else the last clause boundary, else the last space; a single token longer than the cap is cut rather than dropped. At most `max_chunks` (8) parts are kept, and the page says "spoke 8 of 23 parts" when it stopped short. Chunking runs on the script, after the rewrite, so the presenter always sees the whole answer.
 6. **`POST /speak`** once per part. The first is awaited; each next part is fetched while the current one plays, so playback never waits on the network at a seam.
 7. **Play** through one `<audio>` element, one object URL at a time, each revoked before the next replaces it.
+8. **Show what was said.** `showSpoken` puts a folded line directly under the answer — `🔊 what was spoken — rewritten for speech` or `— read as written`, plus `· 8 of 23 parts` when the cap cut it short — holding exactly the parts sent to `/speak`. It goes after the answer's own element, not at the end of the log, because the rewrite can come back after the next question has been asked.
+9. **Journal it.** `recordSpoken` posts the same text, the turn number from `turn_start` and whether it was rewritten to `POST /sessions/<name>/spoken`, and the core writes it into the session's journal. Fire and forget: a missing record never costs the answer its audio. See the next section.
 
 If both the rewrite and the cleaner produce nothing, the page shows `🔇 nothing to read` and sends no request.
+
+## The spoken text: journaled like reasoning, never in history
+
+What the voice said is recorded the way the model's reasoning is — in the session's journal, and nowhere the model is sent. `Session.record_spoken` writes one block per spoken answer, under the turn it belongs to, with a header that marks it as spoken text:
+
+```
+## turn 12 spoken (rewritten for speech)  [16:04:31]
+
+The table above compares load times for the two quantisations …
+```
+
+or `spoken (read as written)` when no rewrite was used. `grep -n 'spoken (' <journal>` lists every one. The text is what was handed to the voice — what the folded line shows — so an answer stopped half-way still records the whole text it was given. The block lands when the voice starts, after the turn has ended and possibly after the next turn's first blocks; the turn number in the header ties it to its answer. With `conversation.journal: false` nothing is recorded, as with reasoning.
+
+It never reaches the model:
+
+- **Not in history, so never in the next turn.** Neither `/narrate` nor `/spoken` writes to history. `build_spoken_script` sends its own two-message list (the rewrite prompt and the answer); the session is consulted only for its engine. The next turn's prompt is exactly what it would be with voice off: the question and the answer as shown.
+- **Not in a digest.** The digest is built from the session's history, which the spoken text never enters.
+- **Not brought back by `/digest expand`.** Expand reads a turn back out of the journal, but `_reconstruct_turn` rebuilds only `user`, `steering`, `round N text / tool_call / tool_result` and `fallback text` blocks and passes over every other kind — reasoning and spoken text alike.
+- **Not in the transcript, the live store or a handoff.** Those are built from history.
+- **Not in the log.** `/narrate` logs only a failure's error, never the script.
+
+The journal is a file the model *can* read through `exec` and `grep`, as it can read its own reasoning there; nothing puts the spoken text in front of it, but nothing hides the file either.
+
+The folded line in the page is DOM, not storage: a reload or a session switch drops it, because the replay draws history. The journal is where the text stays.
+
+What a rewrite *can* affect is speed. It is one more request on the session's model server, and on a single-slot llama.cpp server it can evict the conversation's cached prompt, so the next turn re-reads the prompt and starts slower — the digest has the same cost. SGLang shares prefixes and is unaffected.
 
 ## The core's two routes
 
 Two routes rather than one, because they fail in opposite ways and the page has to survive each separately. `/narrate` is a model call: it can take seconds, time out, or come back wrong. `/speak` is pure CPU and has to stay fast. Folded together, a stalled model would hold a synthesis worker, and a route that needs only piper would also need a live inference server.
 
-Both take `_guard` (token and same-origin): neither changes state, but each costs the core real work, so a cross-origin page must not be able to trigger it. Full status codes are in [protocol.md](protocol.md).
+Both take `_guard` (token and same-origin): neither changes state, but each costs the core real work, so a cross-origin page must not be able to trigger it. A third, `POST /sessions/<name>/spoken {turn, text, rewritten}`, writes the journal block described above; it takes `_guard` too, refuses a session that does not exist (404, and creates none), a turn the session has not had, and text longer than `max_chunks × max_chars`, and answers `{ok, recorded}` with `recorded` false when the journal is off. Full status codes are in [protocol.md](protocol.md).
 
 **`POST /speak {text}` → `audio/wav`.** Empty text is a 400. Text over `voice.max_chars` is a 400 and is **not** cut: the page is the only client and it chunks to that cap, so a longer request is a bug, and a silent cut would drop words without anyone noticing. Synthesis runs in `asyncio.to_thread`, so a turn never waits on someone's browser. A voice that is off, a missing piper or a missing voice file is a 503 whose reason names the fix.
 

@@ -772,12 +772,16 @@ main::after {
 /* The turn digest: the handoff's little sibling, and drawn like one. Dim and
    folded shut by default, because one of these lands at the end of every turn
    — see the digest_done case in app.js. */
-.digest summary {
+.digest summary,
+.spoken summary {
   cursor: pointer;
   color: var(--dim);
   font: 12px var(--sans);
 }
-.digest pre {
+/* The voice's script, under the answer it was spoken for — folded like the
+   digest, and for the same reason: one per spoken answer. */
+.digest pre,
+.spoken-text {
   margin: 6px 0 0;
   padding: 6px 10px;
   background: var(--bg3);
@@ -787,6 +791,7 @@ main::after {
   overflow-wrap: anywhere;
   color: var(--fg);
 }
+.spoken-text { font: 13px/1.5 var(--sans); }   /* prose, not a record */
 
 .sep {
   margin: 18px auto;

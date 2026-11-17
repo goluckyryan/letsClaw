@@ -1261,6 +1261,28 @@ class Session:
                                           self.model_name, self.config)
         await self._journal.write(header, body)
 
+    async def record_spoken(self, turn, text, rewritten):
+        """Journal what the WebUI's voice said for a turn. Returns whether it
+        was written.
+
+        Recorded the way reasoning is: in the journal and nowhere else. The
+        header `## turn N spoken (...)` marks it as spoken text, so a grep
+        tells it apart from the answer. It is never appended to history, so
+        the next turn's prompt and the digest (built from history) never see
+        it; and `_reconstruct_turn`, which reads the journal back for
+        `/digest expand`, rebuilds only user, steering, round and fallback
+        blocks and passes over every other kind, this one included.
+
+        The block lands when the voice starts, which is after the turn ended —
+        possibly after the next turn's first blocks. The turn number in the
+        header is what ties it to its answer, and `_read_turn_blocks` matches
+        on that, not on position.
+        """
+        how = "rewritten for speech" if rewritten else "read as written"
+        before = self.journal_blocks()
+        await self.jot(f"turn {turn} spoken ({how})", text)
+        return self.journal_blocks() > before
+
     def journal_ok(self):
         """Whether the journal is actually recording this session right now.
 

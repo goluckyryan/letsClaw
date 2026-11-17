@@ -1500,6 +1500,7 @@ function handle(e) {
     // another tab, by Discord or by the terminal is drawn here and spoken
     // nowhere, which needs no cross-tab protocol.
     S.turn.asked = S.weAsked;
+    S.turn.id = e.turn_id;         // the spoken text is journaled against it
     think = newThink();
     setBusy(true);
     // Asking is the intent to follow, whatever the view was doing: re-assert
@@ -1621,7 +1622,7 @@ function handle(e) {
     // The answer is the last round's text — the element a tool call closes
     // and the next round reopens — read as the raw markdown, never the HTML.
     if (S.turn && S.turn.asked && S.voice && voiceUsable() && S.turn.textEl) {
-      speakAnswer(S.turn.textEl._raw || '');
+      speakAnswer(S.turn.textEl._raw || '', S.turn.textEl.closest('.msg'), S.turn.id);
     }
     S.turn = null;
     setBusy(false);
@@ -2507,10 +2508,51 @@ async function playQueue(sp) {
   return true;
 }
 
+/* What was spoken, folded shut under the answer it belongs to.
+
+   This tab's only: built from the text the queue was given. The same text is
+   journaled on the core (recordSpoken), but never put in history, so a
+   reload or a session switch drops this line — the replay draws history. Placed after the answer's own element rather than at the end of the
+   log: the rewrite can come back after the next question has been asked. */
+function showSpoken(answerMsg, chunks, rewritten) {
+  const outer = node('slab spoken');
+  outer.appendChild(tsEl(null));
+  const sp = document.createElement('div');
+  sp.className = 'ts-spacer';
+  outer.appendChild(sp);
+  const how = rewritten ? 'rewritten for speech' : 'read as written';
+  const parts = chunks.total > chunks.length ? ` · ${num(chunks.length)} of ${num(chunks.total)} parts` : '';
+  outer.appendChild(node('slab-box',
+    `<details><summary>🔊 what was spoken — ${how}${parts}</summary>` +
+    `<div class="spoken-text">${esc(chunks.join(' '))}</div></details>`));
+  if (answerMsg && answerMsg.isConnected) {
+    answerMsg.after(outer);
+    if (follow) toBottom();
+  } else {
+    append(outer);
+  }
+}
+
+/* Journal what the voice is about to say, as `## turn N spoken (...)` — on
+   the core, beside the turn's reasoning, and like it never in history: the
+   next turn and the digest do not see it. Not tied to the answer's
+   AbortController, because a stop cuts the audio, not the record of what the
+   voice was given. Fire and forget: a missing record (an older core, the
+   journal switched off, a refused request) must not cost the answer its
+   audio, and the folded line above already shows the text in this tab. */
+function recordSpoken(turnId, text, rewritten) {
+  if (!Number.isInteger(turnId) || turnId < 1 || !text) return;
+  fetch(`/sessions/${encodeURIComponent(S.session)}/spoken`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ turn: turnId, text, rewritten }),
+  }).catch(() => {});
+}
+
 /* Speak the answer a turn of ours just finished. Cleans it, asks for a
    rewrite when the answer has something that cannot be read aloud, chunks the
    result, and plays it. Whatever was playing stops first. */
-async function speakAnswer(raw) {
+async function speakAnswer(raw, answerMsg, turnId) {
   stopSpeech(true);
   const info = S.voiceInfo || {};
   const cleaned = cleanForSpeech(raw);
@@ -2519,13 +2561,17 @@ async function speakAnswer(raw) {
   const sp = S.speech = { ctl: new AbortController(), queue: [], url: null, done: null };
   paintVoice();
   let text = cleaned;
+  let rewritten = false;
   if (present) {
     const script = await narrateAnswer(raw, sp);
     if (S.speech !== sp) return;               // stopped while the rewrite was out
-    if (script) text = cleanForSpeech(script) || cleaned;
+    const said = script && cleanForSpeech(script);
+    if (said) { text = said; rewritten = true; }
   }
   const chunks = spokenChunks(text, info.max_chars, info.max_chunks);
   if (!chunks.length) { endSpeech(sp); return notice('🔇 nothing to read'); }
+  showSpoken(answerMsg, chunks, rewritten);
+  recordSpoken(turnId, chunks.join(' '), rewritten);
   sp.queue.push(...chunks);
   const finished = await playQueue(sp);
   if (finished && S.speech === sp && chunks.total > chunks.length) {

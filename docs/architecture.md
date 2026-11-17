@@ -84,9 +84,9 @@ Two names in that node are not core commands: `/session` lives in the clients �
 
 | file | lines | owns |
 |---|---|---|
-| `source/core.py` | 4501 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
+| `source/core.py` | 4523 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
 | `source/session.py` | 891 | **the disk layer.** Live store, archives, the journal, the handoff summariser, the id registry |
-| `source/server.py` | 1333 | **the transport.** aiohttp routes, the WebSocket handler, the Host and Origin guards, auth, backpressure |
+| `source/server.py` | 1368 | **the transport.** aiohttp routes, the WebSocket handler, the Host and Origin guards, auth, backpressure |
 | `source/llm_engine.py` | 1170 | **the model.** Two transports (`chat` and `raw`), streaming, tool-call parsing, resume |
 | `source/config.py` | 602 | **config.yaml → engines.** Loading, the webui presentation keys, number coercion, `build_all_engines` (which doubles as the validator), and the reload diff. Touches no `Session`, which is why it is not in `core`. `build_engine()` passes the constructor the transport and the generation options it forwards (`base_url`, `api_key`, `provider_name`, `timeout`, `temperature`, `max_tokens`, `top_p`), then assigns the eight **policy** attributes onto the instance: `context_length`, `max_output`, `turn_timeout`, `reasoning`, `answer_time_reserve`, `max_pad_compactions`, `resume_mode`, `reasoning_effort`. The split is deliberate and easy to get wrong: `LLMEngine.__init__` takes `**kwargs` straight into `extra_params`, which `get_model_params()` forwards to `chat.completions.create()`, so a policy key handed to the constructor is sent to the server as a generation option instead of configuring the session — and is silently accepted. That is where a ninth belongs. Grepping `llm_engine.py` for `max_pad_compactions` finds nothing, because the name is only ever assigned from outside |
 | `source/behavior.py` | 359 | **the behavior layers.** `BehaviorStore`, the read-through cache behind a lock, and the three directives extracted out of `base.md` |
@@ -103,7 +103,7 @@ Two names in that node are not core commands: `/session` lives in the clients �
 | `source/ui.py` | 86 | the terminal client's spinner and TTFT line |
 | `source/discord_client.py` | 2617 | the Discord client |
 | `source/discord_probe.py` | 49 | **"should the bot be started?", answered once.** `serve.sh` and `install.sh` both run it and read the verdict off the exit code, because the answer depends on the config, the token and the core's URL and one copy of that logic cannot disagree with itself |
-| `web/` | 3347 (`app.js`) | the browser client (`index.html`, `app.js`, `style.css`) — vanilla JS, no build step |
+| `web/` | 3393 (`app.js`) | the browser client (`index.html`, `app.js`, `style.css`) — vanilla JS, no build step |
 
 These are `wc -l`, not estimates. The column is only worth having while it is exact: a `~` in front of every figure lets it be wrong by a third without failing anything, so if you would rather not maintain it, drop the column rather than soften the numbers again.
 
@@ -513,7 +513,7 @@ A live session file written before ids existed has none; it is assigned one at t
 
 ### The journal
 
-An append-only Markdown record of one session *segment*. It exists because the JSON archive is structurally missing two irrecoverable things: **the model's reasoning** and **untruncated tool output**.
+An append-only Markdown record of one session *segment*. It exists because the JSON archive is structurally missing two irrecoverable things: **the model's reasoning** and **untruncated tool output**. It also holds what the WebUI's voice said, as `## turn N spoken (...)` blocks (`Session.record_spoken`), for the same reason reasoning is here: it is a record of the turn that must never become part of the prompt. `/digest expand` passes those blocks over — [voice.md](voice.md).
 
 Markdown and not JSON because `read_file` has no offset and truncates at 8000 chars — a 400 KB JSON archive is unreachable to the model, while a one-header-per-line file is reachable at any size via `grep`/`sed`. The header convention (`## turn 12 round 3 tool_call exec call_a1b2  [16:04:11]`) makes `grep -n '^## turn'` a table of contents.
 

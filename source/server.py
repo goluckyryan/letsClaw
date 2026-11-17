@@ -9,7 +9,7 @@ Start this first; the terminal, a WebUI and a Discord bot are all just clients:
 HTTP:  GET /health  GET /models  GET /sessions  DELETE /sessions/<name>
        GET /sessions/<name>/history  POST /sessions/<name>/rename
        GET /files  GET /files/<name>  DELETE /files/<name>
-       POST /speak  POST /narrate   (the WebUI's voice; see voice.py)
+       POST /speak  POST /narrate  POST /sessions/<name>/spoken   (the WebUI's voice)
 WS:    /ws?session=<name>&last_seq=<n>
 
 The reader never runs a turn inline — turns are tasks, so the socket stays
@@ -547,6 +547,40 @@ async def narrate(request):
     if not script:
         return _voice_refused(503, "the rewrite came back empty")
     return web.json_response({"ok": True, "script": script})
+
+
+async def spoken(request):
+    """POST /sessions/{name}/spoken {turn, text, rewritten} -> {ok, recorded}.
+
+    The WebUI reports what its voice said for one of the session's turns, and
+    the core writes it to the journal as `## turn N spoken (...)` — recorded
+    like reasoning, never added to history, so it cannot reach the next turn
+    or the digest. `recorded` is false when journalling is off.
+
+    `mgr.sessions.get`, never `mgr.get()`: recording speech for a session
+    that does not exist must not create one. The text is bounded by the same
+    figure that bounds a script, max_chunks × max_chars, because the page
+    never speaks more than that.
+    """
+    _guard(request)
+    body = await _json_body(request)
+    if not isinstance(body, dict):
+        return _voice_refused(400, "body must be {turn, text, rewritten}")
+    sess = request.app["mgr"].sessions.get(request.match_info["name"])
+    if sess is None:
+        return _voice_refused(404, "no such session")
+    turn = body.get("turn")
+    if isinstance(turn, bool) or not isinstance(turn, int) or not 1 <= turn <= sess.turn_id:
+        return _voice_refused(400, f"turn must be a turn this session has had (1..{sess.turn_id})")
+    text = _voice_text(body)
+    if text is None:
+        return _voice_refused(400, "nothing to record — text is empty")
+    s = voice.settings(request.app["config"])
+    if len(text) > s["max_chunks"] * s["max_chars"]:
+        return _voice_refused(400, "text is longer than the voice ever speaks "
+                                   "(voice.max_chunks × voice.max_chars)")
+    recorded = await sess.record_spoken(turn, text, bool(body.get("rewritten")))
+    return web.json_response({"ok": True, "recorded": recorded})
 
 
 async def index(request):
@@ -1151,6 +1185,7 @@ def build_app(config, config_path=None, bind=None):
         web.get("/theme.css", theme),
         web.post("/speak", speak),
         web.post("/narrate", narrate),
+        web.post("/sessions/{name}/spoken", spoken),
         # Adjacent on purpose: registered apart, aiohttp builds a second
         # resource for the same pattern rather than adding the method to the
         # first. It resolves either way, but one resource is what a reader of

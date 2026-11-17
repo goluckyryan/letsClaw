@@ -308,6 +308,8 @@ conversation:
   # round's reasoning, every tool call and every tool result in FULL — none of
   # which the JSON transcript beside it can carry (reasoning never enters
   # history, and tool output is clipped to max_output_chars before it does).
+  # What the WebUI's voice said is recorded here too, as `## turn N spoken`,
+  # and like reasoning it never enters history.
   # It lands in sessions_dir as <id>_<name>_<timestamp>.md, is closed by a
   # rollover, and the new window is told to grep it before repeating an
   # investigation. This is what stops the model re-deriving what it already
