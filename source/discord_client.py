@@ -104,6 +104,18 @@ READY_TIMEOUT_S = 10
 # the same endpoint could differ without anyone deciding that they should.
 CORE_INTERACTIVE_S = 5
 CORE_BOOKKEEPING_S = 10
+# How long the startup session-rename check keeps knocking while nothing is
+# listening on the core's port. serve.sh starts the bot 2 s after the core,
+# but the core binds only once it has restored every session, and at boot that
+# took 15 s (it waits on its ssh forwards). Asking once, at 2 s, found the
+# port closed and skipped the check for the whole life of the process.
+CORE_STARTUP_WAIT_S = 120
+# Logging in to Discord when the network is not there yet: the first wait, and
+# the cap the doubling stops at. At boot the bot can start before DNS works;
+# giving up then left the core running with no bot for four days, because
+# serve.sh only exits — and systemd only restarts it — when the core does.
+LOGIN_RETRY_FIRST_S = 5
+LOGIN_RETRY_MAX_S = 300
 # How long the link waits, once the socket is done, for the queued tail of an
 # answer to finish posting. Long enough for a handful of Discord sends at a
 # second each; short enough that a wedged handler cannot hold up a reconnect.
@@ -1794,7 +1806,7 @@ class LetsClawBot(discord.Client):
                 if self.settings.core_token else {})
 
     async def _core_json(self, path, *, what, timeout=CORE_INTERACTIVE_S,
-                         log=None):
+                         log=None, wait_s=0):
         """GET `path` from the core; the JSON object it answered with, or None.
 
         Four read paths used to spell this request out in full, and what they
@@ -1811,16 +1823,35 @@ class LetsClawBot(discord.Client):
         before this helper existed. `log` defaults to debug because three of
         the four callers are conveniences whose failure the user never needs to
         hear about; the one that is not passes `logger.warning`.
+
+        `wait_s` is for a caller that may run before the core is up: while the
+        connection is refused (nothing listening yet) it asks again, backing
+        off, for up to that many seconds. Only a refused connection is retried
+        — a timeout or a bad answer means the core is there and said something,
+        and asking again would not change it.
         """
         log = log or logger.debug
-        try:
-            async with self._core_http.get(
-                    self._core_url() + path, headers=self._auth(),
-                    timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-                body = await r.json()
-        except Exception as e:
-            log("could not %s: %s", what, e)
-            return None
+        deadline = time.monotonic() + wait_s
+        pause = 1
+        while True:
+            try:
+                async with self._core_http.get(
+                        self._core_url() + path, headers=self._auth(),
+                        timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                    body = await r.json()
+                break
+            except aiohttp.ClientConnectorError as e:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    log("could not %s: %s", what, e)
+                    return None
+                logger.debug("core not listening yet (%s); asking again in %d s",
+                             e, min(pause, left))
+                await asyncio.sleep(min(pause, left))
+                pause = min(pause * 2, 10)
+            except Exception as e:
+                log("could not %s: %s", what, e)
+                return None
         if not isinstance(body, dict):
             # Logged rather than passed on: every caller is about to call .get
             # on this, and a list would have raised there before this helper
@@ -1903,7 +1934,8 @@ class LetsClawBot(discord.Client):
         # A warning rather than debug for the same reason — nothing else tells
         # anyone the startup migration did not run.
         body = await self._core_json("/sessions", what="list sessions to rename them",
-                                     timeout=CORE_BOOKKEEPING_S, log=logger.warning)
+                                     timeout=CORE_BOOKKEEPING_S, log=logger.warning,
+                                     wait_s=CORE_STARTUP_WAIT_S)
         if body is None:
             return
         existing = {s.get("name") for s in body.get("sessions") or []}
@@ -2527,26 +2559,56 @@ def main():
         print(f"❌ {e}")
         return 1
 
-    bot = LetsClawBot(settings)
-    try:
-        bot.run(settings.token, log_handler=None)
-    except discord.LoginFailure:
-        print("❌ Discord rejected the token in discord.token.")
-        return 1
-    except discord.PrivilegedIntentsRequired:
-        print("❌ The Message Content Intent is off, so every message would "
-              "arrive empty.\n"
-              "   Developer portal → your app → Bot → Privileged Gateway "
-              "Intents → Message Content Intent.")
-        return 1
-    except (aiohttp.ClientError, discord.GatewayNotFound, OSError) as e:
-        # The lab core often sits on a network with no route out; saying so
-        # beats forty lines of aiohttp traceback.
-        print(f"❌ Could not reach Discord ({type(e).__name__}: {e}).\n"
-              "   Check the network, and https_proxy if this host needs one.")
-        return 1
-    except KeyboardInterrupt:
-        pass
+    # Once connected, discord.py reconnects by itself; what it does not retry
+    # is the login before that — so a bot started ahead of the network (at
+    # boot, before DNS) used to print one line and exit for good. Now an
+    # unreachable Discord is waited out. A wrong token or a missing intent
+    # still stops it: retrying cannot fix either.
+    #
+    # A fresh client each attempt: a discord.Client that has been through
+    # run() is closed, and its HTTP session with it.
+    pause = LOGIN_RETRY_FIRST_S
+    hinted = False
+    while True:
+        bot = LetsClawBot(settings)
+        started = time.monotonic()
+        try:
+            bot.run(settings.token, log_handler=None)
+        except discord.LoginFailure:
+            print("❌ Discord rejected the token in discord.token.")
+            return 1
+        except discord.PrivilegedIntentsRequired:
+            print("❌ The Message Content Intent is off, so every message would "
+                  "arrive empty.\n"
+                  "   Developer portal → your app → Bot → Privileged Gateway "
+                  "Intents → Message Content Intent.")
+            return 1
+        except (aiohttp.ClientError, discord.GatewayNotFound,
+                discord.DiscordServerError, OSError) as e:
+            # A run that stayed up a while was a working bot that lost its
+            # network later, not the same outage still going: start the
+            # backoff over rather than keep it at the cap.
+            if time.monotonic() - started > LOGIN_RETRY_MAX_S:
+                pause = LOGIN_RETRY_FIRST_S
+            # The lab core often sits on a network with no route out; saying
+            # so beats forty lines of aiohttp traceback.
+            logger.warning("could not reach Discord (%s: %s); retrying in %d s",
+                           type(e).__name__, e, pause)
+            print(f"⚠️  Could not reach Discord ({type(e).__name__}: {e}) — "
+                  f"retrying in {pause} s.")
+            if not hinted:
+                print("   Check the network, and https_proxy if this host needs one.")
+                hinted = True
+            sys.stdout.flush()
+            try:
+                time.sleep(pause)
+            except KeyboardInterrupt:
+                break
+            pause = min(pause * 2, LOGIN_RETRY_MAX_S)
+            continue
+        except KeyboardInterrupt:
+            pass
+        break
     print("\nBye! 👋  (the core keeps running)")
     return 0
 
