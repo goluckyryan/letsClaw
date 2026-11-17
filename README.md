@@ -49,6 +49,7 @@ A stripped-down agent: a long-lived **core service** holding the conversations, 
 - **Agent tools** — `exec` / `read` / `write` / `list`, allowlisted, with a timeout, an output cap, and a workdir they resolve against.
 - **Control of a turn in flight** — `/stop` interrupts it; `/steering` feeds it a correction without throwing away the work already done.
 - **Operable without a shell on the core's host** — `/reload` re-reads `config.yaml` into the running core, and `/restart` covers the few keys reload cannot reach.
+- **Spoken answers** — the WebUI can read its answers aloud through the speakers of the machine the browser is on, synthesized locally by piper on the core, so nothing is sent to a cloud voice. An answer with tables, code or formulas is first turned into a short spoken script, the screen keeps the full answer, one click or Escape stops it mid-sentence, and what was said is journaled beside the reasoning without ever entering the conversation. Optional — see [WebUI](#webui).
 - **Work it does in batches** — several independent file reads go out in one message and run together, so a task that needs five lookups costs five tool calls and not five trips to the model.
 
 ## Quick Start
@@ -60,6 +61,8 @@ cd ~/letsClaw
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt   # core: openai, PyYAML, aiohttp, tiktoken
                                             # + optional discord.py (only for the bot)
+                                            # + optional piper-tts (only for the
+                                            #   WebUI's voice; pulls in onnxruntime)
 
 cp config.example.yaml config.yaml          # then edit it: your model server's
                                             # base_url, and which model to start on
@@ -69,6 +72,16 @@ cp config.example.yaml config.yaml          # then edit it: your model server's
 
 ./serve.sh                               # 1. the core — start this first, leave it running
 ./terminalUI.sh                          # 2. the terminal client, in another shell
+```
+
+For the WebUI's voice, piper also needs a voice file, which is not a pip package. Skip this and everything else works; the voice button just says what is missing. The full setup, a check, and troubleshooting are in [`docs/voice.md`](docs/voice.md#setting-it-up):
+
+```bash
+cd voices    # gitignored; about 61 MB
+for f in en_US-lessac-medium.onnx en_US-lessac-medium.onnx.json; do
+  curl -LO "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/$f"
+done
+cd ..
 ```
 
 …or open <http://127.0.0.1:8770/> for the same thing in a browser. The WebUI is served by the core itself — no build step, no `npm install`, no CDN, so it works on a machine with no route to the internet.
@@ -408,7 +421,7 @@ This is the least robust of the three windows, deliberately: it does not reconne
 
 - **A session sidebar.** The list is rebuilt from the core every few seconds, so a session someone started in another window shows up here too. `+` creates one, `✎` renames one in place — same conversation, and anyone attached follows it — and `✕` discards the conversation *and every file it wrote*, asking first and saying how much is about to go.
 - **Foldable thinking.** `🧠 think` has three states — off, folded, open — and each block can be opened on its own. A folded block still shows what it cost.
-- **Voice.** `🔇 voice` speaks the answers you ask in this tab, through the speakers of the machine the browser is on. Typing the question is enough to let the page play sound; no click is needed. An answer with a table, code or a formula is first rewritten by the model into a short spoken script that says "the table above compares…" instead of reading cells aloud, and the screen keeps the full answer. While it speaks, the button reads `⏹`: click it, press Escape, or type `/voice stop` to cut the answer off. Only the tab that asked speaks, so two tabs on one session never talk over each other. A folded `🔊 what was spoken` line under the answer shows exactly what the voice said, and the same text is written to the session's journal as `## turn N spoken (...)` — recorded like the reasoning, and like it never part of the conversation, so the next turn and the digest never see it. It needs `piper-tts` and a voice file on the core (see `requirements.txt`); without them the button is greyed out and says what to install. To hear it on another machine, point that machine's browser at the core, which for anything but loopback means setting `core.bind` *and* `core.token` — read [Security](#security) first.
+- **Voice.** `🔇 voice` speaks the answers you ask in this tab, through the speakers of the machine the browser is on. Typing the question is enough to let the page play sound; no click is needed. An answer with a table, code or a formula is first rewritten by the model into a short spoken script that says "the table above compares…" instead of reading cells aloud, and the screen keeps the full answer. While it speaks, the button reads `⏹`: click it, press Escape, or type `/voice stop` to cut the answer off. Only the tab that asked speaks, so two tabs on one session never talk over each other. A folded `🔊 what was spoken` line under the answer shows exactly what the voice said, and the same text is written to the session's journal as `## turn N spoken (...)` — recorded like the reasoning, and like it never part of the conversation, so the next turn and the digest never see it. It needs `piper-tts` and a voice file on the core; without them the button is greyed out and says what to install. **Setting it up, checking it, and what to do when it stays silent: [`docs/voice.md`](docs/voice.md#setting-it-up).** To hear it on another machine, point that machine's browser at the core, which for anything but loopback means setting `core.bind` *and* `core.token` — read [Security](#security) first.
 - **Two panels:** ⚙️ **Settings**, which shows every parameter in `config.yaml` (secrets never shown at all) and edits the `webui` section live; and 🖼️ **Media**, a grid of every picture the agent has made.
 
 Answers render as markdown with copyable code blocks, maths renders through the KaTeX the core serves itself, the agent can show you an image it made (there is no upload — pictures go agent → you), `/` triggers command autocomplete, and the context gauge marks the rollover threshold. Nothing is rendered optimistically: your own message appears when the core echoes it back, so every window on a session shows the same transcript in the same order. It reconnects with backoff and replays what you missed, so closing the laptop mid-answer loses nothing.

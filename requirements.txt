@@ -24,9 +24,13 @@ tiktoken==0.14.0
 # a bot.
 discord.py==2.7.1
 
-# The WebUI's voice (POST /speak). The core imports piper lazily and does not
-# require it: without it the core boots and serves normally, and the WebUI's
-# voice button says what to install. It also needs a voice file, which is not
-# a pip package — download en_US-lessac-medium.onnx and its .onnx.json from
-# https://huggingface.co/rhasspy/piper-voices into voices/ (gitignored).
+# The WebUI's voice (POST /speak, source/voice.py). The core imports piper
+# lazily and does not require it: without it the core boots and serves
+# normally, and the WebUI's voice button says what to install. It pulls in
+# onnxruntime (1.30.0 here), the bulk of the download. It also needs a voice
+# file, which is not a pip package — fetch both files into voices/ (gitignored):
+#   cd voices && for f in en_US-lessac-medium.onnx en_US-lessac-medium.onnx.json; do
+#     curl -LO "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/$f"
+#   done
+# Another voice works too: point voice.model in config.yaml at its .onnx.
 piper-tts==1.8.0

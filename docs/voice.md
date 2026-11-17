@@ -7,6 +7,68 @@ Two rules set the shape of everything below:
 - **Speech is a presentation, not a reading.** The answer on screen is complete and never changes. What is spoken can be a short script derived from it, which refers to "the table above" instead of reciting cells and skips an equation instead of saying "backslash frac".
 - **Speech stops in the middle.** One stop kills the audio already playing, the parts still queued, and the requests still in flight.
 
+## Setting it up
+
+Voice is optional and off until you turn it on. Everything else in letsClaw works without it.
+
+**1. Install piper into the venv** (it is in `requirements.txt` under optional, so a full `pip install -r requirements.txt` already did this; it pulls in onnxruntime):
+
+```bash
+.venv/bin/pip install piper-tts==1.8.0
+```
+
+**2. Download a voice.** A voice is two files, the model and its config, and they live in `voices/` (gitignored, about 61 MB for this one):
+
+```bash
+cd voices
+for f in en_US-lessac-medium.onnx en_US-lessac-medium.onnx.json; do
+  curl -LO "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/$f"
+done
+cd ..
+```
+
+Any other piper voice works the same way: put both files in `voices/` and point `voice.model` at the `.onnx` in `config.yaml`. The `.onnx.json` must sit beside it under the same name.
+
+**3. Check the core can speak**, without a browser:
+
+```bash
+.venv/bin/python -c "import sys; sys.path.insert(0, 'source'); import config, voice; print(voice.status(config.load_config()))"
+```
+
+`(True, '')` means ready; otherwise the second item says what is missing.
+
+**4. Restart the core** so it loads the voice routes (`/restart` from any client, or `./serve.sh` again). A `voice:` block in `config.yaml` is not needed — the defaults are in `config.example.yaml` — and once one exists, `/reload` applies any change to it.
+
+**5. Hear it end to end**, from the core's own machine, before involving a browser:
+
+```bash
+curl -s -X POST http://127.0.0.1:8770/speak -H 'Content-Type: application/json' \
+     -d '{"text": "Hello from letsClaw."}' -o /tmp/hello.wav && aplay /tmp/hello.wav
+```
+
+Add `-H "Authorization: Bearer <core.token>"` when a token is set. A 503 here carries the same reason as step 3.
+
+**6. Turn it on in the WebUI.** Reload the page (a tab opened before the restart is running the old page), then click **`🔇 voice`** in the top bar, right of `📄 digest`. It lights up as **`🔊 voice`**. Ask a question in that tab and the answer is spoken when it finishes. The choice is remembered per session in this browser.
+
+### When it does not speak
+
+| what you see | why, and what to do |
+|---|---|
+| no `voice` button | the page predates the core's voice — hard-reload the tab (Ctrl+Shift+R); on a narrow window the top bar wraps below about 1100 px, so look on the second row |
+| button greyed out | the core cannot speak; hover it for the reason (`voice.enabled: false`, piper not installed, or no voice file — steps 1–3). It stays grey for a moment after load until `/info` arrives |
+| `🔊 voice` lit, answer not spoken | only the tab that *asked* speaks: a question typed in another tab, the terminal or Discord is shown here but not spoken. Ask in this tab |
+| "the browser blocked audio until this page is clicked or typed in" | Chrome's autoplay rule: the page has had no input yet. Click anywhere or type, then ask again. Typing the question normally counts |
+| `⏹ voice` showing but silent | the tab is in the background: Chrome does not start media in a background tab that has not played yet. Bring the tab forward and it plays |
+| silent everywhere, no notice | the sound is going to the browser's machine — check its output device, its volume, and that the tab is not muted (right-click the tab) |
+| "reading the answer as written — the spoken rewrite failed" | `/narrate` failed or took longer than `voice.script_timeout`; the answer is read with its markup stripped instead. Said once per session. A slow remote model is the usual cause: raise `script_timeout`, set `script_model` to a faster local model, or set `script: never` |
+| a few seconds of silence before a long answer | that is the rewrite. `script: auto` skips it for short plain answers; `never` skips it always |
+| "spoke 8 of 23 parts" | the answer was longer than `voice.max_chunks` × `voice.max_chars`; raise `max_chunks` to hear more |
+| too fast, too slow, too quiet | `voice.speed` (1.2 = 20% faster) and `voice.gain` |
+
+To stop an answer mid-sentence, click **`⏹ voice`**, press Escape, or type `/voice stop`; voice stays on for the next answer. `/voice off` turns it off.
+
+**Listening on another machine.** Open the WebUI from that machine's browser and the sound comes out of its speakers — nothing else to install there. Reaching the core from another machine means a non-loopback `core.bind`, which requires `core.token`; read Security in the README first.
+
 ## The pieces
 
 | where | what |

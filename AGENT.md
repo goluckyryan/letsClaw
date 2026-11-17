@@ -25,7 +25,8 @@ python3 -m venv .venv
 #    required: aiohttp, openai, PyYAML, tiktoken (token counts — there is a
 #    cruder fallback, but the rollover calibration assumes tiktoken)
 #    optional: discord.py (bot only), piper-tts (the WebUI's voice, which also
-#    needs a voice file in voices/). See requirements.txt for which is which.
+#    needs a voice file in voices/ — the curl lines are in requirements.txt and
+#    the README's Quick Start). See requirements.txt for which is which.
 
 # 2. Config. config.yaml is gitignored — it does not exist yet.
 cp config.example.yaml config.yaml
