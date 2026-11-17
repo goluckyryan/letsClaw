@@ -161,11 +161,12 @@ The module map, the turn lifecycle and the disk layout are in [`docs/architectur
 
 ## Terminology
 
-Five words carry most of this manual. They nest, largest first.
+Six words carry most of this manual. They nest, largest first.
 
 | word | means |
 |---|---|
 | **session** | one named, persistent conversation — its history, model and settings. Survives restarts. |
+| **history** | the list of messages sent to the model on **every round**, in order: the system message first, then each of your messages, each answer, and each tool call and tool result in the current window. **It is the prompt, not a record:** what is not in it, the model cannot see; what is cut from it is still in the journal. It holds only the current window — a rollover replaces it with a fresh one that opens on the handoff — and with `digest_turns` on, a finished turn's tool calls and results are collapsed to a short digest. The notepad never enters it, and the prompts the core sends at a cut-off (`## Partial answer`, `## Checkpoint`, `## Forced conclusion`) ride on one round only; the exception is a forced conclusion on a server that cannot resume reasoning, which stays. Saved to `state/live/`, so it survives a restart. In code, `Session.history`; how it differs from the transcript, the journal and the live file is in [design-principles § Vocabulary](docs/design-principles.md#vocabulary). |
 | **turn** | one thing you asked → one answer you got back. |
 | **round** | one request to the model server, and its reply. **A turn is not a round:** a simple question is one of each; a question that needs a file read, some thinking and an answer is still *one turn* — but five or six rounds. |
 | **notepad** | everything the model has thought so far this turn. Lives for one turn and never joins the conversation. |
@@ -177,7 +178,7 @@ Three more, for the walls rather than the work:
 |---|---|
 | **rollover** | the *conversation* outgrew the model's window, so it is archived and restarted from a summary. |
 | **journal** | the running record beside the archive: every round's reasoning, and every tool result untruncated. |
-| **context window** | everything the model can hold at once — the conversation, the notepad and the reserved answer sheet together. |
+| **context window** | everything the model can hold at once — the history, the tool schemas, the notepad and the reserved answer sheet together. |
 
 A **round** and a **request** are the same thing seen from two sides: a round is one question-and-answer with the model, a request is the HTTP call carrying it. This manual says "round" for the unit of work and "request" when the network matters. The kinds of round, and what caps each one, are in [`docs/reasoning.md`](docs/reasoning.md#which-round-runs-under-which-cap); the words a client prints (`transport`, `client`, `event`) are in [`docs/protocol.md`](docs/protocol.md).
 
@@ -207,22 +208,28 @@ The model can call tools to act on the real environment. Each turn, the agent lo
 
 ```mermaid
 graph TD
-    U[User task] --> M[Model call]
+    U[User task] --> G{Room for another tool round?}
+    G -->|yes| M[Model call with tool schemas]
     M --> Q{tool_calls?}
     Q -->|yes| E["Execute each tool (⚙️ shown in terminal)"]
     E --> R[Results back to model]
-    R -->|next round| M
-    Q -->|no| A[Final answer]
-    M -.->|no room for another tool round — one more call with no tool schemas| A
+    R -->|next round| G
+    Q -->|no| T{"Reasoning cut off and the thinking pad filled the window?"}
+    T -->|no| A[Final answer]
+    T -->|yes| P
+    G -->|no| P["Partial answer — one call with no tool schemas, asking for a progress note"]
+    P --> RO[Roll over to a fresh window]
+    RO --> C["Continuation turn resumes from the handoff"]
+    C --> G
 ```
 
 Built-in tools: `exec` (shell), `read_file`, `write_file`, `list_dir`, `show_image`, `search_and_inspect`, `inspect_file`, `inspect_symbol`, `edit_file`, `run_and_capture`. Every result is clipped so one call cannot blow up the window, and `exec` runs in `tools.workdir` under a timeout — the keys and their defaults are in [`config.example.yaml`](config.example.yaml).
 
-The loop is capped by **room, not a round count**: before each round the core checks that the free window still holds enough for one clipped tool result and the message carrying it. Below that it makes one final call with no tool schemas, so the model must answer in plain text. The other wall is time. Why a count of rounds is not a limit the machine actually has, and what the check is derived from: [`docs/reasoning.md`](docs/reasoning.md#can-a-tool-run-while-the-pad-is-open).
+The loop is capped by **room, not a round count**: before each round the core checks that the free window still holds enough for one clipped tool result and the message carrying it. Below that the task has outgrown the window, not finished, so the core makes one last call with no tool schemas asking for a **partial answer** — a progress note: what was done and found, what is left, the exact next step. The session then rolls over without asking (whatever `rollover_mode` says), and a continuation turn picks the task up from the handoff, up to `conversation.max_continuations` in a row (default 10). When it will not continue — the limit is reached, the window could not be archived, or even the fresh window has no room for a tool round — the turn ends on the partial answer and a notice says why; `continue` carries on by hand. The same ending applies one level down: when a tool round's reasoning is cut off, the core resumes it on the thinking pad, and if the pad then reaches the context wall (it had to be checkpointed, or no longer fit) the window has room for a tool round but not for the thinking the next step needs. That pad closes on the same partial answer, with no tool schemas, and rolls over and continues the same way — it used to close on a forced conclusion, which ended the task below the rollover trip with nothing to pick it up. A session with no tools enabled has no tool round to run out of room for, and that last call is its final answer. The other wall is time. Why a count of rounds is not a limit the machine actually has, and what the check is derived from: [`docs/reasoning.md`](docs/reasoning.md#can-a-tool-run-while-the-pad-is-open).
 
 ## Context: rollover, digest, journal
 
-A conversation that outgrows the model's window gets rejected by the server. Rather than silently dropping the oldest turns, letsClaw rolls the session over once it passes `rollover_at_percent` of the window:
+A model's context window is fixed, and a long session runs into it in two ways. The first is length: a conversation that outgrows the window gets rejected by the server. The second is memory: whatever is cut to make room is forgotten, and the session repeats work it has already done. Rollover handles both. Rather than silently dropping the oldest turns, letsClaw rolls the session over once it passes `rollover_at_percent` of the window — the window empties, and what the session learned crosses over in two forms, a handoff the model writes and a journal it can search:
 
 1. the message list is archived, and the journal segment beside it is closed
 2. the model writes a handoff — objective, what's established, **what was ruled out**, what's still open
@@ -230,9 +237,9 @@ A conversation that outgrows the model's window gets rejected by the server. Rat
 
 The **RULED OUT** section is not decoration. A dead end is neither a settled fact nor outstanding work, so without a section of its own it survives nowhere — and the fresh window walks straight back into an approach the old one had already eliminated. Losing a fact costs a re-derivation; losing a rejection costs a loop.
 
-`/rollover` forces one at any time, in any mode, and `rollover_mode` picks what happens on its own. There is an earlier trigger: a window that is nearly full still has room for one more exchange but none to *think* in, so with `rollover_before_think` a thinking model's turn rolls first rather than arriving already degraded. And a turn whose work outgrows the window mid-task does not just stop: once there is no room for another tool round the model writes a progress note, the session rolls over without asking (whatever `rollover_mode` says), and a continuation turn picks the task up from the handoff (up to `conversation.max_continuations` in a row, default 10). The percentage is the server's own figure where the server reports one; where it does not, a calibrated local estimate stands in, and a `~` beside the number is what tells you so.
+`/rollover` forces one at any time, in any mode, and `rollover_mode` picks what happens on its own. There is an earlier trigger: a window that is nearly full still has room for one more exchange but none to *think* in, so with `rollover_before_think` a thinking model's turn rolls first rather than arriving already degraded. And a turn whose work outgrows the window mid-task does not just stop: once there is no room for another tool round — or its thinking fills what is left — the model writes a progress note, the session rolls over without asking (whatever `rollover_mode` says), and a continuation turn picks the task up from the handoff (up to `conversation.max_continuations` in a row, default 10).
 
-**The cheaper move is not to fill the window at all.** Measured across four real sessions, the tool calls and their results were **91–95%** of the context; the answers anyone actually reads were 2–8%. With `digest_turns` on, each finished turn's working-out is replaced by one short digest — the question and the answer stay word for word — and that digest ends with the `grep` line that reaches everything it collapsed. Nothing is lost, and that is *checked* rather than claimed: the collapse requires the journal to be on, healthy, and demonstrably larger than when the turn started, and on any doubt the turn is kept in full. `/digest` chooses this per session; the WebUI's 📄 button is the same switch. It ships **off** — it is the first feature that discards context by design.
+**How full the window is, is often an estimate.** The percentage is the server's own figure where the server reports one; where it does not, a calibrated local estimate stands in, and a `~` beside the number is what tells you so. Even on a server that reports, the estimate is what decides more often than you would think: every operation that reshapes history — a digest, `/clear`, a rollover itself — discards the stale measurement, so the first round of a brand-new window is judged by the estimate. That makes its accuracy a correctness property rather than a display one: an estimate reading high would roll a half-empty window straight over again. It corrects the local count toward the server's tokenizer with three measured constants, lands within about 1%, and errs slightly high on purpose, because rolling early costs a summary and rolling late costs a rejected request. Why the estimate is the rollover decision: [`docs/tokens.md`](docs/tokens.md#6-digest-and-rollover--the-two-ways-history-shrinks); how it is built and how accurate it is: [section 8a](docs/tokens.md#8a-the-estimate-and-why-it-has-three-constants).
 
 **Two directories under `state/`, easily confused.** `state/live/` is the conversation you are having — rewritten as you go and reloaded at startup — while `state/sessions/` is the archive, a write-once record of a window that filled up. A rollover writes to the second and starts the first over. Archives are named `<session_id>_<session>_<timestamp>.json`, and the **id leads because it is the half that cannot change**: a session can be renamed, so `ls a3f91c2e_*` finds every archive of it whatever it was called at the time.
 
@@ -247,6 +254,8 @@ sed -n '820,900p'        state/sessions/a3f91c2e_letsClaw_*.md   # read one bloc
 ```
 
 That is what the carryover block in a fresh window tells the model to do, and what `base.md` tells it to do *before* starting any investigation the handoff does not already answer.
+
+**Digest: fill the window more slowly, so rollover comes later.** Rollover deals with a window that is full; digest keeps it from filling. Measured across four real sessions, the tool calls and their results were **91–95%** of the context; the answers anyone actually reads were 2–8%. With `digest_turns` on, each finished turn's working-out is replaced by one short digest — the question and the answer stay word for word — and that digest ends with the `grep` line that reaches everything it collapsed. It leaves the window but not the record, and that is *checked* rather than claimed: the collapse requires the journal to be on, healthy, and demonstrably larger than when the turn started, and on any doubt the turn is kept in full. `/digest` chooses this per session; the WebUI's 📄 button is the same switch. It ships **off** — it is the first feature that discards context by design.
 
 The numbers — the handoff's three caps, the digest's, what each costs, and the id registry under `logs/` — are in [`docs/architecture.md`](docs/architecture.md#rollover).
 
@@ -266,14 +275,14 @@ A server will only ever generate so much in one request — that limit is `max_t
 
 - **A long think is visible.** It streams as it happens, dimmed and foldable, with a running token count beside it.
 - **A hard question costs time, not quality.** The answer is not truncated to make room for the thinking, because the thinking did not come out of the answer's budget.
-- **A turn does not end empty.** However the thinking stops — out of time, out of room, or out of ideas — the answer still gets written.
+- **A turn does not end on silence.** However the thinking stops — out of time, out of room, or out of ideas — it ends on a closing round that asks for the answer. Only if that round also comes back empty, which happens when the window is full, does the turn end without one, and a notice says so.
 - **The thinking does not fill up your conversation.** It is never added to the history, so a twenty-minute think does not push a rollover any closer. It is written to the [journal](#context-rollover-digest-journal), so it is still there afterwards to grep.
 
 **The one setting people get wrong is `max_tokens`**, because its name suggests a budget for thinking. It is not — it is how much the model may write in *one* request, and the same thought simply continues in the next. Changing it changes how many round-trips a thought takes, not how far the thought can go. The other number people look for is a cap on total thinking, and there isn't one: what caps thinking is the room left in the window once the answer's share is held back, and the turn clock. Both are real limits; neither is a knob labelled "thinking".
 
-**Can it use tools while it is thinking?** Not mid-thought — a conversation has no way to say *"here is what `exec` returned — now carry on inside the sentence you were halfway through"*, and calling a tool would mean abandoning the notepad, which is the one thing this mechanism exists to protect. At the end, yes: the notepad has already worked out *what to do*, and if that is an action rather than a sentence, the tool runs and the turn carries on with the result in hand.
+**Can it use tools while it is thinking?** Not mid-thought — a conversation has no way to say *"here is what `exec` returned — now carry on inside the sentence you were halfway through"*, so a resume round is offered no tools: running one would mean abandoning the notepad, which is the one thing this mechanism exists to protect. At the end, yes: the closing round is offered the tools, and if what the notepad worked out is an action rather than a sentence, the tool runs and the turn carries on with the result in hand. A model that writes a tool call mid-thought anyway is handled by transport: on `chat` the call is only text, so it falls through to the closing round, which can make it for real; on `raw` the core recovers the call and runs it, and the notepad ends there. The `raw` transport also offers no tools at the end — `/completion` has no tool-call parser — so there the closing round is asked for words.
 
-Resuming a thought means asking the server to *continue* a half-written reply rather than start a new one, and not every server exposes that. The core tests yours once and picks the right method; `/info` reports what it found. If a server can do neither, the core falls back to telling the model *"you ran out of room, answer now"* and asking again from scratch — which throws the thinking away, and is a fallback and nothing more.
+Resuming a thought means asking the server to *continue* a half-written reply rather than start a new one, and servers expose that in different ways. With `resume_mode: auto` the core probes once: a server with llama.cpp's `/apply-template` gets `raw` (prefill on `/completion`); anything else gets `chat` (an assistant prefill with `continue_final_message`). The result goes to the core's log, not to `/info`. The probe never picks `off` — for a server that can do neither you set `resume_mode: off` yourself, and then a cut-off round gets the `## Forced conclusion` directive from `base.md` (*"Your reasoning was cut off at the token limit… give your best final answer"*) and is asked again from scratch — which throws the thinking away, and is a fallback and nothing more.
 
 The arithmetic — how the answer's share is worked out, which cap binds which kind of round, the eight distinct ways thinking can stop, what a checkpoint does when the pad fills the window, and how each server's dialect is parsed off the wire — is in [`docs/reasoning.md`](docs/reasoning.md). The per-model keys are commented in [`config.example.yaml`](config.example.yaml).
 
