@@ -24,7 +24,8 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 #    required: aiohttp, openai, PyYAML, tiktoken (token counts — there is a
 #    cruder fallback, but the rollover calibration assumes tiktoken)
-#    optional: discord.py (bot only). See requirements.txt for which is which.
+#    optional: discord.py (bot only), piper-tts (the WebUI's voice, which also
+#    needs a voice file in voices/). See requirements.txt for which is which.
 
 # 2. Config. config.yaml is gitignored — it does not exist yet.
 cp config.example.yaml config.yaml
@@ -128,6 +129,7 @@ source/ssh_forward.py    supervised `ssh -N -L` forwards for remote model server
 source/chat.py           the terminal client
 source/discord_client.py the Discord bot (optional)
 source/discord_probe.py  "start the bot?" — serve.sh and install.sh both ask it
+source/voice.py          the WebUI's voice: piper synthesis behind POST /speak
 source/chunker.py        fence-aware answer chunking (one file, used by the
                          bot rather than reimplemented in it)
 source/version.py        `__version__` — the one place the release number lives

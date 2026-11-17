@@ -34,6 +34,7 @@ import config as configlib
 import config_edit
 import paths
 import session as store
+import voice
 from llm_engine import ChatResult, RoundInterrupted, TOOL_CLOSE, TOOL_OPEN
 from ssh_forward import SSHForwardManager
 from token_counter import (count_text, count_tools, corrected_messages,
@@ -3335,6 +3336,11 @@ class Session:
                 # collapsed turns the window still holds (its expand position
                 # has work to do).
                 "digest": self._digest_state(),
+                # The WebUI's voice button, likewise: whether the core can
+                # speak at all (and the reason when it cannot), plus every cap
+                # the page must obey — the core's config owns those numbers.
+                # Not on /health: that one is unauthenticated.
+                "voice": voice.info(self.config),
                 # Since the session was created, surviving /clear and restarts.
                 "output_total": self.total_output,
                 # The bill, as opposed to the gauge. input_total counts every

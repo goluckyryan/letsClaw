@@ -24,7 +24,7 @@ graph TD
     end
 
     subgraph Modules
-        Cmds[Commands\n/clear /rollover /new /info /model\n/behavior /reasoning /stop /steering\n/reload /restart /session /digest]
+        Cmds[Commands\n/clear /rollover /new /info /model\n/behavior /reasoning /stop /steering\n/reload /restart /session /digest /voice]
         TokenCounter[Token Counter\ntoken_counter.py\nper-message stats]
         ThinkingUI[Thinking indicator\nui.py\nlive spinner + TTFT]
         Tools[Tool executor\ntools.py\nexec / read / write / list]
@@ -84,25 +84,26 @@ Two names in that node are not core commands: `/session` lives in the clients �
 
 | file | lines | owns |
 |---|---|---|
-| `source/core.py` | 4441 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
-| `source/session.py` | 829 | **the disk layer.** Live store, archives, the journal, the handoff summariser, the id registry |
-| `source/server.py` | 1223 | **the transport.** aiohttp routes, the WebSocket handler, the Host and Origin guards, auth, backpressure |
+| `source/core.py` | 4501 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
+| `source/session.py` | 891 | **the disk layer.** Live store, archives, the journal, the handoff summariser, the id registry |
+| `source/server.py` | 1333 | **the transport.** aiohttp routes, the WebSocket handler, the Host and Origin guards, auth, backpressure |
 | `source/llm_engine.py` | 1170 | **the model.** Two transports (`chat` and `raw`), streaming, tool-call parsing, resume |
 | `source/config.py` | 602 | **config.yaml → engines.** Loading, the webui presentation keys, number coercion, `build_all_engines` (which doubles as the validator), and the reload diff. Touches no `Session`, which is why it is not in `core`. `build_engine()` passes the constructor the transport and the generation options it forwards (`base_url`, `api_key`, `provider_name`, `timeout`, `temperature`, `max_tokens`, `top_p`), then assigns the eight **policy** attributes onto the instance: `context_length`, `max_output`, `turn_timeout`, `reasoning`, `answer_time_reserve`, `max_pad_compactions`, `resume_mode`, `reasoning_effort`. The split is deliberate and easy to get wrong: `LLMEngine.__init__` takes `**kwargs` straight into `extra_params`, which `get_model_params()` forwards to `chat.completions.create()`, so a policy key handed to the constructor is sent to the server as a generation option instead of configuring the session — and is silently accepted. That is where a ninth belongs. Grepping `llm_engine.py` for `max_pad_compactions` finds nothing, because the name is only ever assigned from outside |
 | `source/behavior.py` | 359 | **the behavior layers.** `BehaviorStore`, the read-through cache behind a lock, and the three directives extracted out of `base.md` |
 | `source/config_edit.py` | 289 | rewriting the `webui:` block of `config.yaml` **as text**, so the file's comments survive a save |
 | `source/ssh_forward.py` | 732 | **model servers over ssh.** One supervised `ssh -N -L` child per model entry that names an `ssh_forward`, on a port the core picks itself |
-| `source/tools.py` | 823 | `exec`, `read_file`, `write_file`, `list_dir`, `show_image`, the search and edit tools, … and their JSON schemas |
+| `source/tools.py` | 957 | `exec`, `read_file`, `write_file`, `list_dir`, `show_image`, the search and edit tools, … and their JSON schemas |
 | `source/logging_setup.py` | 107 | one rotating log file **per writer** (`letclaw-core.log`, `letclaw-discord.log`), because two processes sharing one file cannot rotate it safely |
+| `source/voice.py` | 218 | **the WebUI's voice.** The `voice:` section read and floored per request, whether the core can speak (and why not, for `/info`), and piper synthesis, loaded only on first use. Behind `POST /speak`; the spoken-script rewrite behind `POST /narrate` is `build_spoken_script` in `session.py`, and the cleaner and chunker are JavaScript in `app.js` |
 | `source/token_counter.py` | 220 | counts with tiktoken's `cl100k_base`, cached under `state/tiktoken/` so it is fetched once ever rather than once per reboot; degrades loudly to 4-chars-per-token if the vocab cannot be loaded at all |
 | `source/paths.py` | 151 | `REPO_ROOT` and `resolve()` — [principle 15](design-principles.md#15-one-definition-of-where-the-repo-is) |
 | `source/version.py` | 25 | `__version__` — the release number, and the only place it lives. Separate from `PROTOCOL_VERSION` in `core.py`: that says whether a client can talk to the core at all, this says which build is running. **Every commit bumps it**, because several agents commit to this tree and a number that moves on judgement of "worth a bump?" stops moving |
 | `source/chunker.py` | 307 | fence-aware message splitting; separate so it tests without `discord.py` |
-| `source/chat.py` | 749 | the terminal client |
+| `source/chat.py` | 875 | the terminal client |
 | `source/ui.py` | 86 | the terminal client's spinner and TTFT line |
-| `source/discord_client.py` | 2555 | the Discord client |
+| `source/discord_client.py` | 2617 | the Discord client |
 | `source/discord_probe.py` | 49 | **"should the bot be started?", answered once.** `serve.sh` and `install.sh` both run it and read the verdict off the exit code, because the answer depends on the config, the token and the core's URL and one copy of that logic cannot disagree with itself |
-| `web/` | 2979 (`app.js`) | the browser client (`index.html`, `app.js`, `style.css`) — vanilla JS, no build step |
+| `web/` | 3347 (`app.js`) | the browser client (`index.html`, `app.js`, `style.css`) — vanilla JS, no build step |
 
 These are `wc -l`, not estimates. The column is only worth having while it is exact: a `~` in front of every figure lets it be wrong by a third without failing anything, so if you would rather not maintain it, drop the column rather than soften the numbers again.
 
@@ -125,11 +126,10 @@ letsClaw/
   logs/                    (gitignored)
   voices/                  text-to-speech models — 61 MB of regenerable
                              binary, so gitignored (.gitignore names the reason).
-                             Nothing shipped reads it yet; the two consumers are
-                             planned in docs/voice-output-plan.md (the core
-                             synthesizes for the WebUI) and
-                             docs/webcam-voice-plan.md (the camera client speaks
-                             for itself)
+                             source/voice.py reads voice.model from here to
+                             synthesize the WebUI's spoken answers; a second
+                             consumer is planned in docs/webcam-voice-plan.md
+                             (the camera client speaks for itself)
 ```
 
 Two things worth knowing about this shape:
@@ -448,7 +448,7 @@ The three tiers, in full. The same division is stated for an operator in the REA
 
 | tier | keys | why |
 |---|---|---|
-| **Live already — no reload needed** | `core.token`, `core.allowed_hosts`, the `state/` paths, the model list `GET /models` serves | read per request off the live config dict, so step 3's in-place mutation delivers them; the reload's job here is only to update the dict |
+| **Live already — no reload needed** | `core.token`, `core.allowed_hosts`, the `state/` paths, the model list `GET /models` serves, every `voice.*` key | read per request off the live config dict, so step 3's in-place mutation delivers them; the reload's job here is only to update the dict |
 | **Reload picks it up** | **every setting in every model entry** — `context_length`, `base_url`, `provider_name`, the sampling parameters, and all of the reasoning settings (`reasoning`, `max_tokens`, `max_output_tokens`, `max_pad_compactions`, `turn_timeout`, `answer_time_reserve`, `resume_mode`, `reasoning_effort`); added and removed models; behavior files including `base.md`; the tool allowlist, `exec_timeout`, `allow_paths` and `deny_commands`; every `conversation.*` setting; `logging.level`; and, in the bot's own process, the Discord allowlist (`discord.users`, `mention_only`, `mention_list`) | the engines are rebuilt from scratch in step 4, and the behavior cache is cleared with them |
 | **Restart-only** | the six named above, plus — on the bot's side — **everything in `discord:` except the allowlist trio**: `enabled` (`serve.sh` reads it before deciding to launch at all), the three that say *where* the bot logs in (`token`, `core`, `core_token`), and the four it reads once when it builds its `Settings` (`idle_detach_min`, `max_lines`, `show_tools`, `auto_names`) | the socket is already bound, and rebinding drops every client, which is the thing a reload exists to avoid; the logging keys are read once at handler installation. The `discord:` half needs the *bot* restarted, which `/restart` does not do — it is a sibling process |
 

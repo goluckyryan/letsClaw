@@ -23,3 +23,10 @@ tiktoken==0.14.0
 # discord.py and does not know the bot exists, so skip this if you do not run
 # a bot.
 discord.py==2.7.1
+
+# The WebUI's voice (POST /speak). The core imports piper lazily and does not
+# require it: without it the core boots and serves normally, and the WebUI's
+# voice button says what to install. It also needs a voice file, which is not
+# a pip package — download en_US-lessac-medium.onnx and its .onnx.json from
+# https://huggingface.co/rhasspy/piper-voices into voices/ (gitignored).
+piper-tts==1.8.0

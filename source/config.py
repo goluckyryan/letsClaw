@@ -36,11 +36,11 @@ DEFAULT_ANSWER_TIME_RESERVE = 120
 # value (`core:`) parses to None, and every reader reaches into it the way it
 # would a dict — `config.get("core", {})` returns the None that is *stored*,
 # not the default, because the key is present. Normalising here is what keeps
-# that from being each reader's problem: the same nine sections
+# that from being each reader's problem: the same ten sections
 # config.example.yaml shows, and no others. test_config_load.py pins the two
 # lists against each other, so a section added to one and not the other fails.
 SECTION_KEYS = ("behavior", "models", "core", "tools", "conversation",
-                "memory", "logging", "webui", "discord")
+                "memory", "logging", "webui", "discord", "voice")
 
 
 def _normalize(cfg):

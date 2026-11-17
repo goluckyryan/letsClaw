@@ -827,3 +827,65 @@ async def build_turn_digest(engine, turn_slice, pad="", max_tokens=600,
     if not text:
         return ""
     return f"{text}\n\n{record}".strip() if record else text
+
+
+# The spoken-script prompt. A module constant, not a behavior file: it is a
+# mechanical instruction to re-render text, and putting it in models/ would
+# invite editing the voice's *identity* when all anyone wants is different
+# pacing. Length and voice choice stay in the voice: config section.
+#
+# Three rules, each because reading an answer aloud shows what happens without
+# it: a table recited cell by cell ("Q 6 underscore K 41 s") is worse than
+# silence; LaTeX and markup spoken literally are noise; and a presentation that
+# changes a figure is worse than a reading — the one rule here that is about
+# correctness rather than style.
+_SPOKEN_SYSTEM = (
+    "You turn a written answer into a short script to be read aloud by a "
+    "text-to-speech voice, in the register of someone presenting the answer to "
+    "a listener who can also see it on screen. Plain sentences only: no "
+    "markdown, no lists, no headings, no emoji.\n"
+    "Rules:\n"
+    "1. Never recite a table cell by cell. Say what it compares or shows, and "
+    "refer to it as the table above.\n"
+    "2. Never read code, markup, LaTeX, file paths or command lines aloud as "
+    "prose. Say what the code does, refer to the formula above, or to the "
+    "command shown.\n"
+    "3. Keep every claim and every number you do state exactly as the answer "
+    "gives it. Invent nothing, and do not soften a caveat. State numbers only "
+    "where they carry the point.\n"
+    "Be brief: a few sentences, never longer than the answer itself. If the "
+    "answer is only a table or only code, still say what it is for."
+)
+
+
+def spoken_script_messages(answer):
+    """The exact message list build_spoken_script sends. [] if there is none."""
+    if not (answer or "").strip():
+        return []
+    return [
+        {"role": "system", "content": _SPOKEN_SYSTEM},
+        {"role": "user", "content": (
+            f"The written answer:\n\n{answer.strip()}\n\n"
+            "Write the spoken script now. Output only the script.")},
+    ]
+
+
+async def build_spoken_script(engine, answer, max_tokens=300):
+    """A spoken presentation of `answer`. Returns "" if it produced nothing.
+
+    The third caller of _summarise, for the reason the second one is: the
+    no-thinking hint is a guess about one server's chat template, and a
+    thinking model left to think spends the whole budget doing so — measured
+    on remote SGLang, 302 reasoning tokens and nothing usable.
+
+    Runs on its own message list, like build_handoff and build_turn_digest:
+    the real history is never touched and this request never becomes part of
+    the conversation. It takes no session lock and carries no turn.
+
+    `answer` is the raw markdown, deliberately not cleaned: the presenter has
+    to see the table to say "the table above compares".
+    """
+    messages = spoken_script_messages(answer)
+    if not messages:
+        return ""
+    return await _summarise(engine, messages, max_tokens)

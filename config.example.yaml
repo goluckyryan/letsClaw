@@ -408,3 +408,36 @@ webui:
     font_color: "var(--fg)"   # CSS color; the message text
                               # var(--bg) / var(--fg) follow the page's light
                               # and dark themes; any literal works too ("#1e222b")
+
+# Voice — the WebUI speaks its answers, through the speakers of the machine the
+# browser is on. The core synthesizes with piper (POST /speak) and the browser
+# plays it; the on/off switch is per tab, in the page (the 🔇/🔊 voice button,
+# or /voice on|off|stop), and only the tab that asked a question speaks its
+# answer. Optional: with no piper installed, or no voice file, the core runs
+# normally and the button says what is missing. Everything here is read per
+# request, so /reload is enough. See docs/voice.md.
+voice:
+  enabled: true                        # false = /speak and /narrate always answer 503
+  # The piper voice, repo-relative unless absolute. Its .onnx.json must sit
+  # beside it. Download both from https://huggingface.co/rhasspy/piper-voices
+  model: "voices/en_US-lessac-medium.onnx"
+  max_chars: 400                       # most any one /speak request may carry; the page
+                                       # splits a longer answer at sentences and asks once per part
+  max_chunks: 8                        # most parts one answer may ask for ("spoke 8 of 23 parts")
+  speed: 1.0                           # speaking rate: 1.2 = 20% faster (piper length_scale = 1/speed)
+  gain: 1.0                            # volume
+  # Present, or read? A written answer has tables, code and formulas that make
+  # no sense read aloud, so the answer can first be rewritten into a short spoken
+  # script by a model (POST /narrate). The screen keeps the full answer either way.
+  #   always — rewrite every answer
+  #   auto   — rewrite only an answer that is long, or holds a code fence, a table
+  #            row or a math delimiter; read short plain answers as they are
+  #   never  — always read the answer, cleaned of markup
+  # The rewrite costs 2-5 s before the first word, on the same model server.
+  script: auto
+  script_model: ""                     # a name under models: for the rewrite; "" = the session's own
+                                       # (not the same kind of thing as `model` above, which is a file)
+  script_min_chars: 280                # auto: an answer under this, with none of those markers, is read
+  script_max_tokens: 300               # the script's budget, roughly 60-90 words
+  script_timeout: 12                   # seconds before /narrate answers 504 (the page then reads)
+  max_answer_chars: 4000               # most any one /narrate request may carry

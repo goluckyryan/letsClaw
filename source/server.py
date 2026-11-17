@@ -9,6 +9,7 @@ Start this first; the terminal, a WebUI and a Discord bot are all just clients:
 HTTP:  GET /health  GET /models  GET /sessions  DELETE /sessions/<name>
        GET /sessions/<name>/history  POST /sessions/<name>/rename
        GET /files  GET /files/<name>  DELETE /files/<name>
+       POST /speak  POST /narrate   (the WebUI's voice; see voice.py)
 WS:    /ws?session=<name>&last_seq=<n>
 
 The reader never runs a turn inline — turns are tasks, so the socket stays
@@ -36,6 +37,8 @@ import config as configlib
 import core
 import logging_setup
 import paths
+import session as store
+import voice
 from version import __version__
 
 logger = logging.getLogger("letclaw.server")
@@ -439,6 +442,111 @@ async def rename_session(request):
             status = 409
         return web.json_response(result, status=status)
     return web.json_response(result)
+
+
+def _voice_refused(status, reason):
+    return web.json_response({"ok": False, "reason": reason}, status=status)
+
+
+def _voice_text(body, field="text"):
+    """The text a voice route was asked about, or None when there is none."""
+    text = body.get(field) if isinstance(body, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return text.strip()
+
+
+async def speak(request):
+    """POST /speak {text} -> audio/wav. Never touches a model.
+
+    `_guard`, not `_read_guard`: it costs CPU and reads the voice file. The
+    length cap is a per-request bound enforced *before* synthesis, and an
+    over-length request is refused rather than cut — the page is the only
+    legitimate client and it chunks to this cap, so a longer request is a bug,
+    and a silent cut here is the exact failure chunking exists to prevent.
+    """
+    _guard(request)
+    cfg = request.app["config"]
+    ok, reason = voice.status(cfg)
+    if not ok:
+        return _voice_refused(503, reason)
+    body = await _json_body(request)
+    text = _voice_text(body)
+    if text is None:
+        return _voice_refused(400, "nothing to speak — text is empty")
+    s = voice.settings(cfg)
+    if len(text) > s["max_chars"]:
+        return _voice_refused(
+            400, f"text is {len(text)} characters; voice.max_chars is "
+                 f"{s['max_chars']} — split it into sentences first")
+    try:
+        # Off the event loop: 0.05-0.8 s of CPU in a native library is exactly
+        # what to_thread is for, and a turn must not wait on somebody's browser.
+        wav = await asyncio.to_thread(voice.synthesize, s, text)
+    except voice.Unavailable as e:
+        return _voice_refused(503, str(e))
+    return web.Response(body=wav, content_type="audio/wav")
+
+
+async def _narrate_engine(mgr, s, session_name):
+    """The engine that presents an answer.
+
+    voice.script_model if set; else the engine of the session that wrote the
+    answer, which is the one that had the thought; else the default model.
+    `mgr.sessions.get`, never `mgr.get()` — that one *creates* the session,
+    and a narrate request must not invent one.
+    """
+    if s["script_model"]:
+        return await mgr.engine_for(s["script_model"])
+    sess = mgr.sessions.get(session_name) if isinstance(session_name, str) else None
+    if sess is not None and sess.engine is not None:
+        return sess.engine
+    return await mgr.engine_for(None)
+
+
+async def narrate(request):
+    """POST /narrate {text, session} -> {"script": ...}: a spoken presentation.
+
+    Split from /speak because the two fail in opposite ways: this is a model
+    call that can stall or come back wrong, and its failure must not stop
+    audio — the page falls back to reading the cleaned answer, and it needs a
+    status code to act on. Every failure is therefore a non-200: an empty 200
+    would read as "nothing to say" and speak nothing.
+    """
+    _guard(request)
+    cfg = request.app["config"]
+    s = voice.settings(cfg)
+    if not s["enabled"]:
+        return _voice_refused(503, "voice is switched off (voice.enabled: false)")
+    if s["script"] == "never":
+        return _voice_refused(503, "voice.script is never — answers are read, not presented")
+    body = await _json_body(request)
+    text = _voice_text(body)
+    if text is None:
+        return _voice_refused(400, "nothing to present — text is empty")
+    if len(text) > s["max_answer_chars"]:
+        return _voice_refused(
+            400, f"answer is {len(text)} characters; voice.max_answer_chars "
+                 f"is {s['max_answer_chars']}")
+    try:
+        engine = await _narrate_engine(request.app["mgr"], s, body.get("session"))
+    except Exception as e:
+        return _voice_refused(503, f"no engine to present with: {e}")
+    try:
+        script = await asyncio.wait_for(
+            store.build_spoken_script(engine, text, max_tokens=s["script_max_tokens"]),
+            timeout=s["script_timeout"])
+    except TimeoutError:
+        return _voice_refused(
+            504, f"the rewrite took longer than voice.script_timeout "
+                 f"({s['script_timeout']:g} s)")
+    except Exception as e:
+        logger.warning("narrate: the rewrite failed: %s", e)
+        return _voice_refused(503, f"the rewrite failed: {e}")
+    script = voice.cap_script(script, s["max_chunks"] * s["max_chars"])
+    if not script:
+        return _voice_refused(503, "the rewrite came back empty")
+    return web.json_response({"ok": True, "script": script})
 
 
 async def index(request):
@@ -1041,6 +1149,8 @@ def build_app(config, config_path=None, bind=None):
         web.get("/config", config_get),
         web.post("/config", config_save),
         web.get("/theme.css", theme),
+        web.post("/speak", speak),
+        web.post("/narrate", narrate),
         # Adjacent on purpose: registered apart, aiohttp builds a second
         # resource for the same pattern rather than adding the method to the
         # first. It resolves either way, but one resource is what a reader of

@@ -26,6 +26,7 @@ const COMMANDS = {
   '/behavior':  'print the loaded behavior files (base + model + session)',
   '/digest':    'off | collapse | expand [all] — collapse finished turns, per session',
   '/reasoning': "cycle the model's thinking: off → folded → open (or name one)",
+  '/voice':     'on | off | stop — speak the answers you ask in this tab',
   '/stop':      'interrupt the turn in progress',
   '/steering':       'send a correction to the turn in progress',
   '/reload':    're-read config.yaml into the running core',
@@ -33,8 +34,8 @@ const COMMANDS = {
   '/help':      'this list',
 };
 
-// /reasoning and /help are handled here, not by the core: they change this
-// browser, not the conversation.
+// /reasoning, /voice and /help are handled here, not by the core: they change
+// this browser, not the conversation.
 
 const FRAMES = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';   // the same spinner ui.py draws in the terminal
 const PROTOCOL_VERSION = 1;
@@ -349,6 +350,93 @@ function renderMd(src) {
              `<code>${esc(b.code.replace(/\n$/, ''))}</code></pre>`;
     })
     .replace(/\u0002(\d+)\u0002/g, (_, i) => renderMath(maths[i]));
+}
+
+/* ------------------------------------------------------------- voice: text */
+
+/* What the voice says, decided without a DOM — tests/test_voice.mjs extracts
+   this section the way test_md.mjs extracts the renderer above.
+
+   The cleaner is the renderer's opposite: renderMd makes markup safe to look
+   at, this removes it so it can be heard. It starts from the turn's raw
+   markdown, never from rendered HTML — KaTeX spans and <pre> blocks have no
+   sentence in them to read. */
+function cleanForSpeech(raw) {
+  let t = String(raw || '');
+  t = t.replace(/```[\s\S]*?(```|$)/g, '\n');          // fences, closed or not
+  t = t.replace(/\$\$[\s\S]*?\$\$/g, ' ')                // display maths
+       .replace(/\\\[[\s\S]*?\\\]/g, ' ')
+       .replace(/\\\([\s\S]*?\\\)/g, ' ');
+  t = t.replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')            // pictures: nothing to hear
+       .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')         // links keep their text
+       .replace(/https?:\/\/\S+/g, ' ');
+  const lines = [];
+  for (let line of t.split('\n')) {
+    line = line.trim();
+    if (!line || /^[-*_]{3,}$/.test(line)) continue;            // a rule
+    if (/^\|?[\s:|-]+\|[\s:|-]*$/.test(line)) continue;         // |---|---|
+    let block = false;
+    if (/^#{1,6}\s+/.test(line)) { line = line.replace(/^#{1,6}\s+/, ''); block = true; }
+    if (/^>\s?/.test(line))      { line = line.replace(/^>\s?/, ''); }
+    if (/^([-*+]|\d+[.)])\s+/.test(line)) { line = line.replace(/^([-*+]|\d+[.)])\s+/, ''); block = true; }
+    if (line.includes('|'))      { line = line.replace(/^\||\|$/g, '').split('|').map((c) => c.trim()).filter(Boolean).join(', '); block = true; }
+    line = line.replace(/\*\*|__|`/g, '').replace(/(^|\s)\*(?=\S)|(\S)\*(?=\s|$)/g, '$1$2');
+    line = line.replace(/[\p{Extended_Pictographic}\u{FE0F}\u{200D}\u{20E3}]/gu, '').trim();
+    if (!line) continue;
+    // A heading, a bullet or a table row has no full stop of its own; give it
+    // one so the voice pauses there and the chunker can break on it.
+    if (block && !/[.!?:;,]$/.test(line)) line += '.';
+    lines.push(line);
+  }
+  // Removing an emoji can strand the space before a full stop ("412 A ."); a
+  // voice reads that as a pause, so close it.
+  return lines.join(' ').replace(/\s+/g, ' ').replace(/\s+([.,!?;:])(?=\s|$)/g, '$1').trim();
+}
+
+/* Split clean text into requests of at most maxChars, in order, for /speak.
+
+   The cap protects the core from a megabyte of synthesis; it does not decide
+   how much of the answer is worth hearing, so a long text becomes several
+   requests rather than one truncated one. Each break is the last sentence end
+   that fits, else the last clause boundary, else the last space; a single
+   token longer than the cap is cut rather than dropped. At most maxChunks are
+   returned; `.total` says how many there would have been, so the caller can
+   say "spoke 8 of 23 parts". */
+function spokenChunks(text, maxChars, maxChunks) {
+  const max = Math.max(1, maxChars | 0 || 400);
+  const out = [];
+  let rest = String(text || '').replace(/\s+/g, ' ').trim();
+  const lastEnd = (s, re) => { let at = -1, m; re.lastIndex = 0; while ((m = re.exec(s))) at = m.index + m[0].length; return at; };
+  while (rest) {
+    if (rest.length <= max) { out.push(rest); break; }
+    const win = rest.slice(0, max + 1);           // +1: a break may sit on the space just past the cap
+    let cut = lastEnd(win, /[.!?…]["')\]]*\s/g);
+    if (cut <= 0) cut = lastEnd(win, /[,;:—–]\s/g);
+    if (cut <= 0) { const sp = win.lastIndexOf(' '); cut = sp > 0 ? sp + 1 : max; }
+    out.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+  }
+  const cap = Math.max(1, maxChunks | 0 || 8);
+  const kept = out.slice(0, cap);
+  kept.total = out.length;
+  return kept;
+}
+
+/* Should this answer go through /narrate first? Decided on the RAW answer:
+   the cleaner deletes the very fences and table pipes this looks for, and an
+   answer that cleans to nothing (code only, a table only) is exactly the one
+   a presenter can still say something about. `auto` asks whether anything in
+   the answer cannot be read aloud, not whether it is interesting. */
+function wantsNarration(raw, info) {
+  const mode = (info && info.script) || 'auto';
+  if (mode === 'always') return true;
+  if (mode !== 'auto') return false;
+  const min = info && info.script_min_chars != null ? info.script_min_chars : 280;
+  const t = String(raw || '');
+  return t.length >= min
+      || /^\s*```/m.test(t)           // a fence
+      || /^\s*\|/m.test(t)            // a table row
+      || /\$|\\\(|\\\[/.test(t);      // a math delimiter
 }
 
 /* ------------------------------------------------------------------- the log */
@@ -1348,6 +1436,9 @@ function switchSession(name) {
   S.turn = null;
   S.sent = loadSent(name);         // the recall list follows the session, not the tab
   S.histIdx = -1;
+  stopSpeech(true);                // the answer being read belongs to the session being left
+  S.voice = loadVoice(name);       // and so does the voice choice
+  paintVoice();
   resetView();                 // a fresh session starts at the bottom, following
   history.replaceState(null, '', `?session=${encodeURIComponent(name)}`);
   refreshSessions();          // move the highlight now, don't wait for the poll
@@ -1400,7 +1491,15 @@ function handle(e) {
   case 'hello': return hello(e);
 
   case 'turn_start':
+    // Barge-in: a new turn cuts off whatever is still being spoken. The same
+    // stop the button makes, not a second copy of it.
+    stopSpeech(true);
     S.turn = newTurn();
+    // weAsked is consumed below, and the answer is spoken at turn_end — so
+    // whether this tab asked has to ride on the turn. A turn started in
+    // another tab, by Discord or by the terminal is drawn here and spoken
+    // nowhere, which needs no cross-tab protocol.
+    S.turn.asked = S.weAsked;
     think = newThink();
     setBusy(true);
     // Asking is the intent to follow, whatever the view was doing: re-assert
@@ -1519,6 +1618,11 @@ function handle(e) {
     stampThinking();
     clearWaiting();
     if (S.turn) flushStream(S.turn.textEl);
+    // The answer is the last round's text — the element a tool call closes
+    // and the next round reopens — read as the raw markdown, never the HTML.
+    if (S.turn && S.turn.asked && S.voice && voiceUsable() && S.turn.textEl) {
+      speakAnswer(S.turn.textEl._raw || '');
+    }
     S.turn = null;
     setBusy(false);
     refreshSessions();            // the message count just moved
@@ -1596,7 +1700,7 @@ function handle(e) {
       notice(`♻️ Config reloaded — ${e.model}, context budget ${e.budget} tok.`);
       loadModels().then(() => showModel(e.model)).catch(() => {});
       rpc('info', '', true)
-        .then((r) => r.info && (setGauge(r.info.used, r.info.budget, false), applyDigestInfo(r.info)))
+        .then((r) => r.info && (setGauge(r.info.used, r.info.budget, false), applyDigestInfo(r.info), applyVoiceInfo(r.info)))
         .catch(() => {});
       if (isOpen('#settings')) settingsRefresh();   // the panel shows the live config — redraw it
       setHint();
@@ -1606,6 +1710,8 @@ function handle(e) {
       // the labels that carry the name need moving, the URL included, or a reload
       // would take this tab back to a name that no longer exists.
       S.session = e.session;
+      // The voice choice follows the conversation to its new name.
+      if (e.was) saveVoice(e.session, S.voice);
       document.title = `${e.session} · letsClaw`;
       history.replaceState(null, '', `?session=${encodeURIComponent(e.session)}`);
       setHint();
@@ -1739,8 +1845,9 @@ function hello(e) {
   // The gauge has no reading until a turn completes; /info gives an estimate
   // now. The digest button is painted from the same fetch: the state is
   // server-owned and attach is when a stale tab (or a fresh one) learns it.
+  // The voice button too: whether the core can speak, and the caps to obey.
   rpc('info', '', true)
-    .then((r) => r.info && (setGauge(r.info.used, r.info.budget, false), applyDigestInfo(r.info)))
+    .then((r) => r.info && (setGauge(r.info.used, r.info.budget, false), applyDigestInfo(r.info), applyVoiceInfo(r.info)))
     .catch(() => {});
 }
 
@@ -2006,7 +2113,9 @@ input.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowDown') { e.preventDefault(); return acMove(1); }
     if (e.key === 'ArrowUp')   { e.preventDefault(); return acMove(-1); }
     if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) { e.preventDefault(); return acAccept(); }
-    if (e.key === 'Escape')    { ac.hidden = true; acItems = []; return; }
+    // stopPropagation: this Escape closes the list and nothing else. Bubbling
+    // up, it would reach the document listener and stop speech as well.
+    if (e.key === 'Escape')    { e.stopPropagation(); ac.hidden = true; acItems = []; return; }
   }
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); return submit(); }
   // Terminal habit: an empty box plus ArrowUp recalls what you sent before.
@@ -2052,6 +2161,7 @@ function submit() {
         return notice(`/reasoning takes ${REASON_MODES.join(', ')} — or nothing, to cycle`, 'warn');
       return cycleReasoning(want || undefined);
     }
+    if (word === '/voice')     return voiceCommand(args);
     if (word === '/stop')      { send({ t: 'stop' }); return; }
     if (word === '/steering') {
       if (!args) {
@@ -2173,6 +2283,257 @@ function applyDigestInfo(info) {
   }
 }
 
+/* --------------------------------------------------------- voice: playback */
+
+/* The tab speaks the answers it asked for, through this machine's speakers.
+   The core synthesizes (POST /speak) and, for an answer worth presenting
+   rather than reading, rewrites it first (POST /narrate); this side cleans,
+   chunks, queues, plays, and stops. See docs/voice.md.
+
+   The on/off is per session, in this browser — letsclaw.voice.<session>, the
+   letsclaw.sent.<name> shape for the same reason: what you want read aloud in
+   one conversation has no business applying to another. It is the default
+   for a new tab; only the tab that asked a question speaks its answer (see
+   turn_start), so two tabs on one session never talk over each other. */
+
+const voiceKey = (name) => `letsclaw.voice.${name}`;
+function loadVoice(name) {
+  try { return localStorage.getItem(voiceKey(name)) === '1'; } catch { return false; }
+}
+function saveVoice(name, on) {
+  try { localStorage.setItem(voiceKey(name), on ? '1' : '0'); } catch { /* private window */ }
+}
+
+S.voice = loadVoice(S.session);
+// /info's `voice` payload: whether the core can speak, why not, and the caps.
+// null until /info lands, and the button stays unavailable until then.
+S.voiceInfo = null;
+// Set for the life of the page when the core turned voice down in a way
+// another try will not fix — a 404 (an older core) or a 503 (no piper, no
+// voice file). Said once, then the button shows it.
+S.voiceDead = '';
+// The answer being spoken: its AbortController, its queue of chunks not yet
+// played, the object URL playing now, and the resolver that ends playback.
+// One per answer and replaced, never reused — aborting a controller that has
+// already been swapped out would abort the wrong answer.
+S.speech = null;
+// Sessions already told that the rewrite failed and the answer is being read
+// instead — once per session per page load, not on every turn.
+const narrateWarned = new Set();
+
+const voiceAudio = new Audio();
+
+function voiceUsable() { return !!(S.voiceInfo && S.voiceInfo.available && !S.voiceDead); }
+function voiceReason() {
+  return S.voiceDead || (S.voiceInfo ? S.voiceInfo.reason : 'waiting for the core to say whether it can speak');
+}
+
+/* Four states, because the button is also the stop control: off, on,
+   speaking (click = stop this answer, the setting stays), unavailable (click =
+   say why). The label always ends in `voice` so the header row never changes
+   width. `speaking` follows S.speech, not audio.paused: the gap between two
+   chunks is still speaking, and a lamp that flickers at every seam lies. */
+function paintVoice() {
+  const b = $('#btn-voice');
+  if (!b) return;
+  const usable = voiceUsable();
+  const speaking = !!S.speech;
+  b.classList.toggle('on', usable && S.voice);
+  b.classList.toggle('unavail', !usable && !speaking);
+  b.textContent = speaking ? '⏹ voice' : usable && S.voice ? '🔊 voice' : '🔇 voice';
+  b.title = speaking ? 'speaking — click to stop this answer (or Escape, or /voice stop); voice stays on'
+    : !usable ? `voice unavailable — ${voiceReason()}`
+    : S.voice ? 'answers you ask in this tab are spoken — click to turn off (/voice off)'
+    : 'answers are not spoken — click to speak the ones you ask in this tab (/voice on)';
+}
+
+/* /info carries `voice` (attach, and the re-fetch a /reload makes, so a core
+   retuned to a smaller max_chars is obeyed by an open tab). A core older than
+   voice output sends none, and says so through the button. */
+function applyVoiceInfo(info) {
+  if (!info) return;
+  S.voiceInfo = info.voice || { available: false, reason: 'this core predates voice output — update it' };
+  paintVoice();
+}
+
+function setVoice(on) {
+  if (on && !voiceUsable()) return notice(`🔇 voice unavailable — ${voiceReason()}`, 'warn');
+  S.voice = on;
+  saveVoice(S.session, on);
+  if (!on) stopSpeech(true);
+  paintVoice();
+  notice(on ? '🔊 voice on — this tab' : '🔇 voice off — this tab');
+}
+
+function clickVoice() {
+  if (S.speech) return stopSpeech();
+  if (!voiceUsable()) return notice(`🔇 voice unavailable — ${voiceReason()}`, 'warn');
+  setVoice(!S.voice);
+}
+
+function voiceCommand(args) {
+  const want = args.trim().toLowerCase();
+  if (want === 'stop') { if (!stopSpeech()) notice('⏹ nothing is being spoken'); return; }
+  if (want === 'on')   return setVoice(true);
+  if (want === 'off')  return setVoice(false);
+  if (want === '')     return clickVoice();
+  notice('/voice takes on, off or stop — or nothing, to toggle', 'warn');
+}
+
+function revokeSpeechUrl(sp) {
+  if (sp && sp.url) { URL.revokeObjectURL(sp.url); sp.url = null; }
+}
+
+/* Stop the answer being spoken, now. Three places, and missing one leaves
+   audio playing after a click that looked like it worked: the element that is
+   playing (paused, its source dropped so nothing can resume), the queue of
+   chunks not yet played, and the requests still in flight — the /narrate
+   rewrite and any /speak download, aborted through the answer's controller.
+   The button, Escape, /voice stop, /voice off and a new turn all come here.
+   Returns whether anything was playing. */
+function stopSpeech(silent) {
+  const sp = S.speech;
+  if (!sp) return false;
+  S.speech = null;
+  sp.queue.length = 0;
+  sp.ctl.abort();
+  voiceAudio.pause();
+  voiceAudio.removeAttribute('src');
+  voiceAudio.load();             // drop the buffer; a bare pause() keeps it
+  revokeSpeechUrl(sp);
+  if (sp.done) sp.done();
+  paintVoice();
+  if (!silent) notice('⏹ stopped');
+  return true;
+}
+
+function endSpeech(sp) {
+  if (S.speech !== sp) return;
+  S.speech = null;
+  revokeSpeechUrl(sp);
+  paintVoice();
+}
+
+/* A failure that another try will not fix, said once. */
+function voiceDied(reason) {
+  if (S.voiceDead) return;
+  S.voiceDead = reason;
+  paintVoice();
+  notice(`🔇 voice unavailable — ${reason}`, 'warn');
+}
+
+async function voicePost(path, payload, sp) {
+  return fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(payload),
+    signal: sp.ctl.signal,
+  });
+}
+
+/* The spoken script for `raw`, or null meaning "read the cleaned answer".
+   Never throws: a rewrite that fails must not cost the answer its audio. */
+async function narrateAnswer(raw, sp) {
+  const info = S.voiceInfo || {};
+  const fellBack = (why) => {
+    if (sp.ctl.signal.aborted || narrateWarned.has(S.session)) return null;
+    narrateWarned.add(S.session);
+    notice(`🔊 reading the answer as written — the spoken rewrite failed (${why})`, 'warn');
+    return null;
+  };
+  if (info.max_answer_chars && raw.length > info.max_answer_chars) {
+    return fellBack(`the answer is over voice.max_answer_chars, ${info.max_answer_chars}`);
+  }
+  try {
+    const r = await voicePost('/narrate', { text: raw, session: S.session }, sp);
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.script) return j.script;
+    return fellBack(j.reason || `HTTP ${r.status}`);
+  } catch (err) {
+    return err.name === 'AbortError' ? null : fellBack(err.message);
+  }
+}
+
+async function fetchWav(text, sp) {
+  const r = await voicePost('/speak', { text }, sp);
+  if (r.ok) return r.blob();
+  const j = await r.json().catch(() => ({}));
+  const err = new Error(j.reason || `HTTP ${r.status}`);
+  err.status = r.status;
+  throw err;
+}
+
+/* One chunk through the element. Resolves when it ends, errors, or is stopped
+   — stopSpeech calls sp.done, so a stop never leaves this waiting. */
+function playBlob(blob, sp) {
+  return new Promise((resolve) => {
+    revokeSpeechUrl(sp);              // the previous chunk's, before replacing it
+    sp.url = URL.createObjectURL(blob);
+    sp.done = resolve;
+    voiceAudio.onended = () => resolve(true);
+    voiceAudio.onerror = () => { revokeSpeechUrl(sp); resolve(true); };
+    voiceAudio.src = sp.url;
+    voiceAudio.play().catch((err) => {
+      // The autoplay rule: no gesture on this page yet. Typing the question
+      // counts, so this is rare — a turn asked in a tab opened and never touched.
+      if (err.name === 'NotAllowedError') {
+        stopSpeech(true);
+        notice('🔇 the browser blocked audio until this page is clicked or typed in', 'warn');
+      }
+      resolve(false);
+    });
+  });
+}
+
+/* The queue: the first chunk is awaited, the next is fetched while this one
+   plays, so the chain never waits on the network at a seam. */
+async function playQueue(sp) {
+  let next = sp.queue.length ? fetchWav(sp.queue.shift(), sp) : null;
+  while (next) {
+    let blob;
+    try { blob = await next; }
+    catch (err) {
+      if (err.name === 'AbortError' || S.speech !== sp) return;
+      if (err.status === 404) voiceDied('this core has no /speak route — update it');
+      else if (err.status === 503) voiceDied(err.message);
+      else notice(`🔇 voice: ${err.message}`, 'warn');
+      return;
+    }
+    if (S.speech !== sp) return;
+    next = sp.queue.length ? fetchWav(sp.queue.shift(), sp) : null;
+    if (next) next.catch(() => {});   // handled when awaited; this only silences the early rejection
+    if (!(await playBlob(blob, sp)) || S.speech !== sp) return;
+  }
+  return true;
+}
+
+/* Speak the answer a turn of ours just finished. Cleans it, asks for a
+   rewrite when the answer has something that cannot be read aloud, chunks the
+   result, and plays it. Whatever was playing stops first. */
+async function speakAnswer(raw) {
+  stopSpeech(true);
+  const info = S.voiceInfo || {};
+  const cleaned = cleanForSpeech(raw);
+  const present = wantsNarration(raw, info);
+  if (!cleaned && !present) return notice('🔇 nothing to read');
+  const sp = S.speech = { ctl: new AbortController(), queue: [], url: null, done: null };
+  paintVoice();
+  let text = cleaned;
+  if (present) {
+    const script = await narrateAnswer(raw, sp);
+    if (S.speech !== sp) return;               // stopped while the rewrite was out
+    if (script) text = cleanForSpeech(script) || cleaned;
+  }
+  const chunks = spokenChunks(text, info.max_chars, info.max_chunks);
+  if (!chunks.length) { endSpeech(sp); return notice('🔇 nothing to read'); }
+  sp.queue.push(...chunks);
+  const finished = await playQueue(sp);
+  if (finished && S.speech === sp && chunks.total > chunks.length) {
+    notice(`🔊 spoke ${chunks.length} of ${chunks.total} parts — voice.max_chunks is ${chunks.length}`);
+  }
+  endSpeech(sp);
+}
+
 /* ------------------------------------------------------------------- wiring */
 
 $('#send').onclick = submit;
@@ -2181,6 +2542,7 @@ $('#nav-down').onclick = () => goPrompt(1);
 $('#stop').onclick = () => send({ t: 'stop' });
 $('#btn-reasoning').onclick = () => cycleReasoning();
 $('#btn-digest').onclick = () => clickDigest();
+$('#btn-voice').onclick = () => clickVoice();
 $('#btn-info').onclick = () => rpc('info').catch(() => {});
 $('#btn-behavior').onclick = () => rpc('behavior').catch(() => {});
 
@@ -2434,7 +2796,7 @@ $('#side-add').onsubmit = (e) => {
 };
 
 $('#side-name').addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') { $('#side-add').hidden = true; input.focus(); }
+  if (e.key === 'Escape') { e.stopPropagation(); $('#side-add').hidden = true; input.focus(); }
 });
 
 /* --------------------------------------------------------------- overlays
@@ -2470,7 +2832,12 @@ function overlay({ panel, button, closer, onOpen, onClose }) {
 
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
-  for (const o of overlays) if (isOpen(o.panel)) o.close();
+  let closed = false;
+  for (const o of overlays) if (isOpen(o.panel)) { o.close(); closed = true; }
+  // With nothing to close, Escape stops speech. The lightbox keeps its own
+  // listener, added after this one, so it is still in the DOM here: an Escape
+  // meant for it must not cut the voice off too.
+  if (!closed && !document.querySelector('.lightbox')) stopSpeech();
 });
 
 /* --------------------------------------------------------------- settings */
@@ -2960,6 +3327,7 @@ function showModel(name) {
 
 async function boot() {
   showReasonMode();
+  paintVoice();
   $('#side').hidden = localStorage.getItem('letsclaw.side') === '0';
   $('#side').style.width = S.sideW + 'px';
   document.title = `${S.session} · letsClaw`;

@@ -324,7 +324,7 @@ Everything is on **one port** — the WebUI and the API share `core.port`, so th
 
 **Nothing is committed until the new file parses and produces a working engine for every model in it.** A half-finished edit — the normal state of a file open in an editor — comes back as `400` with the parser's own complaint, and the core carries on exactly as it was. Building the engines *is* the validation: it is the same code path a real turn takes, so it catches a missing `base_url` that a schema check would wave through. The reply then names what moved, key by key (`models.qwen38-local.context_length: 100000 -> 128000`), so a reload says what it did rather than only that it happened.
 
-**Most settings apply on reload** — every key in every model entry, added and removed models, the behavior files, the tool allowlist, everything under `conversation:` and `logging.level`. Only three kinds need a restart: where the core listens (`core.bind`, `core.port`), the keys that size the log files, and — on the bot's side — everything in `discord:` except its allowlist. **`/restart` applies the core's restart-only keys from any client** (below), so that is no longer a trip to the core's host; the `discord:` half needs the *bot* restarted, which `/restart` does not touch.
+**Most settings apply on reload** — every key in every model entry, added and removed models, the behavior files, the tool allowlist, everything under `conversation:` and `logging.level`, and everything under `voice:`. Only three kinds need a restart: where the core listens (`core.bind`, `core.port`), the keys that size the log files, and — on the bot's side — everything in `discord:` except its allowlist. **`/restart` applies the core's restart-only keys from any client** (below), so that is no longer a trip to the core's host; the `discord:` half needs the *bot* restarted, which `/restart` does not touch.
 
 Two behaviours are easy to mistake for a reload that did not work:
 
@@ -360,7 +360,7 @@ Binding to a non-loopback address with no token is refused at startup for exactl
 
 ## Commands you can type
 
-Every client understands these, except where a row says otherwise; four are handled by the window itself rather than sent to the core (`/quit`, `/exit`, `/reasoning`, `/session`).
+Every client understands these, except where a row says otherwise; five are handled by the window itself rather than sent to the core (`/quit`, `/exit`, `/reasoning`, `/session`, `/voice`).
 
 | command | |
 |---|---|
@@ -371,6 +371,7 @@ Every client understands these, except where a row says otherwise; four are hand
 | `/info` | the core's version, session name and id, recent history, context usage, output total |
 | `/behavior` | print the loaded behavior file |
 | `/reasoning` | toggle live display of the model's thinking |
+| `/voice` , `/voice on` , `/voice off` , `/voice stop` | WebUI only: speak the answers you ask in this tab, through this machine's speakers. The bare form toggles; `stop` cuts off the answer being spoken and leaves voice on |
 | `/digest` , `/digest off` , `/digest collapse` , `/digest expand [all]` | per-session digest mode — the bare form reports it (and answers while a turn runs), `off`/`collapse` choose it for this session's life, `expand` restores the last collapsed turn from the journal, `expand all` every one |
 | `/stop` | interrupt the turn in progress |
 | `/steering <text>` | send a correction *into* the turn in progress — the model picks it up at the next round, and it enters the history as the ordinary user message it is. Refused when nothing is running, rather than held over for the next turn |
@@ -403,10 +404,11 @@ This is the least robust of the three windows, deliberately: it does not reconne
 
 ## WebUI
 
-<http://127.0.0.1:8770/> — everything the terminal does, plus three things:
+<http://127.0.0.1:8770/> — everything the terminal does, plus four things:
 
 - **A session sidebar.** The list is rebuilt from the core every few seconds, so a session someone started in another window shows up here too. `+` creates one, `✎` renames one in place — same conversation, and anyone attached follows it — and `✕` discards the conversation *and every file it wrote*, asking first and saying how much is about to go.
 - **Foldable thinking.** `🧠 think` has three states — off, folded, open — and each block can be opened on its own. A folded block still shows what it cost.
+- **Voice.** `🔇 voice` speaks the answers you ask in this tab, through the speakers of the machine the browser is on. Typing the question is enough to let the page play sound; no click is needed. An answer with a table, code or a formula is first rewritten by the model into a short spoken script that says "the table above compares…" instead of reading cells aloud, and the screen keeps the full answer. While it speaks, the button reads `⏹`: click it, press Escape, or type `/voice stop` to cut the answer off. Only the tab that asked speaks, so two tabs on one session never talk over each other. It needs `piper-tts` and a voice file on the core (see `requirements.txt`); without them the button is greyed out and says what to install. To hear it on another machine, point that machine's browser at the core, which for anything but loopback means setting `core.bind` *and* `core.token` — read [Security](#security) first.
 - **Two panels:** ⚙️ **Settings**, which shows every parameter in `config.yaml` (secrets never shown at all) and edits the `webui` section live; and 🖼️ **Media**, a grid of every picture the agent has made.
 
 Answers render as markdown with copyable code blocks, maths renders through the KaTeX the core serves itself, the agent can show you an image it made (there is no upload — pictures go agent → you), `/` triggers command autocomplete, and the context gauge marks the rollover threshold. Nothing is rendered optimistically: your own message appears when the core echoes it back, so every window on a session shows the same transcript in the same order. It reconnects with backoff and replays what you missed, so closing the laptop mid-answer loses nothing.
@@ -474,7 +476,7 @@ cp config.example.yaml config.yaml     # config.yaml is gitignored — it holds 
 
 **[`config.example.yaml`](config.example.yaml) is the reference.** Every key is there inline with its default and what a change costs, and it is a template rather than a manual page, so it cannot go stale the way a list of keys can. Read it beside the reload table under [The Core](#the-core): the table says *which tier* a key is in, the file says *what the key does*.
 
-Seven sections, and one place to read each properly:
+Eight sections, and one place to read each properly:
 
 | section | what it is for |
 |---|---|
@@ -485,6 +487,7 @@ Seven sections, and one place to read each properly:
 | `conversation` | how long a session is kept, when it rolls over, and what gets written to disk |
 | `discord` | the bot, and the allowlist that decides who may talk to it. Omit the section entirely if you do not want a bot |
 | `logging` | how much log to keep |
+| `voice` | the WebUI's spoken answers: the piper voice file, the caps on each request, and whether answers are rewritten into a spoken script first. Optional — omit it and the defaults apply |
 
 Two of them are worth more than a skim, because getting them wrong costs something other than a feature:
 

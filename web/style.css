@@ -290,6 +290,9 @@ header button {
 }
 header button:hover { border-color: var(--accent); }
 header button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+/* The voice button when the core cannot speak. Still clickable — the click
+   says why — so not :disabled, which would swallow it. */
+header button.unavail { opacity: 0.5; }
 
 /* Context gauge: fill = used, tick = the rollover threshold. */
 .gauge {
