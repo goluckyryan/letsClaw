@@ -64,6 +64,8 @@ The corollary is that machinery must not *also* be prompt. `strip_directive_sect
 
 The context is the behavior files plus the conversation. Nothing else. No framework preamble, no injected tool preamble beyond the schemas, no silent memory retrieval.
 
+The skills catalog is the one listing beside them, and it is held to the same rule: it is off unless `skills.enabled` says so, it is visible in `/behavior`, it is counted in `history[0]`, and it never carries a skill's body — the model reads the body with `read_file` when it chooses to, and that read is a tool call in the transcript like any other. Injecting the matching skill's text would be easier and would break this principle.
+
 This is why the token counts in the `⚡` line can be trusted, and it is the thing to protect hardest when adding a feature: a feature that quietly adds tokens to every prompt has broken the one promise the README opens with.
 
 Taking tokens away is bound by the same rule, which is why the turn digest ([principle 18](#18-elide-only-what-can-be-reconstructed)) is a *replacement* and not an addition: it is counted like any other message, it is visible in the conversation as the assistant message it is, and the turn it stands in for is gone rather than hidden. An elision the `⚡` line cannot see would break the promise in the other direction.

@@ -40,7 +40,7 @@ DEFAULT_ANSWER_TIME_RESERVE = 120
 # config.example.yaml shows, and no others. test_config_load.py pins the two
 # lists against each other, so a section added to one and not the other fails.
 SECTION_KEYS = ("behavior", "models", "core", "tools", "conversation",
-                "memory", "logging", "webui", "discord", "voice")
+                "memory", "logging", "webui", "discord", "voice", "skills")
 
 
 def _normalize(cfg):
@@ -449,7 +449,7 @@ def check_section_shapes(config):
     Checking shapes here puts that failure back inside reload()'s validation,
     where it is a refusal with a message instead of a poisoned process.
 
-    The same nine sections _normalize knows about: it already stands an empty
+    The same sections _normalize knows about (SECTION_KEYS): it already stands an empty
     one up as a dict, so anything still not a dict by the time it reaches here
     is a shape nobody can use.
     """

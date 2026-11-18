@@ -34,6 +34,7 @@ import config as configlib
 import config_edit
 import paths
 import session as store
+import skills as skilllib
 import voice
 from llm_engine import ChatResult, RoundInterrupted, TOOL_CLOSE, TOOL_OPEN
 from ssh_forward import SSHForwardManager
@@ -188,6 +189,9 @@ DIGEST_PAD_TAIL_CHARS = 20_000
 DIGEST_POINTER_RX = re.compile(
     r"\[full record: grep -n '\^## turn (\d+) ' (\S+)\]")
 SESSION_MARKER = "\n=== SESSION ===\n"
+# The skills catalog, a listing rather than a behavior layer. Above the
+# carryover marker, for the reason fresh_history gives.
+SKILLS_MARKER = "\n\n=== SKILLS ===\n"
 CARRYOVER_MARKER = "\n\n=== CONTINUED SESSION ===\n"
 
 # Seconds held back from turn_timeout so the closing round still fits inside the
@@ -645,6 +649,10 @@ class Session:
         # models/sessions/<name>.md — per session, which for the Discord bot
         # means per channel, since it names sessions after them.
         self.session_behavior = ""
+        # The skills catalog this window was built with (skills.py) — "" when
+        # skills are off or none are installed. Moves on the same paths as the
+        # behavior layers, never on /reload.
+        self.skills_block = ""
         self.history = []
         self.tools = []
         self.schemas = []
@@ -1055,10 +1063,12 @@ class Session:
                 "expandable": sum(1 for m in self.history if m.get("digest"))}
 
     def fresh_history(self, carryover=""):
-        """System message: the three behavior layers, then the carryover.
+        """System message: the three behavior layers, the skills catalog, then
+        the carryover.
 
         base (every session) → model (per model entry) → session (per session,
-        so per channel for Discord) → carryover (the rollover handoff).
+        so per channel for Discord) → skills (a listing of skills.py's catalog,
+        never a skill's body) → carryover (the rollover handoff).
 
         The base (identity + tool notes) is in the prompt even when a session
         has neither of the other two. The carryover stays last, and that is
@@ -1072,6 +1082,8 @@ class Session:
             content += "\n=== BEHAVIOR ===\n" + self.behavior
         if self.session_behavior:
             content += SESSION_MARKER + self.session_behavior
+        if self.skills_block:
+            content += SKILLS_MARKER + self.skills_block
         if carryover:
             content += CARRYOVER_MARKER + carryover
         return [{"role": "system", "content": content}]
@@ -1122,7 +1134,10 @@ class Session:
         entry = (self.config.get("models", {}) or {}).get(self.model_name) or {}
         fresh = await self.manager.behavior_for(entry, self.name)
         was = (self.base_behavior, self.behavior, self.session_behavior)
-        if fresh == was:
+        skills_block = await self.manager.skills_catalog()
+        skills_moved = skills_block != self.skills_block
+        self.skills_block = skills_block
+        if fresh == was and not skills_moved:
             return []
         (self.base_behavior, self.behavior, self.session_behavior) = fresh
 
@@ -1130,6 +1145,8 @@ class Session:
         names = [Path(keys[i]).name if i < len(keys) else label
                  for i, label in enumerate(("base", "model", "session"))]
         moved = [names[i] for i in range(3) if was[i] != fresh[i]]
+        if skills_moved:
+            moved.append("skills catalog")
         self.emit(ev("notice", level="info",
                      text="behavior re-read from disk: " + ", ".join(moved)))
         return moved
@@ -3391,7 +3408,36 @@ class Session:
                     "session": self.name,
                     "base": self.base_behavior or "",
                     "behavior": self.behavior or "",
-                    "session_behavior": self.session_behavior or ""}
+                    "session_behavior": self.session_behavior or "",
+                    "skills": self.skills_block or ""}
+        if name == "skills":
+            # Read-only, so above the busy guard with /info and /behavior: the
+            # moment you most want to know whether there was a skill to read is
+            # while the turn that might have read it is running. The listing is
+            # of disk now; /behavior's `skills` is what this window was told.
+            enabled = skilllib.settings(self.config)[0]
+            scan = await self.manager.skills_scan()
+            want = args.strip()
+            if not want:
+                # Keys of their own, not `skills`: clients tell replies apart
+                # by which key is present, and /behavior already has that one.
+                return {"ok": True, "skills_enabled": enabled,
+                        "skill_roots": list(scan.roots),
+                        "skill_list": [{"name": k.name,
+                                        "description": k.description,
+                                        "path": k.path} for k in scan.skills],
+                        "skill_warnings": list(scan.warnings)}
+            hit = next((k for k in scan.skills if k.name == want), None)
+            if hit is None:
+                return {"ok": False, "error": f"no skill called {want!r} — "
+                        "/skills lists the ones that are loaded"}
+            try:
+                text = await asyncio.to_thread(Path(hit.path).read_text,
+                                               encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                return {"ok": False, "error": f"{hit.path}: {e}"}
+            return {"ok": True, "skill": hit.name, "path": hit.path,
+                    "skill_text": text}
         if name == "model" and not args.strip():
             # The listing half of /model, up here with /info and /behavior
             # because it reads two fields and changes nothing — and because
@@ -3611,6 +3657,7 @@ class Session:
         # and the session file is named for this session.
         (self.base_behavior, self.behavior,
          self.session_behavior) = await self.manager.behavior_for(entry, self.name)
+        self.skills_block = await self.manager.skills_catalog()
         self._rebuild_system_message()
         # Two things just moved under the measurement, not one. history[0] was
         # rebuilt from a different model's behavior layers, so _last_used sizes
@@ -3643,6 +3690,11 @@ class SessionManager:
         # and be cancelled by the very restart that just reported none running.
         self.restarting = False
         self.behaviors = behavior.BehaviorStore(self.config)
+        # Parsed SKILL.md files, cached by (mtime, size). See skills.py.
+        self.skills = skilllib.SkillCatalog()
+        # The catalog text last handed to a session, so /reload can say when
+        # the skills on disk have moved. None until the first session asks.
+        self._skills_text = None
         # ssh port-forwards the core owns (models with an ssh_forward entry).
         # configure() is synchronous and spawns nothing; the keepalive loop
         # starts from the server's on_startup, where a running loop exists.
@@ -3834,6 +3886,17 @@ class SessionManager:
         """
         return await asyncio.to_thread(self.behaviors.refresh_sync)
 
+    async def skills_catalog(self, config=None):
+        """The skills catalog block for a system message, read off the event loop."""
+        text = await asyncio.to_thread(self.skills.catalog, config or self.config)
+        if config is None:
+            self._skills_text = text
+        return text
+
+    async def skills_scan(self):
+        """skills.Scan of the configured roots, off the event loop. For /skills."""
+        return await asyncio.to_thread(self.skills.scan, self.config)
+
     async def get(self, name, model=None):
         """The session called `name`, created on first use.
 
@@ -4015,6 +4078,11 @@ class SessionManager:
             # or /new, each of which rebuilds that prefix anyway and re-reads on
             # the way through.
             refreshed = await self.refresh_behaviors()
+            # The skills catalog, by the same rule: re-scanned so a change is
+            # reported, installed in no live window.
+            skills_text = await self.skills_catalog(fresh)
+            if self._skills_text is not None and skills_text != self._skills_text:
+                refreshed = list(refreshed) + ["skills catalog"]
 
             # Everything below reads `fresh` and can refuse it, so all of it
             # sits above the commit. Building the tools and reading the base
@@ -4093,6 +4161,8 @@ class SessionManager:
         self._tools = new_tools_list
         self._schemas = new_schemas
         self._tools_tok = new_tools_tok
+        if self._skills_text is not None:
+            self._skills_text = skills_text
 
         log_cfg = fresh.get("logging") or {}
         if log_cfg.get("level"):

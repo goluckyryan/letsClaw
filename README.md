@@ -37,7 +37,7 @@ A stripped-down agent: a long-lived **core service** holding the conversations, 
 - **Modular** — base behavior always on, everything else a toggle in `config.yaml`.
 - **Transparent** — full source, no black boxes. What the model was sent is on disk, and the journal keeps the reasoning and the untruncated tool output beside it.
 - **Low energy** — a small footprint on a lab machine, no bloat. The WebUI has no build step, no `npm install` and no CDN, so it works on a box with no route out.
-- **Lean context** — nothing is injected behind your back. The window holds the three behavior layers (base + per-model + per-session), the tool schemas, and the conversation — and nothing else. `/info` accounts for all of it.
+- **Lean context** — nothing is injected behind your back. The window holds the three behavior layers (base + per-model + per-session), the skills catalog when skills are on, the tool schemas, and the conversation — and nothing else. `/info` accounts for all of it.
 
 **What it does**
 
@@ -50,6 +50,7 @@ A stripped-down agent: a long-lived **core service** holding the conversations, 
 - **Control of a turn in flight** — `/stop` interrupts it; `/steering` feeds it a correction without throwing away the work already done.
 - **Operable without a shell on the core's host** — `/reload` re-reads `config.yaml` into the running core, and `/restart` covers the few keys reload cannot reach.
 - **Spoken answers** — the WebUI can read its answers aloud through the speakers of the machine the browser is on, synthesized locally by piper on the core, so nothing is sent to a cloud voice. An answer with tables, code or formulas is first turned into a short spoken script, the screen keeps the full answer, one click or Escape stops it mid-sentence, and what was said is journaled beside the reasoning without ever entering the conversation. Optional — see [WebUI](#webui).
+- **Skills** — drop a `SKILL.md` into `skills/<name>/` and the model is told it exists: a catalog of names, descriptions and paths rides in the prompt, and the model reads the one it needs with `read_file`. A skill's body never enters the prompt, so a skill costs its one-line description until a task needs it. Off by default — see [`skills/README.md`](skills/README.md).
 - **Work it does in batches** — several independent file reads go out in one message and run together, so a task that needs five lookups costs five tool calls and not five trips to the model.
 
 ## Quick Start
@@ -203,6 +204,8 @@ The system prompt is four parts, in this order:
 2. **Per-model behavior** — one file per model entry, layered on top of the base.
 3. **Per-session behavior** — `models/sessions/<session name>.md`. Dropping the file in is the whole operation, and `ls models/sessions/` says which sessions are tuned. This is also how one Discord channel gets its own rules without the core knowing Discord exists: the bot names each session after its channel.
 4. **Continued session** — after a rollover, the handoff and the path of the previous window's journal.
+
+With `skills.enabled`, a **skills catalog** sits between 3 and 4: the name, description and path of each skill under `skills/`, so the model knows what it can read. It is a listing, never a skill's text, and `/behavior` shows it.
 
 No framework-injected boilerplate: if it is not in one of those files or in the conversation, it is not sent.
 
@@ -382,7 +385,8 @@ Every client understands these, except where a row says otherwise; five are hand
 | `/new` | **wipe everything** — the conversation *and* every transcript and journal this session has written. No undo |
 | `/model` , `/model <name>` | list the configured models, or switch this session to one. The bare form answers while a turn is running; the switch waits for it |
 | `/info` | the core's version, session name and id, recent history, context usage, output total |
-| `/behavior` | print the loaded behavior file |
+| `/behavior` | print the loaded behavior files, and the skills catalog this window was given |
+| `/skills` , `/skills <name>` | list the skills on disk and any that were skipped (with why), or print one skill's `SKILL.md`. Answers while a turn is running |
 | `/reasoning` | toggle live display of the model's thinking |
 | `/voice` , `/voice on` , `/voice off` , `/voice stop` | WebUI only: speak the answers you ask in this tab, through this machine's speakers. The bare form toggles; `stop` cuts off the answer being spoken and leaves voice on |
 | `/digest` , `/digest off` , `/digest collapse` , `/digest expand [all]` | per-session digest mode — the bare form reports it (and answers while a turn runs), `off`/`collapse` choose it for this session's life, `expand` restores the last collapsed turn from the journal, `expand all` every one |
@@ -489,7 +493,7 @@ cp config.example.yaml config.yaml     # config.yaml is gitignored — it holds 
 
 **[`config.example.yaml`](config.example.yaml) is the reference.** Every key is there inline with its default and what a change costs, and it is a template rather than a manual page, so it cannot go stale the way a list of keys can. Read it beside the reload table under [The Core](#the-core): the table says *which tier* a key is in, the file says *what the key does*.
 
-Eight sections, and one place to read each properly:
+Nine of the sections, and one place to read each properly:
 
 | section | what it is for |
 |---|---|
@@ -500,6 +504,7 @@ Eight sections, and one place to read each properly:
 | `conversation` | how long a session is kept, when it rolls over, and what gets written to disk |
 | `discord` | the bot, and the allowlist that decides who may talk to it. Omit the section entirely if you do not want a bot |
 | `logging` | how much log to keep |
+| `skills` | whether the model is offered the skills under `skills/` (off by default), which other directories to read skills from, and the caps on the catalog and on each skill — see [`skills/README.md`](skills/README.md) |
 | `voice` | the WebUI's spoken answers: the piper voice file, the caps on each request, and whether answers are rewritten into a spoken script first. Optional — omit it and the defaults apply |
 
 Two of them are worth more than a skim, because getting them wrong costs something other than a feature:

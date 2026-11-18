@@ -84,7 +84,7 @@ Six verbs, all JSON text frames keyed on `"t"`. Malformed JSON gets a non-fatal 
 
 **Commands** (`Session.command()`), name lowercased and a leading `/` stripped. Three groups, not two, and the third is the one that was being filed under the first:
 
-- **read-only**, reply to the asker: `info`, `behavior`, and the bare forms of `model` (the listing) and `digest` (the state) — answered above the busy guard, because the moment you want to know is while a turn is running. There is no separate `/models`: the listing is bare `/model`, and a second spelling of it would be a second command to keep in sync for no new answer.
+- **read-only**, reply to the asker: `info`, `behavior`, `skills`, and the bare forms of `model` (the listing) and `digest` (the state) — answered above the busy guard, because the moment you want to know is while a turn is running. There is no separate `/models`: the listing is bare `/model`, and a second spelling of it would be a second command to keep in sync for no new answer.
 - **manager-level**, above the busy guard and outside the turn lock: `reload`, `restart`. They act on the whole core rather than one session, and taking the turn lock here would deadlock — `reload` defers busy sessions, including the one that asked. Each does its own refusing instead: `reload` defers, `restart` reports every busy session by name and takes `force` to override
 - **turn-lock-taking**: `clear`, `rollover`, `new`, `model`, `digest` — these return `{"ok": false, "error": "a turn is running…"}` when busy. The last two are the pair that splits across the guard: their bare form reports and sits in the read-only group above, their argument form mutates and sits here.
 

@@ -23,6 +23,28 @@ behavior:
   # base.md does.
   session_dir: "models/sessions"
 
+# Skills — directories of know-how the model reads when a task matches one.
+# Each is skills/<name>/SKILL.md with a `description` in its YAML frontmatter.
+# On, every session's system prompt carries a catalog: each skill's name,
+# description and absolute path, never its body — the model opens the one it
+# wants with read_file. /behavior shows the catalog a window was given, /skills
+# lists what is on disk. An added or edited skill reaches a live session at its
+# next /clear, /rollover or /new; /reload says when one is waiting. See
+# skills/README.md.
+skills:
+  enabled: false        # off by default: the catalog is a per-prompt cost
+  # Roots, repo-relative unless absolute. An earlier root wins a name clash.
+  # A second root is read in place — another checkout's skill tree, say — and
+  # its prose goes into your agent's prompt, so name it deliberately.
+  dirs: [skills]
+  # Ceiling on the whole catalog. Over it, entries shrink in steps — short
+  # descriptions, then no descriptions, then names only, then one line saying
+  # where to look — and the catalog says which step it is on.
+  max_catalog_tokens: 1500
+  # A SKILL.md bigger than this is not listed (and the log says so): read_file
+  # clips at tools.max_output_chars, so a longer skill could not be read whole.
+  max_skill_chars: 8000
+
 # Model registry — every entry is self-contained: it names its own server, so
 # reading one entry tells you everything about that model.
 #   default_model: which entry to start with. A session may be started on

@@ -110,21 +110,22 @@ A session with nothing in it read `1979/262144` when that was measured. And `/cl
 
 It is easy to read the number above as a property of the install. It is not. It is a property of **this session, right now**, and it is better thought of as a step function — flat for long stretches, with a jump at each of the events below.
 
-Start with the fact that the "system message" is not one file. It is three layers concatenated, plus the handoff:
+Start with the fact that the "system message" is not one file. It is three layers concatenated, plus the skills catalog when skills are on, plus the handoff:
 
 ```
-  base.md  →  the model entry's behavior_file  →  models/sessions/<name>.md  →  carryover
+  base.md  →  the model entry's behavior_file  →  models/sessions/<name>.md  →  skills catalog  →  carryover
 ```
 
 The third layer is named for the session, so **two sessions on the same core have different floors** if either has a file of its own. For Discord that means one per channel.
 
-Four things move it:
+Five things move it:
 
 | what happens | what it does to the floor |
 |---|---|
 | **a rollover** | **raises** it — the handoff joins the system message, up to ~1,500 tokens. It does **not** stack: each handoff is written from the previous one and **replaces** it, so the floor steps up once and then stays roughly flat however many times you roll over. |
 | **`/model`** | **changes** it — `use_model()` rebuilds the system message, and the middle layer *is* the model's own behavior file. A different model is a different layer 2. |
 | **the `# Directives` group in base.md** | **does not raise it** — `strip_directive_sections()` cuts the group out of the base layer for every model, so the two directive templates cost nothing in the prompt and are billed only on the turn the core actually sends one. |
+| **`skills.enabled`** | **raises** it by the catalog — one line of name, description and path per skill, plus a preamble of about 150 tokens. Eight skills come to about 460 tokens, and `skills.max_catalog_tokens` (1,500 by default) caps it however many are installed. A skill's own text is never in the floor; it costs tokens only in the turn that reads it, as a tool result. |
 | **`/reload`** | **changes the schema half only.** See below. |
 
 **The reload asymmetry is worth knowing.** A reload updates `tools_tok` on every live session immediately, but deliberately leaves the system message alone — so a session that was running when you reloaded is carrying **new schemas and an old system message**, and will be until its next rollover, `/clear` or `/new`.

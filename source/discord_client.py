@@ -147,7 +147,7 @@ NO = {"n", "no"}
 COMMAND_WORDS = {
     "info", "model", "new", "rollover", "clear", "behavior", "stop",
     "reload", "restart", "session", "help", "commands", "quit", "exit",
-    "reasoning", "digest",
+    "reasoning", "digest", "skills",
 }
 # Discord's own client captures a leading "/" into its slash-command picker, and
 # with no application commands registered the message can end up never being
@@ -165,6 +165,7 @@ HELP = (
     "handoff forward\n"
     "`!new` **wipe everything**, archives included · `!behavior` the loaded "
     "behavior files\n"
+    "`!skills [name]` the skills on offer, or one skill's SKILL.md\n"
     "`!stop` interrupt the turn in progress · `!reload` re-read config.yaml · "
     "`!restart` restart the core process (I am a separate process and stay "
     "up)\n"
@@ -1446,7 +1447,22 @@ class ChannelBridge:
             if per_session:
                 where = f" ({event['session']})" if event.get("session") else ""
                 out.append(f"**Session behavior**{where}\n{per_session}")
+            if event.get("skills"):
+                out.append(f"**Skills catalog**\n{event['skills']}")
             return "\n\n".join(out)
+        if "skill_list" in event:
+            skills = event["skill_list"]
+            head = (f"🧰 **{len(skills)} skill(s)**" if event.get("skills_enabled")
+                    else f"🧰 **skills are off** (skills.enabled) — {len(skills)} "
+                         "on disk, none offered to the model")
+            out = [head] + [f"{i}. `{r}`" for i, r in
+                            enumerate(event.get("skill_roots") or [], 1)]
+            out += [f"• **{k['name']}** — {k['description']}" for k in skills] \
+                or ["_none found_"]
+            out += [f"⚠️ `{w}`" for w in event.get("skill_warnings") or []]
+            return "\n".join(out)
+        if "skill_text" in event:
+            return f"🧰 **{event['skill']}** — `{event['path']}`\n\n{event['skill_text']}"
         if "digest" in event:
             # Bare /digest: the read-only half. The off/collapse replies carry
             # nothing but ok — their line is the session_state broadcast.
@@ -2273,6 +2289,12 @@ class LetsClawBot(discord.Client):
         # The bot is a sibling process of the core, not a child of it: this
         # restarts the core and the link reconnects on its own backoff.
         simple("restart", "restart the core process (refuses while a turn runs)")
+
+        @tree.command(name="skills",
+                      description="the skills on offer, or one skill's SKILL.md")
+        @app_commands.describe(name="leave blank for the list")
+        async def _skills(interaction: discord.Interaction, name: str = ""):
+            await self.run_slash(interaction, "skills", name)
 
         @tree.command(name="digest",
                       description="digest mode — the report, or off / collapse "

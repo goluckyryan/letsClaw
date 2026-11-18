@@ -14,7 +14,7 @@
 
 ## Read in this order
 
-1. **[architecture.md](architecture.md)** — the module map, the turn lifecycle, the tool layer, the thinking pad, the behavior layers, rollover, the digest, config reload, the disk layer. Start here. It ends with a numbered list of traps that is worth reading even if you skip the rest.
+1. **[architecture.md](architecture.md)** — the module map, the turn lifecycle, the tool layer, the thinking pad, the behavior layers and the skills catalog, rollover, the digest, config reload, the disk layer. Start here. It ends with a numbered list of traps that is worth reading even if you skip the rest.
 2. **[design-principles.md](design-principles.md)** — the 20 rules the codebase actually follows, each with its evidence, plus an honest section on where they are strained. Read this before proposing a change, so it lands with the grain.
 3. **[protocol.md](protocol.md)** — the WebSocket and HTTP reference. Needed if you touch `server.py`, any client, or any event.
 4. **[clients.md](clients.md)** — what the terminal, browser and Discord clients each do, and what they duplicate.
@@ -36,5 +36,5 @@ A long-lived core process (`source/server.py` + `source/core.py`) holds every co
 - **Every configuration key** — `config.example.yaml`, which is the template you copy, and therefore the one place a key cannot be out of date. The README names the sections; the comments in the template say what each key does and what happens if you set it wrong.
 - **`config.yaml`** — gitignored; it holds the API key and the Discord bot token. Do not commit it or quote it.
 - **`tests/`** — gitignored, so a fresh clone has no test suite and nothing in these pages points into it. The checks that keep this documentation honest live there, which means they do not travel with a clone: a fork inherits the prose and none of the gates.
-- **[webcam-voice-plan.md](webcam-voice-plan.md)** and **[skill-plan.md](skill-plan.md)** — plans, not descriptions of shipped code, and so not in the reading order above. They name functions, devices and files that do not exist yet, which is what a plan is for; the pages above describe only what exists. They become a doc section when the code they describe ships. Shorter items wait in `models/todo.md`.
+- **[webcam-voice-plan.md](webcam-voice-plan.md)** — a plan, not a description of shipped code, and so not in the reading order above. It names functions, devices and files that do not exist yet, which is what a plan is for; the pages above describe only what exists. A plan becomes a doc section when the code it describes ships. Shorter items wait in `models/todo.md`.
 - **Open work** — `models/todo.md`.

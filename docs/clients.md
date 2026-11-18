@@ -151,7 +151,7 @@ The `reason` never reaches the handler; it exists only to be shown. The choice i
 
 ### Commands
 
-The slash commands work as plain messages: `/info`, `/model [name]`, `/rollover`, `/new`, `/clear`, `/behavior`, `/stop`, `/reload`, `/restart`, `/session [name]`, plus a local `/help`. Neither `/session` nor `/steering` is shared by all three: here `/session` maps a *channel* to a session, the terminal's moves its one window, and the browser has none (its sidebar switches); `/steering` is terminal and WebUI only. `/restart` restarts the **core** — the bot is a separate process, stays up, and reconnects on its own backoff.
+The slash commands work as plain messages: `/info`, `/model [name]`, `/rollover`, `/new`, `/clear`, `/behavior`, `/skills [name]`, `/stop`, `/reload`, `/restart`, `/session [name]`, plus a local `/help`. Neither `/session` nor `/steering` is shared by all three: here `/session` maps a *channel* to a session, the terminal's moves its one window, and the browser has none (its sidebar switches); `/steering` is terminal and WebUI only. `/restart` restarts the **core** — the bot is a separate process, stays up, and reconnects on its own backoff.
 
 Slash commands are registered as a real `app_commands.CommandTree` (`_format_info()`), synced per guild (immediate) and globally (needed for DMs, up to an hour to propagate), guarded to run once per process rather than per reconnect.
 
@@ -173,7 +173,7 @@ The 📄 button is a three-position wheel in the think button's style — **off*
 
 **Shared:** the protocol constant (in the two Python clients), and `source/chunker.py` — one file rather than a copy per client, though the bot is currently its only importer.
 
-**Duplicated:** everything else. Each of `/info`, `/behavior`, `/model`, `/reload`, `rollover_ask`, `session_state` and `stats` has **two or three independent renderers**.
+**Duplicated:** everything else. Each of `/info`, `/behavior`, `/skills`, `/model`, `/reload`, `rollover_ask`, `session_state` and `stats` has **two or three independent renderers**.
 
 This is the codebase's real maintenance tax, and it is worth naming plainly: **adding a field to a command's reply means editing up to three renderers, and nothing will tell you if you miss one.** The core returns one dict and no code checks that the three renderers agree about it. The *command lists* are the near neighbour of that bug — three separate listings of what a client accepts, which is how `/models` came to be reachable in the terminal and on Discord while the WebUI rejected it outright, `app.js`'s `COMMANDS` being a hard gate rather than a help table. See [architecture.md](architecture.md#the-command-node-is-a-listing-and-the-listings-are-many).
 

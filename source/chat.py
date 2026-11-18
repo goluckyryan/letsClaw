@@ -61,6 +61,7 @@ COMMANDS = {
     "/model": "list models, or /model <name> to switch",
     "/info": "recent history and context usage",
     "/behavior": "print the loaded behavior files (base + model + session)",
+    "/skills": "list the skills, or /skills <name> to print its SKILL.md",
     "/digest":    "off | collapse | expand [all] — turn's working-out, per session",
     "/reasoning": "toggle live display of the model's thinking",
     "/stop": "interrupt the turn in progress",
@@ -445,6 +446,23 @@ class Renderer:
             for w in srv.get("warnings") or []:
                 self.line(f"     ⚠️  {w}")
 
+    def show_skills(self, r):
+        """The bare /skills reply: what the roots offer on disk now."""
+        skills = r.get("skill_list") or []
+        if r.get("skills_enabled"):
+            self.line(f"\n🧰 {len(skills)} skill(s):")
+        else:
+            self.line(f"\n🧰 Skills are off (skills.enabled) — {len(skills)} on "
+                      "disk, none offered to the model:")
+        for i, root in enumerate(r.get("skill_roots") or [], 1):
+            self.line(f"   {i}. {root}")
+        for k in skills:
+            self.line(f"  • {k['name']} — {k['description']}")
+        if not skills:
+            self.line("  (none found)")
+        for w in r.get("skill_warnings") or []:
+            self.line(f"  ⚠️  {w}")
+
     def show_reload(self, r):
         changed = r.get("changed") or []
         if not changed:
@@ -621,9 +639,16 @@ async def run_client(url, session_name, render, token=""):
                             sess = f" ({e['session']})" if e.get("session") else ""
                             render.line(f"\n📄 Session behavior{sess}:\n"
                                         f"{e['session_behavior']}")
+                        if e.get("skills"):
+                            render.line(f"\n🧰 Skills catalog:\n{e['skills']}")
                         if not any(e.get(k) for k in
                                    ("base", "behavior", "session_behavior")):
                             render.line("\nNo behavior file loaded.")
+                    elif "skill_list" in e:
+                        render.show_skills(e)
+                    elif "skill_text" in e:
+                        render.line(f"\n🧰 {e['skill']} — {e['path']}\n"
+                                    f"{e['skill_text']}")
                     elif "configured" in e:
                         render.line(f"\n🤖 Current: {e.get('current')}")
                         render.line(f"📋 Configured models: {', '.join(e['configured']) or '(none)'}")

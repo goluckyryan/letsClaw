@@ -24,6 +24,7 @@ const COMMANDS = {
   '/model':     'list models, or /model <name> to switch',
   '/info':      'recent history and context usage',
   '/behavior':  'print the loaded behavior files (base + model + session)',
+  '/skills':    'list the skills, or /skills <name> to print its SKILL.md',
   '/digest':    'off | collapse | expand [all] — collapse finished turns, per session',
   '/reasoning': "cycle the model's thinking: off → folded → open (or name one)",
   '/voice':     'on | off | stop — speak the answers you ask in this tab',
@@ -1950,7 +1951,14 @@ function response(e) {
       md += `**session** (${e.session || 'this session'})\n\`\`\`markdown\n`
           + e.session_behavior + '\n```\n';
     }
+    if (e.skills) md += '**skills catalog**\n```markdown\n' + e.skills + '\n```\n';
     return msg('llm', '📄', renderMd(md || '_No behavior file loaded._'));
+  }
+  if (e.skill_list) return showSkills(e);
+  if ('skill_text' in e) {
+    // A SKILL.md is a Markdown document, so it is rendered as one rather than
+    // fenced: its own code blocks would close a fence early.
+    return msg('llm', '🧰', renderMd(`**${e.skill}** — \`${e.path}\`\n\n` + e.skill_text));
   }
   if (e.configured) {
     return notice(`🤖 current: ${e.current}   ·   configured: ${e.configured.join(', ') || '(none)'}`);
@@ -1972,6 +1980,22 @@ function response(e) {
     // button's on-collapse click is silent and gets no line of its own.
     return notice('📄 nothing to expand — no collapsed turn in the window');
   }
+}
+
+/* The bare /skills reply: what the configured roots offer on disk now. What a
+   window was actually told is /behavior's skills catalog — the two differ after
+   a skill is added, until the next rollover, /clear or /new. */
+function showSkills(e) {
+  const list = e.skill_list || [];
+  let md = e.skills_enabled
+    ? `**${list.length} skill${list.length === 1 ? '' : 's'}**`
+    : `**skills are off** (skills.enabled) — ${list.length} on disk, none offered to the model`;
+  md += '\n\n' + (e.skill_roots || []).map((r, i) => `${i + 1}. \`${r}\``).join('\n') + '\n\n';
+  md += list.map(k => `- **${k.name}** — ${k.description}`).join('\n') || '_No skills found._';
+  if ((e.skill_warnings || []).length) {
+    md += '\n\n**not listed:**\n' + e.skill_warnings.map(w => `- \`${w}\``).join('\n');
+  }
+  return msg('llm', '🧰', renderMd(md));
 }
 
 function showReload(e) {
@@ -2591,6 +2615,7 @@ $('#btn-digest').onclick = () => clickDigest();
 $('#btn-voice').onclick = () => clickVoice();
 $('#btn-info').onclick = () => rpc('info').catch(() => {});
 $('#btn-behavior').onclick = () => rpc('behavior').catch(() => {});
+$('#btn-skills').onclick = () => rpc('skills').catch(() => {});
 
 $('#btn-clear').onclick = () => {
   if (confirm('Forget this conversation? The archives are kept — /rollover carries a summary forward instead.')) rpc('clear').catch(() => {});

@@ -24,7 +24,7 @@ graph TD
     end
 
     subgraph Modules
-        Cmds[Commands\n/clear /rollover /new /info /model\n/behavior /reasoning /stop /steering\n/reload /restart /session /digest /voice]
+        Cmds[Commands\n/clear /rollover /new /info /model\n/behavior /skills /reasoning /stop /steering\n/reload /restart /session /digest /voice]
         TokenCounter[Token Counter\ntoken_counter.py\nper-message stats]
         ThinkingUI[Thinking indicator\nui.py\nlive spinner + TTFT]
         Tools[Tool executor\ntools.py\nexec / read / write / list]
@@ -84,12 +84,13 @@ Two names in that node are not core commands: `/session` lives in the clients �
 
 | file | lines | owns |
 |---|---|---|
-| `source/core.py` | 4523 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
+| `source/core.py` | 4593 | **the engine.** `Session` (one conversation), `SessionManager` (all of them), config reload, rollover, the thinking pad, commands |
 | `source/session.py` | 891 | **the disk layer.** Live store, archives, the journal, the handoff summariser, the id registry |
 | `source/server.py` | 1368 | **the transport.** aiohttp routes, the WebSocket handler, the Host and Origin guards, auth, backpressure |
 | `source/llm_engine.py` | 1170 | **the model.** Two transports (`chat` and `raw`), streaming, tool-call parsing, resume |
 | `source/config.py` | 602 | **config.yaml → engines.** Loading, the webui presentation keys, number coercion, `build_all_engines` (which doubles as the validator), and the reload diff. Touches no `Session`, which is why it is not in `core`. `build_engine()` passes the constructor the transport and the generation options it forwards (`base_url`, `api_key`, `provider_name`, `timeout`, `temperature`, `max_tokens`, `top_p`), then assigns the eight **policy** attributes onto the instance: `context_length`, `max_output`, `turn_timeout`, `reasoning`, `answer_time_reserve`, `max_pad_compactions`, `resume_mode`, `reasoning_effort`. The split is deliberate and easy to get wrong: `LLMEngine.__init__` takes `**kwargs` straight into `extra_params`, which `get_model_params()` forwards to `chat.completions.create()`, so a policy key handed to the constructor is sent to the server as a generation option instead of configuring the session — and is silently accepted. That is where a ninth belongs. Grepping `llm_engine.py` for `max_pad_compactions` finds nothing, because the name is only ever assigned from outside |
 | `source/behavior.py` | 359 | **the behavior layers.** `BehaviorStore`, the read-through cache behind a lock, and the three directives extracted out of `base.md` |
+| `source/skills.py` | 295 | **the skills catalog.** `SkillCatalog` scans the `skills.dirs` roots, parses each `SKILL.md`'s frontmatter, and renders the catalog block within `skills.max_catalog_tokens`. Synchronous and pure — no asyncio, no session — so the core calls it through `asyncio.to_thread`. See [Skills](#skills-a-catalog-never-a-body) |
 | `source/config_edit.py` | 289 | rewriting the `webui:` block of `config.yaml` **as text**, so the file's comments survive a save |
 | `source/ssh_forward.py` | 732 | **model servers over ssh.** One supervised `ssh -N -L` child per model entry that names an `ssh_forward`, on a port the core picks itself |
 | `source/tools.py` | 957 | `exec`, `read_file`, `write_file`, `list_dir`, `show_image`, the search and edit tools, … and their JSON schemas |
@@ -99,11 +100,11 @@ Two names in that node are not core commands: `/session` lives in the clients �
 | `source/paths.py` | 151 | `REPO_ROOT` and `resolve()` — [principle 15](design-principles.md#15-one-definition-of-where-the-repo-is) |
 | `source/version.py` | 25 | `__version__` — the release number, and the only place it lives. Separate from `PROTOCOL_VERSION` in `core.py`: that says whether a client can talk to the core at all, this says which build is running. **Every commit bumps it**, because several agents commit to this tree and a number that moves on judgement of "worth a bump?" stops moving |
 | `source/chunker.py` | 307 | fence-aware message splitting; separate so it tests without `discord.py` |
-| `source/chat.py` | 875 | the terminal client |
+| `source/chat.py` | 900 | the terminal client |
 | `source/ui.py` | 86 | the terminal client's spinner and TTFT line |
-| `source/discord_client.py` | 2617 | the Discord client |
+| `source/discord_client.py` | 2639 | the Discord client |
 | `source/discord_probe.py` | 49 | **"should the bot be started?", answered once.** `serve.sh` and `install.sh` both run it and read the verdict off the exit code, because the answer depends on the config, the token and the core's URL and one copy of that logic cannot disagree with itself |
-| `web/` | 3393 (`app.js`) | the browser client (`index.html`, `app.js`, `style.css`) — vanilla JS, no build step |
+| `web/` | 3418 (`app.js`) | the browser client (`index.html`, `app.js`, `style.css`) — vanilla JS, no build step |
 
 These are `wc -l`, not estimates. The column is only worth having while it is exact: a `~` in front of every figure lets it be wrong by a third without failing anything, so if you would rather not maintain it, drop the column rather than soften the numbers again.
 
@@ -119,6 +120,7 @@ letsClaw/
   config.example.yaml      the documented template to copy from
   models/                  behavior Markdown: base.md + per-model
     sessions/                per-session layer; every file gitignored but its README
+  skills/                  <name>/SKILL.md know-how the model reads on demand (tracked)
   web/                     browser client: index.html, app.js, style.css, vendor/
   source/                  all Python (the table above)
   state/                   live conversations, archives, journals, pictures, memory
@@ -147,7 +149,7 @@ Two things worth knowing about this shape:
 
 ### `Session` — one conversation
 
-Holds `history`, `engine`, the three behavior layers, per-session policy, and the set of attached `Subscriber`s.
+Holds `history`, `engine`, the three behavior layers, the skills catalog it was built with (`skills_block`), per-session policy, and the set of attached `Subscriber`s.
 
 **Policy is copied per session, never read live off the shared config dict** (`Session.__init__()`). A session that disables its own rollover must not disable everyone else's.
 
@@ -163,7 +165,7 @@ A bounded `deque` (`maxlen=2000`) plus a wake event. `push()` drops `reasoning` 
 
 ### `SessionManager` — all of them
 
-Owns the sessions dict, the engine cache, the behavior-file cache, tools and their schemas (built **once** per core, not per session), and the two directive templates.
+Owns the sessions dict, the engine cache, the behavior-file cache, the skills cache (`SkillCatalog`), tools and their schemas (built **once** per core, not per session), and the two directive templates.
 
 Notable methods: `get` (create on demand), `restore` (eager at startup), `reload`, `rename`, `delete`, `session_behavior_path`, `close`.
 
@@ -300,14 +302,15 @@ Two costs a new tool pays silently. Blocking work must go off the event loop ([p
 content = self.base_behavior                                    # models/base.md
 if self.behavior:         content += "\n=== BEHAVIOR ===\n" + self.behavior
 if self.session_behavior: content += SESSION_MARKER + self.session_behavior
+if self.skills_block:     content += SKILLS_MARKER + self.skills_block   # a listing, not a layer
 if carryover:             content += CARRYOVER_MARKER + carryover
 ```
 
-**The ordering is load-bearing.** `carryover()` recovers layer 4 by partitioning on `CARRYOVER_MARKER` and taking everything *after* it. Anything appended below would be read back as part of the handoff and re-appended on the next rebuild — growing the prompt every turn.
+**The ordering is load-bearing.** `carryover()` recovers layer 4 by partitioning on `CARRYOVER_MARKER` and taking everything *after* it. Anything appended below would be read back as part of the handoff and re-appended on the next rebuild — growing the prompt every turn. That is why the skills catalog sits above the marker, not at the end where an addition would naturally go.
 
 Corollary: a session-behavior file containing the literal string `=== CONTINUED SESSION ===` will silently corrupt this.
 
-**Three places rebuild `history[0]`, and each must round-trip `carryover()`:** `reload_session_behavior()`, `roll_over()`, `use_model()`. `restore()` avoids the problem differently — by assigning history *after* `use_model`, which would otherwise destroy the carryover.
+**Three places rebuild `history[0]`, and each must round-trip `carryover()`:** `reload_session_behavior()`, `roll_over()`, `use_model()`. `use_model()` and `refresh_behavior()` are also where `skills_block` is set — `use_model()` because `SessionManager.get` and `restore` build every session through it. `restore()` avoids the problem differently — by assigning history *after* `use_model`, which would otherwise destroy the carryover.
 
 `apply_config` is deliberately **not** a fourth: it leaves `history` alone on purpose, because the prefix it would rebuild is the one the server has already tokenised, and rebuilding it mid-conversation costs every live session its KV cache for a behavior edit it did not ask for. An edited file is picked up instead by `refresh_behavior()` at the next rollover, `/clear` or `/new` — the paths that were going to replace the prefix anyway.
 
@@ -329,6 +332,34 @@ The rollover summariser never sees the three layers: they are re-read verbatim i
 The third layer is keyed on the **session name**, which is what makes a per-Discord-channel file work without the core knowing Discord exists — the bot names each session after its channel (`auto_names` → `dudus-den-solaris`), so `models/sessions/dudus-den-solaris.md` is that channel's file. The same mechanism covers `terminal.md` and any WebUI session, which a channel-id-keyed design would have excluded. A directory rather than a config map, because sessions spring into existence on attach: dropping the file in is the whole operation.
 
 The name becomes a filename by the same rule `state/` uses — everything outside `[A-Za-z0-9-_.]` becomes `_` — and the result must sit directly in `session_dir` or it is refused. Both guards matter: `?session=` is not validated on attach (trap 11), so a session named `../../etc/passwd` can exist, and this is the one place a session name becomes a path that is *read*. `session_behavior_path()` is where that rule lives; replicate it if you add another.
+
+### Skills: a catalog, never a body
+
+A skill is a directory under one of the `skills.dirs` roots holding a `SKILL.md` with a `description` in its YAML frontmatter (`skills/README.md` is the author's page). With `skills.enabled: true`, the system message carries a catalog: a short preamble telling the model when to read one, the roots, and one entry per skill — name, description, absolute path. The model opens the skill it wants with `read_file`. **No skill body is ever put in the prompt.** That is [principle 3](design-principles.md#3-no-hidden-token-injection): a catalog is a listing, shown by `/behavior` and counted in `history[0]` like the layers around it, whereas injecting the body of whichever skill a keyword matched would be a silent per-prompt addition chosen by string comparison — and a wrong skill in the prompt is a wrong instruction.
+
+There is no skill tool. `read_file` already reads any path, and one more tool schema would be paid by every prompt of every session whether or not it has skills, where the catalog is paid only by an install that turns skills on. A skill body comes back through `read_file`'s clip like any other file, which is why `skills.max_skill_chars` defaults to the same 8 000 as `tools.max_output_chars`: a skill over it is not listed, and the log names it, so nothing in the catalog is too long to read in one go.
+
+**Loading.** `SkillCatalog.scan()` lists each root's immediate subdirectories and nothing deeper — a `SKILL.md` one level down is reported, not half-loaded. The name is the directory's, checked against `^[a-z0-9][a-z0-9._-]*$`; a frontmatter `name` that disagrees is a warning, not an override. The `SKILL.md` must resolve inside its root, so a symlink out of it is not followed. A file with no frontmatter, frontmatter that is not a YAML mapping, no `description`, or too many characters is skipped with a warning naming it; nothing in a skill file can raise out of the scan. An earlier root wins a name clash and the loser is named. Entries are sorted by name, so two identical installs produce byte-identical prompts.
+
+**Caching.** Each scan stats every `SKILL.md` and re-reads only those whose `(mtime, size)` moved, so an edited skill is noticed, not only an added one. Its own `{path: (stamp, Skill)}` map rather than a corner of `BehaviorStore`, because that class keys file *contents* by path and a catalog is not a file. Warnings are logged once each, not on every session creation.
+
+**The budget ladder.** `skills.max_catalog_tokens` (default 1 500) caps the whole block. Over it, `render()` steps down until one fits, and every rung below the first says which it is — a model that cannot see the catalog was cut would not go looking for what is missing:
+
+| rung | each entry |
+|---|---|
+| 0 | name, full description, path |
+| 1 | description cut to 200 characters at a word boundary |
+| 2 | name and path |
+| 3 | names only, grouped under their root |
+| 4 | no entries — one line naming the count and the roots to `list_dir` |
+
+Descriptions go before paths because losing a description costs the model its judgement of which skill applies, while losing the path costs it the ability to open one. Measured against a 55-skill borrowed tree, rung 0 is about 3 400 tokens and rung 2 about 1 350; eight hand-written skills fit rung 0 in under 500.
+
+**When it moves.** Exactly when the behavior layers do. `use_model()` sets `skills_block` when a session is built, and `refresh_behavior()` re-reads it at a rollover, `/clear` or `/new`, adding "skills catalog" to its "behavior re-read from disk" notice when it changed. `/reload` re-scans and reports `skills catalog: edited — applies at the next rollover, /clear or /new`, and leaves every live window alone, for the KV-cache reason below. The rollover summariser never sees the catalog, because it is above the carryover marker with the layers.
+
+**Commands.** `/behavior` returns the catalog the window was given, as `skills`. `/skills` lists what the roots offer on disk now, with the warnings, and `/skills <name>` returns that `SKILL.md`. Both are read-only and sit above the busy guard. The two can differ between a skill being added and the next rebuild, which is the point of having both.
+
+A borrowed root is somebody else's prose inside your agent's prompt, at the same trust level as `models/sessions/*.md`. That is why `dirs` is a list of explicit paths and never a pattern, and why `enabled` defaults to false.
 
 ### What `base.md` commits the model to
 

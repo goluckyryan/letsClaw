@@ -124,6 +124,7 @@ source/llm_engine.py     the OpenAI-compatible chat client + the reasoning pad
 source/server.py         the aiohttp WS/HTTP server, serves the WebUI
 source/config.py         config.yaml → engines; building them is the validation
 source/behavior.py       the behavior-file cache and the two base.md directives
+source/skills.py         the skills catalog: scan skills/*/SKILL.md, render the listing
 source/config_edit.py    saving the webui: block back into config.yaml as text
 source/logging_setup.py  one rotating log file per writer (core, bot)
 source/ssh_forward.py    supervised `ssh -N -L` forwards for remote model servers
@@ -138,6 +139,7 @@ source/version.py        `__version__` — the one place the release number live
 web/                     the WebUI (vanilla JS, no build)
 models/base.md           the base behavior file (committed)
 models/sessions/*.md     per-session behavior + archived transcripts (gitignored)
+skills/<name>/SKILL.md   skills the model reads on demand (tracked; off until skills.enabled)
 config.example.yaml      the documented config template (committed)
 config.yaml              your config (gitignored)
 state/                   live conversations, archives, memory (gitignored)
