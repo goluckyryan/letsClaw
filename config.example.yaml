@@ -146,15 +146,36 @@ models:
     #                      whole path here rather than in ~/.ssh/config is what
     #                      makes the entry work on a fresh machine holding only
     #                      the ssh keys.
+    #   ssh_port:          the port sshd listens on at the destination, on the
+    #                      address the target names. 22 is the default —
+    #                      omit it and the spawn is byte-identical to what it
+    #                      always was. With ssh_jump, it is dialled from the
+    #                      jump host, so it is the port as the jump host
+    #                      sees the destination.
+    #   ssh_jump_port:     the port sshd listens on at the jump host. 22 is
+    #                      the default; ignored (with a warning) without
+    #                      ssh_jump.
     #   ssh_remote_port:   the port on the ssh_forward destination — always that
     #                      host's own loopback, so just the number.
     #                      (Legacy ssh_remote: "host:port" is still read; the
     #                      host half is ignored.)
-    # ssh_forward: "someone@10.0.0.5"
-    # ssh_jump: "jump@192.168.203.52"
+    # Every port is a whole number from 1 to 65535; anything else stops the
+    # core from starting, or refuses the /reload, naming the key.
+    #
+    # Direct, e.g. through a router that port-forwards 2202 to the
+    # destination's sshd:
+    # ssh_forward: "someone@192.168.203.52"
+    # ssh_port: 2202
     # ssh_remote_port: 8888
     #
-    # /models reports each forward as {target, jump, remote, local, pid}; a
+    # Through a jump host:
+    # ssh_forward: "someone@10.0.0.5"
+    # ssh_jump: "jump@192.168.203.52"
+    # ssh_jump_port: 22
+    # ssh_remote_port: 8888
+    #
+    # /models reports each forward as
+    # {target, ssh_port, jump, ssh_jump_port, remote, local, pid}; a
     # missing pid means the path is down. The startup banner prints the full
     # path for each and warns if the `ssh` binary is not installed at all.
   # Example: a second model on another server (e.g. llama.cpp + GGUF)

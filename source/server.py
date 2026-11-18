@@ -986,9 +986,17 @@ async def _on_startup(app):
         app["mgr"]._engine_ports,
         app["config"].get("core", {}).get("ssh_health_sec"))
     for name, st in app["mgr"].forwards.status().items():
-        via = st["target"] + (f" via {st['jump']}" if st["jump"] else "")
-        print(f"   forward: {name} {st['local']} -> {st['remote']} "
-              f"(via {via})")
+        # The same route spelling as SSHForward._path() in the log: each sshd
+        # port is named only when it is not 22.
+        dest = st["target"] + (f" port {st['ssh_port']}"
+                               if st["ssh_port"] != 22 else "")
+        via = ""
+        if st["jump"]:
+            jport = (f" port {st['ssh_jump_port']}"
+                     if st["ssh_jump_port"] != 22 else "")
+            via = f" (via {st['jump']}{jport})"
+        print(f"   forward: {name} {st['local']} -> {dest} -> "
+              f"{st['remote']}{via}")
     if app["mgr"].forwards.status() and shutil.which("ssh") is None:
         print("   WARNING: no 'ssh' binary found — the ssh_forward models "
               "will not work on this machine")

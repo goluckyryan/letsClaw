@@ -3,19 +3,36 @@
 A model entry may name an `ssh_forward` beside its `base_url`:
 
     qwen38-flash-helios:
-      base_url: "http://127.0.0.1:18888/v1"   # the port is IGNORED when
-      ssh_forward: "heliosspark@192.168.1.101"  # ssh_forward is set — the core
-      ssh_jump: "helios@192.168.203.52"         # assigns its own local port
-      ssh_remote_port: 8888                     # the port on the destination
+      # base_url's port is IGNORED when ssh_forward is set: the core
+      # assigns its own local port.
+      base_url: "http://127.0.0.1:18888/v1"
+      ssh_forward: "heliosspark@192.168.203.52"
+      ssh_port: 2202           # sshd at the destination (22 if absent)
+      ssh_remote_port: 8888    # the service, on the destination's loopback
+
+or, for a destination reachable only through a jump host:
+
+      ssh_forward: "heliosspark@192.168.0.101"
+      ssh_jump: "helios@192.168.203.52"
+      ssh_jump_port: 22        # sshd at the jump host (22 if absent)
+      ssh_remote_port: 8888
 
 The entry is self-contained: `ssh_forward` is the destination as ssh takes it
 (user@ip, bare ip, or — if the machine has an alias — an alias), and
 `ssh_jump` is an optional jump host (user@ip or ip). `ssh_remote_port` is
 the port the service listens on at the destination — always its own loopback,
-so the port alone is all there is to name. Nothing is read from ~/.ssh/config,
-so the model works on a fresh machine that has only the ssh keys. `ssh_jump` is spelled out as a ProxyCommand rather than -J because a
--J drops command-line options on the inner hop — and some jump hosts run old
-sshd that only offers ssh-rsa, which the inner hop must be told to accept.
+so the port alone is all there is to name. `ssh_port` is the port sshd
+itself listens on at the destination, and `ssh_jump_port` the one sshd
+listens on at the jump host — each 22 when absent, so a config that never
+needed them does not mention them. With a jump, the destination is dialled
+from the jump host (`-W %h:%p`), so `ssh_port` is the destination's port as
+the jump host sees it. Every port must be a whole number from 1 to 65535; a
+config that says otherwise refuses to load rather than spawning an ssh that
+cannot work. Nothing is read from ~/.ssh/config, so the model works on a
+fresh machine that has only the ssh keys. `ssh_jump` is spelled out as a
+ProxyCommand rather than -J because a -J drops command-line options on the
+inner hop — and some jump hosts run old sshd that only offers ssh-rsa, which
+the inner hop must be told to accept.
 
 The core spawns `ssh -N -L 127.0.0.1:<port>:127.0.0.1:<remote_port> <target>` itself and
 points the engine at the local end. The port is picked by the core at startup
@@ -129,7 +146,7 @@ class SSHForward:
     """
 
     def __init__(self, name, target, remote_port, jump=None, model_id=None,
-                 local_port=0):
+                 ssh_port=22, ssh_jump_port=22, local_port=0):
         self.name = name
         self.target = target
         # The port the service listens on at the destination, on its own
@@ -141,6 +158,12 @@ class SSHForward:
         # provider_name, or the entry's own name). It is what makes "is this
         # port ours?" answerable — see _far_side_is_ours().
         self.model_id = model_id
+        # The port sshd listens on at the destination, on the address the
+        # target names. 22 = the default, so -p is added only when it is not.
+        self.ssh_port = int(ssh_port)
+        # The port sshd listens on at the jump host. Meaningless without a
+        # jump; _wanted() pins it to 22 then, so it cannot cause a respawn.
+        self.ssh_jump_port = int(ssh_jump_port)
         self.local_port = int(local_port) or pick_free_port()
         self._proc = None
         self._lock = asyncio.Lock()
@@ -191,20 +214,38 @@ class SSHForward:
                     "-o", "PubKeyAcceptedAlgorithms=+ssh-rsa"]
             if juser:
                 jcmd += ["-l", juser]
+            if self.ssh_jump_port != 22:
+                jcmd += ["-p", str(self.ssh_jump_port)]
             jcmd += ["-W", "%h:%p", jhost]
             cmd += ["-o", "ProxyCommand=" + " ".join(jcmd)]
         remote = f"127.0.0.1:{self.remote_port}"
-        cmd += ["-N", "-L", f"127.0.0.1:{self.local_port}:{remote}",
-                self.target]
+        cmd += ["-N", "-L", f"127.0.0.1:{self.local_port}:{remote}"]
+        if self.ssh_port != 22:
+            cmd += ["-p", str(self.ssh_port)]
+        cmd.append(self.target)
         return cmd
+
+    def _path(self):
+        """The whole route in one line, for every log line and error that
+        names it: local end, destination (with its sshd port when not 22),
+        far end, and the jump (likewise) when there is one. One spelling, so
+        the line that says a forward failed names the same ports as the line
+        that said it was starting."""
+        dest = self.target
+        if self.ssh_port != 22:
+            dest += f" port {self.ssh_port}"
+        via = ""
+        if self.jump:
+            via = f" (via {self.jump}"
+            if self.ssh_jump_port != 22:
+                via += f" port {self.ssh_jump_port}"
+            via += ")"
+        return (f"127.0.0.1:{self.local_port} -> {dest} -> "
+                f"127.0.0.1:{self.remote_port}{via}")
 
     def _spawn(self):
         cmd = self._spawn_cmd()
-        remote = f"127.0.0.1:{self.remote_port}"
-        via = f" (via {self.jump})" if self.jump else ""
-        logger.info("ssh forward %s: %s -> %s (via %s)%s", self.name,
-                    f"127.0.0.1:{self.local_port}", remote,
-                    self.target, via)
+        logger.info("ssh forward %s: %s", self.name, self._path())
         # preexec_fn is only passed when we are on the main thread, so a fork
         # from a worker never arms PDEATHSIG against that worker's lifetime.
         # The alternative — always passing it — would kill a healthy tunnel the
@@ -401,19 +442,14 @@ class SSHForward:
             # engine-build path is the one that reports to whoever needs the
             # model, so this line is for the log, not for the user.
             if self._started:
-                logger.warning("ssh forward %s is down "
-                               "(127.0.0.1:%s -> %s via %s) — retrying every "
-                               "%.0f s", self.name, self.local_port,
-                               f"127.0.0.1:{self.remote_port}", self.target,
+                logger.warning("ssh forward %s is down (%s) — retrying every "
+                               "%.0f s", self.name, self._path(),
                                HEALTH_INTERVAL)
             else:
-                logger.error("ssh forward %s did not come up "
-                             "(127.0.0.1:%s -> %s via %s)", self.name,
-                             self.local_port, f"127.0.0.1:{self.remote_port}",
-                             self.target)
+                logger.error("ssh forward %s did not come up (%s)", self.name,
+                             self._path())
             self._failure = (
-                f"ssh forward {self.name} did not come up "
-                f"(127.0.0.1:{self.local_port} -> 127.0.0.1:{self.remote_port} via {self.target}) — "
+                f"ssh forward {self.name} did not come up ({self._path()}) — "
                 "check the ssh binary is installed, the key for the target is "
                 "authorized there, and the path (jump host, network) is reachable")
             self._failed_at = time.monotonic()
@@ -485,11 +521,38 @@ class SSHForward:
     def status(self) -> dict:
         return {
             "target": self.target,
+            "ssh_port": self.ssh_port,
             "jump": self.jump,
+            "ssh_jump_port": self.ssh_jump_port if self.jump else None,
             "remote": f"127.0.0.1:{self.remote_port}",
             "local": f"127.0.0.1:{self.local_port}",
             "pid": self._proc.pid if self._proc and self._proc.poll() is None else None,
         }
+
+
+def _port(entry, key, name, default):
+    """models.<name>.<key> as a TCP port, or `default` when the key is absent
+    (or null).
+
+    Anything that is not a whole number from 1 to 65535 raises ValueError
+    naming the key. The alternatives are worse: `int()` alone accepts 0 (ssh
+    rejects `-p 0`, so the forward fails at spawn, far from the typo), turns
+    `true` into port 1, and dies on "" with a message that names no key. A
+    raise here fails startup, or refuses a /reload and leaves the running
+    forwards as they were — the config is wrong, so say where.
+    """
+    value = entry.get(key)
+    if value is None:
+        return default
+    port = None
+    if isinstance(value, int) and not isinstance(value, bool):
+        port = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        port = int(value.strip())
+    if port is None or not 1 <= port <= 65535:
+        raise ValueError(f"models.{name}.{key} must be a port number from 1 "
+                         f"to 65535, not {value!r}")
+    return port
 
 
 class SSHForwardManager:
@@ -533,15 +596,35 @@ class SSHForwardManager:
                                "longer exists — the core picks a free local "
                                "port for every forward; remove the key", name)
             jump = str(entry.get("ssh_jump") or "").strip() or None
+            # ssh_port is the port sshd listens on at the destination, on the
+            # address the target names. Absent = 22, the ssh default — the
+            # argv carries -p only when it is not, so a config without the
+            # key spawns exactly what it always did.
+            sp = _port(entry, "ssh_port", name, 22)
+            # ssh_jump_port, likewise, for the jump host. Without a jump it
+            # has nothing to apply to: said so, and pinned to 22 so editing
+            # it cannot replace a forward it does not touch.
+            jp = _port(entry, "ssh_jump_port", name, 22)
+            if not jump:
+                if entry.get("ssh_jump_port") is not None:
+                    logger.warning("models.%s.ssh_jump_port is ignored: there "
+                                   "is no ssh_jump for it to apply to", name)
+                jp = 22
             # ssh_remote_port is the port on the destination. The legacy
-            # ssh_remote "host:port" spelling is still read (host ignored).
-            rp = entry.get("ssh_remote_port")
-            if rp is None:
-                rp = str(entry.get("ssh_remote") or "").rsplit(":", 1)[-1]
+            # ssh_remote "host:port" spelling is still read (host ignored),
+            # and neither present means 8888.
+            if entry.get("ssh_remote_port") is not None:
+                rp = _port(entry, "ssh_remote_port", name, 8888)
+            else:
+                legacy = str(entry.get("ssh_remote") or "").rsplit(":", 1)[-1]
+                rp = (_port({"ssh_remote": legacy}, "ssh_remote", name, 8888)
+                      if legacy.strip() else 8888)
             want[name] = (str(entry.get("ssh_forward")),
-                          int(rp or 8888),
+                          rp,
                           jump,
-                          str(entry.get("provider_name") or name))
+                          str(entry.get("provider_name") or name),
+                          sp,
+                          jp)
         return want
 
     def configure(self, config):
@@ -574,7 +657,8 @@ class SSHForwardManager:
             cur = self._forwards.get(name)
             if cur is None:
                 added[name] = SSHForward(name, *spec)
-            elif (cur.target, cur.remote_port, cur.jump, cur.model_id) != spec:
+            elif (cur.target, cur.remote_port, cur.jump, cur.model_id,
+                  cur.ssh_port, cur.ssh_jump_port) != spec:
                 removed[name] = cur
                 added[name] = SSHForward(name, *spec)
         for name, fwd in self._forwards.items():
