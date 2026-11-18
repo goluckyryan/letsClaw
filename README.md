@@ -493,7 +493,7 @@ cp config.example.yaml config.yaml     # config.yaml is gitignored — it holds 
 
 **[`config.example.yaml`](config.example.yaml) is the reference.** Every key is there inline with its default and what a change costs, and it is a template rather than a manual page, so it cannot go stale the way a list of keys can. Read it beside the reload table under [The Core](#the-core): the table says *which tier* a key is in, the file says *what the key does*.
 
-Nine of the sections, and one place to read each properly:
+Eleven sections, and one place to read each properly:
 
 | section | what it is for |
 |---|---|
@@ -503,7 +503,9 @@ Nine of the sections, and one place to read each properly:
 | `tools` | which tools the agent may call, and the limits on each |
 | `conversation` | how long a session is kept, when it rolls over, and what gets written to disk |
 | `discord` | the bot, and the allowlist that decides who may talk to it. Omit the section entirely if you do not want a bot |
+| `memory` | where rollover appends every handoff (`long_term_file`). Nothing reads it back yet — see [Future Features](#future-features) |
 | `logging` | how much log to keep |
+| `webui` | where the agent's pictures are served from and whether the media panel may delete them, the page theme, and the style of the pinned prompt. The one section the WebUI's ⚙️ Settings panel edits live |
 | `skills` | whether the model is offered the skills under `skills/` (off by default), which other directories to read skills from, and the caps on the catalog and on each skill — see [`skills/README.md`](skills/README.md) |
 | `voice` | the WebUI's spoken answers: the piper voice file, the caps on each request, and whether answers are rewritten into a spoken script first. Optional — omit it and the defaults apply |
 
