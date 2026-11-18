@@ -17,10 +17,11 @@ behavior:
   # dudus-den-solaris.md is that channel's file. It works the same for the
   # terminal (terminal.md) and any WebUI session.
   #
-  # Drop a file in and it applies on the next rebuild of the prompt — which is
-  # any of /clear, /rollover, /new, /model or /reload. Creating a file for an
-  # already-live session needs a /reload to be noticed, the same as editing
-  # base.md does.
+  # Drop a file in, or edit one, and it applies at the session's next /clear,
+  # /rollover or /new, which re-read it from disk. /reload reads it too and
+  # says it is waiting, but leaves a live window alone. /model keeps the
+  # conversation and swaps in the new model's file; the other layers come from
+  # what was last read, so an edit already staged by /reload rides along.
   session_dir: "models/sessions"
 
 # Skills — directories of know-how the model reads when a task matches one.

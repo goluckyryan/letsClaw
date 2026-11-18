@@ -17,8 +17,11 @@ a session name.
 A session with no file here is unaffected. `ls` tells you which sessions are
 tuned, which is the point of a directory rather than a config map.
 
-Creating a file for a session that is already live needs a `/reload` to be
-noticed — the read is cached, the same as `base.md` is.
+A file created or edited for a session that is already live applies at that
+session's next `/clear`, `/rollover` or `/new`, which re-read it from disk.
+`/reload` reads it too and says it is waiting, but leaves the live window
+alone. `/model` keeps the conversation and rebuilds the prompt from what was
+last read, so it carries the edit only once `/reload` has staged it.
 
 This file is not a session behavior file unless you have a session called
 "README", which you should not.
